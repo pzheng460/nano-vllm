@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 from transformers import AutoConfig
 
 
@@ -16,6 +17,7 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    device_type: Optional[str] = None  # "cuda", "npu", or None (auto)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
