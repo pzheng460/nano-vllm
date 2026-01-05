@@ -4,11 +4,22 @@ from torch import nn
 from nanovllm.utils.context import get_context
 from nanovllm.utils.device import is_npu, is_cuda
 
-# Conditional imports based on device type
-if is_cuda():
+# Lazy-initialized references for device-specific implementations
+_store_kvcache_impl = None
+_flash_attn_varlen_func = None
+_flash_attn_with_kvcache = None
+
+
+def _init_cuda_backend():
+    """Initialize CUDA-specific implementations (lazy)."""
+    global _store_kvcache_impl, _flash_attn_varlen_func, _flash_attn_with_kvcache
+
     import triton
     import triton.language as tl
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    _flash_attn_varlen_func = flash_attn_varlen_func
+    _flash_attn_with_kvcache = flash_attn_with_kvcache
 
     @triton.jit
     def store_kvcache_kernel(
@@ -32,7 +43,7 @@ if is_cuda():
         tl.store(k_cache_ptr + cache_offsets, key)
         tl.store(v_cache_ptr + cache_offsets, value)
 
-    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
+    def store_kvcache_cuda(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
         assert key.stride(-1) == 1 and value.stride(-1) == 1
@@ -41,10 +52,16 @@ if is_cuda():
         assert slot_mapping.numel() == N
         store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
-elif is_npu():
+    _store_kvcache_impl = store_kvcache_cuda
+
+
+def _init_npu_backend():
+    """Initialize NPU-specific implementations (lazy)."""
+    global _store_kvcache_impl
+
     import torch_npu
 
-    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
+    def store_kvcache_npu(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
         """NPU version of KV cache storage using scatter_update_."""
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
@@ -63,13 +80,32 @@ elif is_npu():
         torch_npu.scatter_update_(k_cache, slot_indices, cast_key, -2)
         torch_npu.scatter_update_(v_cache, slot_indices, cast_value, -2)
 
-else:
-    # Fallback: lazy import at runtime
-    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
+    _store_kvcache_impl = store_kvcache_npu
+
+
+def _ensure_backend_initialized():
+    """Ensure device-specific backend is initialized."""
+    global _store_kvcache_impl
+    if _store_kvcache_impl is not None:
+        return
+
+    if is_cuda():
+        _init_cuda_backend()
+    elif is_npu():
+        _init_npu_backend()
+    else:
         raise RuntimeError("Device backend not initialized. Call DeviceBackend.initialize() first.")
 
 
+def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
+    """Store key-value pairs to cache. Auto-initializes backend on first call."""
+    _ensure_backend_initialized()
+    _store_kvcache_impl(key, value, k_cache, v_cache, slot_mapping, block_size)
+
+
 class Attention(nn.Module):
+
+    SHARE_MASK_TRIL_SPARSE = None
 
     def __init__(
         self,
@@ -84,32 +120,45 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
-        self._use_npu = is_npu()
+        self._use_npu = None  # Lazy initialization
+
+    def _get_use_npu(self):
+        """Lazy check for NPU usage."""
+        if self._use_npu is None:
+            self._use_npu = is_npu()
+        return self._use_npu
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        use_npu = self._get_use_npu()
+
+        if use_npu and Attention.SHARE_MASK_TRIL_SPARSE is None:
+            Attention.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
+                torch.ones((2048, 2048), dtype=torch.bool, device='npu')
+            )
 
         if k_cache.numel() and v_cache.numel():
-            block_size = k_cache.shape[0] if self._use_npu else 256
+            block_size = k_cache.shape[0] if use_npu else 256
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, block_size)
 
-        if self._use_npu:
+        if use_npu:
             return self._forward_npu(q, k, v, context, k_cache, v_cache)
         else:
             return self._forward_cuda(q, k, v, context, k_cache, v_cache)
 
     def _forward_cuda(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context, k_cache: torch.Tensor, v_cache: torch.Tensor):
         """CUDA forward using Flash Attention."""
+        _ensure_backend_initialized()
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
+            o = _flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+            o = _flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o

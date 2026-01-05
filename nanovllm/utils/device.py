@@ -9,6 +9,7 @@ class DeviceType:
 class DeviceBackend:
     _instance = None
     _device_type = None
+    _original_compile = None
 
     @classmethod
     def detect_device(cls):
@@ -29,8 +30,24 @@ class DeviceBackend:
         cls._device_type = device_type or cls.detect_device()
         if cls._device_type == DeviceType.NPU:
             import torch_npu  # noqa
+            cls._patch_torch_compile()
         cls._instance = cls()
         return cls._instance
+
+    @classmethod
+    def _patch_torch_compile(cls):
+        """Monkey-patch torch.compile to use NPU backend by default."""
+        if cls._original_compile is not None:
+            return
+        cls._original_compile = torch.compile
+
+        def npu_compile(model=None, *, backend=None, **kwargs):
+            # Use "npu" backend if not explicitly specified
+            if backend is None:
+                backend = "npu"
+            return cls._original_compile(model, backend=backend, **kwargs)
+
+        torch.compile = npu_compile
 
     @classmethod
     def get_instance(cls):
