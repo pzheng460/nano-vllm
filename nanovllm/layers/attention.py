@@ -34,7 +34,7 @@ if is_cuda():
         tl.store(k_cache_ptr + cache_offsets, key)
         tl.store(v_cache_ptr + cache_offsets, value)
 
-    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
+    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
         assert key.stride(-1) == 1 and value.stride(-1) == 1
@@ -49,10 +49,11 @@ elif is_npu():
 
     NZ_DIM = 16
 
-    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
+    def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
         """NPU version of KV cache storage using torch_npu.npu_scatter_pa_kv_cache."""
         N, num_kv_heads, head_dim = key.shape
         num_blocks = k_cache.shape[0]
+        block_size = k_cache.shape[1]
         
         k_cache_nz = k_cache.view(num_blocks, num_kv_heads * head_dim // NZ_DIM, block_size, NZ_DIM)
         v_cache_nz = v_cache.view(num_blocks, num_kv_heads * head_dim // NZ_DIM, block_size, NZ_DIM)
@@ -87,19 +88,17 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
         self._use_npu = is_npu()
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        context = get_context()
-        k_cache, v_cache = self.k_cache, self.v_cache
-
         if self._use_npu and Attention.SHARE_MASK_TRIL_SPARSE is None:
             Attention.SHARE_MASK_TRIL_SPARSE = ~torch.tril(
                 torch.ones((2048, 2048), dtype=torch.bool, device='npu')
             )
 
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+
         if k_cache.numel() and v_cache.numel():
-            block_size = k_cache.shape[1] if self._use_npu else 256
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, block_size)
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if self._use_npu:
             return self._forward_npu(q, k, v, context, k_cache, v_cache)
@@ -122,8 +121,8 @@ class Attention(nn.Module):
         return o
 
     def _forward_npu(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context, k_cache: torch.Tensor, v_cache: torch.Tensor):
+        """NPU forward using torch_npu FIA kernels."""
         config = get_config()
-        """NPU forward using torch_npu fused attention."""
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
