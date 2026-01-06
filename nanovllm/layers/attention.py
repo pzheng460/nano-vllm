@@ -47,27 +47,23 @@ elif is_npu():
     import torch_npu
     import torchair as tng
 
+    NZ_DIM = 16
+
     def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor, block_size: int = 256):
-        """NPU version of KV cache storage using scatter_update_."""
-        N, num_heads, head_dim = key.shape
-        D = num_heads * head_dim
+        """NPU version of KV cache storage using torch_npu.npu_scatter_pa_kv_cache."""
+        N, num_kv_heads, head_dim = key.shape
+        num_blocks = k_cache.shape[0]
+        
+        k_cache_nz = k_cache.view(num_blocks, num_kv_heads * head_dim // NZ_DIM, block_size, NZ_DIM)
+        v_cache_nz = v_cache.view(num_blocks, num_kv_heads * head_dim // NZ_DIM, block_size, NZ_DIM)
 
-        # Calculate slot indices for scatter update
-        slot_indices = torch.stack([
-            slot_mapping // block_size,  # block index
-            slot_mapping % block_size    # offset in block
-        ], dim=1)
-
-        # Reshape key/value for scatter update
-        cast_key = key.reshape(-1, 1, D)
-        cast_value = value.reshape(-1, 1, D)
-
-        cast_k_cache = k_cache.reshape(-1, 1, D)
-        cast_v_cache = v_cache.reshape(-1, 1, D)
-
-        # Use scatter_update_ for in-place update
-        torch_npu.scatter_update_(cast_k_cache, slot_indices, cast_key, -2)
-        torch_npu.scatter_update_(cast_v_cache, slot_indices, cast_value, -2)
+        torch_npu.npu_scatter_pa_kv_cache(
+            key.contiguous(),
+            value.contiguous(),
+            k_cache_nz,
+            v_cache_nz,
+            slot_mapping
+        )
 
 else:
     raise RuntimeError("No CUDA or NPU device available. DeviceBackend must be initialized before importing attention module.")
@@ -102,7 +98,7 @@ class Attention(nn.Module):
             )
 
         if k_cache.numel() and v_cache.numel():
-            block_size = k_cache.shape[0] if self._use_npu else 256
+            block_size = k_cache.shape[1] if self._use_npu else 256
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping, block_size)
 
         if self._use_npu:
@@ -150,32 +146,28 @@ class Attention(nn.Module):
             batch_size = q.size(0)
             block_size = k_cache.shape[1]
             block_num, block_size, num_kv_heads, head_dim = k_cache.shape
+            k_cache = k_cache.reshape(-1, num_kv_heads, head_dim // NZ_DIM, block_size, NZ_DIM)
+            v_cache = v_cache.reshape(-1, num_kv_heads, head_dim // NZ_DIM, block_size, NZ_DIM)
 
             if config.enforce_eager:
-                k_cache = k_cache.reshape(-1, num_kv_heads, block_size, head_dim)
-                v_cache = v_cache.reshape(-1, num_kv_heads, block_size, head_dim)
-
-                o = torch_npu.npu_fused_infer_attention_score(
-                    q.view(batch_size, self.num_heads, self.head_dim),
+                o = torch_npu.npu_fused_infer_attention_score_v2(
+                    q,
                     k_cache,
                     v_cache,
-                    num_heads=self.num_heads,
+                    num_query_heads=self.num_heads,
                     num_key_value_heads=self.num_kv_heads,
                     input_layout="TND",
-                    scale=self.scale,
-                    actual_seq_lengths=context.cu_seqlens_q,
-                    actual_seq_lengths_kv=context.context_lens,
+                    softmax_scale=self.scale,
                     block_table=context.block_tables,
                     block_size=block_size,
                     sparse_mode=3,
                     atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
+                    actual_seq_qlen=context.cu_seqlens_q,
+                    actual_seq_kvlen=context.context_lens,
                 )[0]
             else:
-                k_cache = k_cache.reshape(-1, num_kv_heads, head_dim // 16, block_size, 16)
-                v_cache = v_cache.reshape(-1, num_kv_heads, head_dim // 16, block_size, 16)
-
                 o = tng.ops.npu_fused_infer_attention_score(
-                    q.view(batch_size, self.num_heads, self.head_dim),
+                    q,
                     k_cache,
                     v_cache,
                     num_heads=self.num_heads,
