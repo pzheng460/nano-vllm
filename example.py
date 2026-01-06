@@ -31,12 +31,12 @@ def main():
 
 
 if __name__ == "__main__":
-    with open('example.log', 'w') as f:
+    with open('output.log', 'w') as f:
         sys.stdout = f
-        sys.stderr = f
+        # sys.stderr = f
         main()
 
     # Restore original stdout and stderr
     sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
-    print("Execution completed. Check example.log for details.")
+    # sys.stderr = sys.__stderr__
+    print("Execution completed. Check output.log for details.")

@@ -182,9 +182,11 @@ class ModelRunner:
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
-        context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
+        context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        cu_seqlens_q = torch.arange(len(seqs), dtype=torch.int64) + 1
+        cu_seqlens_q = self.device.to_device(cu_seqlens_q)
+        set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -275,7 +277,7 @@ class ModelRunner:
         patch_for_hcom()  # HCCL communication patch
         config = torchair.CompilerConfig()
         config.experimental_config.frozen_parameter = True
-        config.experimental_config.tiling_schedule_optimize = True
+        config.experimental_config.tiling_schedule_optimize = False
         torch.npu.set_compile_mode(jit_compile=False)
 
         # Get NPU backend

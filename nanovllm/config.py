@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional
 from transformers import AutoConfig
 
@@ -26,3 +26,19 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+
+_current_config = None
+
+def get_config() -> Config:
+    global _current_config
+    return _current_config
+
+def set_config(model, **kwargs):
+    global _current_config
+    config_fields = {field.name for field in fields(Config)}
+    config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+    _current_config = Config(model, **config_kwargs)
+
+def reset_config():
+    global _current_config
+    _current_config = None
