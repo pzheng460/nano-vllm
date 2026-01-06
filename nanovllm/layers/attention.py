@@ -76,9 +76,12 @@ def _init_npu_backend():
         cast_key = key.reshape(-1, 1, D)
         cast_value = value.reshape(-1, 1, D)
 
+        cast_k_cache = k_cache.reshape(-1, 1, D)
+        cast_v_cache = v_cache.reshape(-1, 1, D)
+
         # Use scatter_update_ for in-place update
-        torch_npu.scatter_update_(k_cache, slot_indices, cast_key, -2)
-        torch_npu.scatter_update_(v_cache, slot_indices, cast_value, -2)
+        torch_npu.scatter_update_(cast_k_cache, slot_indices, cast_key, -2)
+        torch_npu.scatter_update_(cast_v_cache, slot_indices, cast_value, -2)
 
     _store_kvcache_impl = store_kvcache_npu
 
@@ -175,39 +178,37 @@ class Attention(nn.Module):
             num_seqs = len(context.cu_seqlens_q) - 1
             if num_seqs == 1:
                 # Single sequence - use BSND layout
-                seq_len = context.cu_seqlens_q[-1].item()
-                o, _, _ = torch_npu.npu_fused_infer_attention_score(
+                o = torch_npu.npu_fused_infer_attention_score(
                     q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
                     num_heads=self.num_heads,
                     num_key_value_heads=self.num_kv_heads,
                     input_layout="BSND",
                     scale=self.scale,
-                    pre_tokens=65535,
-                    next_tokens=0,
-                    sparse_mode=0,
-                )
+                    sparse_mode=3,
+                    atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
+                )[0]
                 o = o.view(-1, self.num_heads, self.head_dim)
             else:
                 # Multiple sequences - use TND layout with npu_fusion_attention
-                actual_seq_qlen = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).tolist()
-                actual_seq_kvlen = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]).tolist()
-                o, _, _ = torch_npu.npu_fusion_attention(
+                # actual_seq_qlen = (context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]).tolist()
+                # actual_seq_kvlen = (context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]).tolist()
+                o = torch_npu.npu_fusion_attention(
                     q, k, v,
                     head_num=self.num_heads,
                     input_layout="TND",
                     scale=self.scale,
-                    pre_tokens=65535,
-                    next_tokens=0,
-                    actual_seq_qlen=actual_seq_qlen,
-                    actual_seq_kvlen=actual_seq_kvlen,
-                    sparse_mode=0,
-                )
-        else:    # decode
+                    atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
+                    sparse_mode=3,
+                    actual_seq_qlen=context.cu_seqlens_q[1:].tolist(),
+                    actual_seq_kvlen=context.cu_seqlens_k[1:].tolist(),
+                )[0]
+        else:    
+            # decode
             batch_size = q.size(0)
             block_size = k_cache.shape[1]
 
-            o, _, _ = torch_npu.npu_fused_infer_attention_score(
-                q.view(batch_size, 1, self.num_heads, self.head_dim),
+            o = torch_npu.npu_fused_infer_attention_score(
+                q.view(batch_size, self.num_heads, 1, self.head_dim),
                 k_cache,
                 v_cache,
                 num_heads=self.num_heads,
@@ -217,7 +218,7 @@ class Attention(nn.Module):
                 actual_seq_lengths_kv=context.context_lens.tolist(),
                 block_table=context.block_tables,
                 block_size=block_size,
-            )
+            )[0]
             o = o.view(batch_size, self.num_heads, self.head_dim)
 
         return o

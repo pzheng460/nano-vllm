@@ -1,4 +1,5 @@
 import os
+import sys
 from nanovllm import LLM, SamplingParams
 from transformers import AutoTokenizer
 
@@ -30,4 +31,12 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with open('example.log', 'w') as f:
+        sys.stdout = f
+        sys.stderr = f
+        main()
+
+    # Restore original stdout and stderr
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+    print("Execution completed. Check example.log for details.")

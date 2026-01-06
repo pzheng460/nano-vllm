@@ -19,8 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = ["triton>=3.0.0", "flash-attn"]
-npu = ["torch_npu", "torchair"]
-all = ["triton>=3.0.0", "flash-attn", "torch_npu", "torchair"]
+npu = ["torch_npu", "torchvision"]
+all = ["triton>=3.0.0", "flash-attn", "torch_npu", "torchvision"]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"

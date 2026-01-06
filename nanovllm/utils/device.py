@@ -36,16 +36,26 @@ class DeviceBackend:
 
     @classmethod
     def _patch_torch_compile(cls):
-        """Monkey-patch torch.compile to use NPU backend by default."""
+        """Monkey-patch torch.compile to be a no-op on NPU for decorated functions.
+
+        NPU uses GE Graph via torchair which is configured explicitly in model_runner.
+        For @torch.compile decorated functions (sampler, layernorm, etc.), we disable
+        compilation on NPU since they work fine without it.
+        """
         if cls._original_compile is not None:
             return
         cls._original_compile = torch.compile
 
         def npu_compile(model=None, *, backend=None, **kwargs):
-            # Use "npu" backend if not explicitly specified
-            if backend is None:
-                backend = "npu"
-            return cls._original_compile(model, backend=backend, **kwargs)
+            # If backend is explicitly specified (e.g., from model_runner), use it
+            if backend is not None:
+                return cls._original_compile(model, backend=backend, **kwargs)
+            # Otherwise, return the model as-is (no-op) for NPU
+            # This handles @torch.compile decorated functions
+            if model is not None:
+                return model
+            # Handle torch.compile() used as a function call
+            return lambda m: m
 
         torch.compile = npu_compile
 

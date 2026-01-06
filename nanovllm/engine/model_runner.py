@@ -10,7 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-from nanovllm.utils.device import DeviceBackend, get_device_backend
+from nanovllm.utils.device import get_device_backend
 
 
 class ModelRunner:
@@ -24,8 +24,8 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        # Initialize device backend
-        self.device = DeviceBackend.initialize(config.device_type)
+        # Get device backend (already initialized in nanovllm.__init__)
+        self.device = get_device_backend()
 
         dist.init_process_group(self.device.get_dist_backend(), "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         self.device.set_device(rank)
