@@ -140,8 +140,8 @@ class Attention(nn.Module):
                 scale=self.scale,
                 sparse_mode=3,
                 atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_qlen=context.cu_seqlens_q[1:],
-                actual_seq_kvlen=context.cu_seqlens_k[1:],
+                actual_seq_lengths=context.cu_seqlens_q[1:],
+                actual_seq_lengths_kv=context.cu_seqlens_k[1:],
                 next_tokens=0
             )[0]
             o = o.view(-1, self.num_heads, self.head_dim)
