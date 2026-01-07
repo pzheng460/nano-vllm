@@ -124,12 +124,8 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence], fixed_num_blocks: int | None = None):
-        if fixed_num_blocks is not None:
-            # Use fixed size for GE Graph compatibility
-            max_len = fixed_num_blocks
-        else:
-            max_len = max(len(seq.block_table) for seq in seqs)
+    def prepare_block_tables(self, seqs: list[Sequence]):
+        max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True)
         block_tables = self.device.to_device(block_tables)
@@ -188,8 +184,7 @@ class ModelRunner:
         slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
         context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
         block_tables = self.prepare_block_tables(seqs)
-        cu_seqlens_q = torch.arange(len(seqs), dtype=torch.int64) + 1
-        cu_seqlens_q = self.device.to_device(cu_seqlens_q)
+        cu_seqlens_q = self.device.to_device(torch.arange(1, len(seqs) + 1, dtype=torch.int64, pin_memory=True))
         set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -223,40 +218,21 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
         else:
-            # NPU: Use GE Graph compiled model with fixed buffers
+            # NPU: Use GE Graph (similar to CUDA Graph)
             if input_ids.size(0) > 512:
                 return self.model.compute_logits(self.model(input_ids, positions))
             bs = input_ids.size(0)
             context = get_context()
-            graph_vars = self.ge_graph_vars
-
-            # Copy current inputs to fixed buffers (in-place update)
+            compiled_model = self.compiled_models[next(x for x in self.graph_bs if x >= bs)]
+            graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].fill_(1)
+            graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
-
-            # Copy block_tables - ensure it fits in fixed buffer
-            num_blocks = context.block_tables.size(1)
-            assert num_blocks <= graph_vars["max_num_blocks"], \
-                f"block_tables columns {num_blocks} exceeds max {graph_vars['max_num_blocks']}"
-            graph_vars["block_tables"].fill_(-1)  # Use -1 for invalid blocks
-            graph_vars["block_tables"][:bs, :num_blocks] = context.block_tables
-            graph_vars["cu_seqlens_q"][:bs] = context.cu_seqlens_q
-
-            # Update context to use fixed buffers (important for attention to read correct data)
-            set_context(
-                False,
-                cu_seqlens_q=graph_vars["cu_seqlens_q"],
-                slot_mapping=graph_vars["slot_mapping"],
-                context_lens=graph_vars["context_lens"],
-                block_tables=graph_vars["block_tables"]
-            )
-
-            # Run compiled model
-            graph_vars["outputs"][:] = self.compiled_model(graph_vars["input_ids"], graph_vars["positions"])
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph_vars["outputs"][:bs] = compiled_model(graph_vars["input_ids"][:bs], graph_vars["positions"][:bs])
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
@@ -306,47 +282,46 @@ class ModelRunner:
 
     @torch.inference_mode()
     def compile_ge_graph(self):
-        """NPU GE Graph compilation using torchair with fixed buffers."""
+        """NPU GE Graph compilation (similar to capture_cudagraph)."""
         import torchair
         from torchair import patch_for_hcom
-        from nanovllm.layers.attention import Attention
 
-        # Initialize torchair config
-        patch_for_hcom()  # HCCL communication patch
-        config = torchair.CompilerConfig()
-        config.experimental_config.frozen_parameter = True
-        config.experimental_config.tiling_schedule_optimize = False
+        patch_for_hcom()
+        compiler_config = torchair.CompilerConfig()
+        compiler_config.experimental_config.frozen_parameter = True
+        compiler_config.experimental_config.tiling_schedule_optimize = False
         torch.npu.set_compile_mode(jit_compile=False)
+        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
 
-        # Get NPU backend
-        npu_backend = torchair.get_npu_backend(compiler_config=config)
-
-        # Create fixed input buffers for GE Graph (similar to CUDA Graph)
-        hf_config = self.config.hf_config
+        config = self.config
+        hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-
-        # These tensors will be reused for every decode call - fixed address, content updated
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.ones(max_bs, dtype=torch.int64)
+        context_lens = torch.zeros(max_bs, dtype=torch.int64)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        cu_seqlens_q = torch.arange(max_bs, dtype=torch.int64) + 1
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        cu_seqlens_q = torch.arange(1, max_bs + 1, dtype=torch.int64)
+        outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.torch_dtype)
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.compiled_models = {}
 
-        # Mark tensors as static for dynamo - fixed address but content can change
-        torch._dynamo.mark_static(input_ids)
-        torch._dynamo.mark_static(positions)
-        torch._dynamo.mark_static(slot_mapping)
-        torch._dynamo.mark_static(context_lens)
-        torch._dynamo.mark_static(block_tables)
-        torch._dynamo.mark_static(cu_seqlens_q)
-        torch._dynamo.mark_static(outputs)
-        torch._dynamo.mark_static(self.kv_cache)
+        for bs in reversed(self.graph_bs):
+            set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            compiled_model = torch.compile(
+                self.model,
+                dynamic=False,
+                fullgraph=True,
+                backend=npu_backend
+            )
+            outputs[:bs] = compiled_model(input_ids[:bs], positions[:bs])    # compile
+            self.compiled_models[bs] = compiled_model
+            self.device.synchronize()
+            reset_context()
 
-        # Store graph variables for reuse during inference
-        self.ge_graph_vars = dict(
+        self.graph_vars = dict(
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
@@ -354,29 +329,4 @@ class ModelRunner:
             block_tables=block_tables,
             cu_seqlens_q=cu_seqlens_q,
             outputs=outputs,
-            max_num_blocks=max_num_blocks,  # Store for runtime validation
         )
-
-        # Set decode context using fixed buffers
-        set_context(
-            False,  # is_prefill=False for decode
-            cu_seqlens_q=cu_seqlens_q,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables
-        )
-
-        # Compile model forward with dynamic=False since we use fixed buffers
-        self.compiled_model = torch.compile(
-            self.model,
-            dynamic=False,
-            fullgraph=True,
-            backend=npu_backend
-        )
-
-        # Run warmup to trigger compilation and stabilize
-        for _ in range(2):
-            outputs[:] = self.compiled_model(input_ids, positions)
-            self.device.synchronize()
-
-        reset_context()

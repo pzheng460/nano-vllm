@@ -144,15 +144,14 @@ class Attention(nn.Module):
             # decode
             batch_size = q.size(0)
             block_size = k_cache.shape[1]
-            block_num, block_size, num_kv_heads, head_dim = k_cache.shape
-            k_cache = k_cache.reshape(-1, num_kv_heads, head_dim // NZ_DIM, block_size, NZ_DIM)
-            v_cache = v_cache.reshape(-1, num_kv_heads, head_dim // NZ_DIM, block_size, NZ_DIM)
+            k_cache_nz = k_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
+            v_cache_nz = v_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
 
             if config.enforce_eager:
                 o = torch_npu.npu_fused_infer_attention_score_v2(
                     q,
-                    k_cache,
-                    v_cache,
+                    k_cache_nz,
+                    v_cache_nz,
                     num_query_heads=self.num_heads,
                     num_key_value_heads=self.num_kv_heads,
                     input_layout="TND",
@@ -167,8 +166,8 @@ class Attention(nn.Module):
             else:
                 o = tng.ops.npu_fused_infer_attention_score(
                     q,
-                    k_cache,
-                    v_cache,
+                    k_cache_nz,
+                    v_cache_nz,
                     num_heads=self.num_heads,
                     num_key_value_heads=self.num_kv_heads,
                     input_layout="TND",
