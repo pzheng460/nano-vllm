@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from nanovllm.utils.context import get_context
+from nanovllm.utils.context import get_context, get_graph_context
 from nanovllm.utils.device import is_npu, is_cuda
 from nanovllm.config import Config, get_config, set_config, reset_config
 
@@ -94,7 +94,10 @@ class Attention(nn.Module):
             )
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        context = get_context()
+        if self._use_npu and not get_config().enforce_eager:
+            context = get_graph_context()
+        else:
+            context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
 
         if k_cache.numel() and v_cache.numel():
