@@ -182,10 +182,14 @@ class ModelRunner:
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
-        context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
         block_tables = self.prepare_block_tables(seqs)
-        cu_seqlens_q = self.device.to_device(torch.arange(1, len(seqs) + 1, dtype=torch.int64, pin_memory=True))
-        set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        if self.device.is_cuda:
+            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        else:
+            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
+            cu_seqlens_q = self.device.to_device(torch.arange(1, len(seqs) + 1, dtype=torch.int32, pin_memory=True))
+            set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
