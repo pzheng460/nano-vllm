@@ -184,11 +184,11 @@ class ModelRunner:
         slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
         block_tables = self.prepare_block_tables(seqs)
         if self.device.is_cuda:
-            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
+            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         else:
-            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
-            cu_seqlens_q = self.device.to_device(torch.arange(1, len(seqs) + 1, dtype=torch.int32, pin_memory=True))
+            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
+            cu_seqlens_q = self.device.to_device(torch.arange(1, len(seqs) + 1, dtype=torch.int64, pin_memory=True))
             set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -233,7 +233,7 @@ class ModelRunner:
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"].fill_(1)
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph_vars["outputs"][:bs] = compiled_model(graph_vars["input_ids"][:bs], graph_vars["positions"][:bs])
@@ -304,16 +304,15 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int64)
+        context_lens = torch.ones(max_bs, dtype=torch.int64)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         cu_seqlens_q = torch.arange(1, max_bs + 1, dtype=torch.int64)
         outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.torch_dtype)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [1, 2]
         self.compiled_models = {}
 
         for bs in reversed(self.graph_bs):
             set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             compiled_model = torch.compile(
                 self.model,
                 dynamic=False,
