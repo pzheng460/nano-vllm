@@ -41,7 +41,7 @@ class ModelRunner:
             if self.device.is_cuda:
                 self.capture_cudagraph()
             else:
-                self.compile_ge_graph()
+                self.capture_aclgraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -60,7 +60,7 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager and self.device.is_cuda:
+        if not self.enforce_eager:
             del self.graphs, self.graph_pool
         self.device.synchronize()
         dist.destroy_process_group()
@@ -222,12 +222,12 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
         else:
-            # NPU: Use GE Graph (similar to CUDA Graph)
+            # NPU: Use ACL Graph (similar to CUDA Graph)
             if input_ids.size(0) > 512:
                 return self.model.compute_logits(self.model(input_ids, positions))
             bs = input_ids.size(0)
             context = get_context()
-            compiled_model = self.compiled_models[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -236,7 +236,7 @@ class ModelRunner:
             graph_vars["context_lens"].fill_(1)
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph_vars["outputs"][:bs] = compiled_model(graph_vars["input_ids"][:bs], graph_vars["positions"][:bs])
+            graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
@@ -285,18 +285,8 @@ class ModelRunner:
         )
 
     @torch.inference_mode()
-    def compile_ge_graph(self):
-        """NPU GE Graph compilation (similar to capture_cudagraph)."""
-        import torchair
-        from torchair import patch_for_hcom
-
-        patch_for_hcom()
-        compiler_config = torchair.CompilerConfig()
-        compiler_config.experimental_config.frozen_parameter = True
-        compiler_config.experimental_config.tiling_schedule_optimize = False
-        torch.npu.set_compile_mode(jit_compile=False)
-        npu_backend = torchair.get_npu_backend(compiler_config=compiler_config)
-
+    def capture_aclgraph(self):
+        """NPU ACL Graph capture (similar to capture_cudagraph)."""
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -308,19 +298,19 @@ class ModelRunner:
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         cu_seqlens_q = torch.arange(1, max_bs + 1, dtype=torch.int64)
         outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.torch_dtype)
-        self.graph_bs = [1, 2]
-        self.compiled_models = {}
+        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graphs = {}
+        self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
+            graph = torch.npu.NPUGraph()
             set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            compiled_model = torch.compile(
-                self.model,
-                dynamic=False,
-                fullgraph=True,
-                backend=npu_backend
-            )
-            outputs[:bs] = compiled_model(input_ids[:bs], positions[:bs])    # compile
-            self.compiled_models[bs] = compiled_model
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            with torch.npu.graph(graph, self.graph_pool):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+            if self.graph_pool is None:
+                self.graph_pool = graph.pool()
+            self.graphs[bs] = graph
             self.device.synchronize()
             reset_context()
 

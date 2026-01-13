@@ -122,6 +122,13 @@ class DeviceBackend:
         else:
             return tensor.npu(non_blocking=non_blocking)
 
+    def graph_context(self, graph, pool=None):
+        """Return a context manager for graph capture."""
+        if self.is_cuda:
+            return torch.cuda.graph(graph, pool=pool)
+        else:
+            return torch.npu.graph(graph, pool=pool)
+
 
 def get_device_backend():
     return DeviceBackend.get_instance()
