@@ -38,7 +38,7 @@ class DeviceBackend:
     def _patch_torch_compile(cls):
         """Monkey-patch torch.compile to be a no-op on NPU for decorated functions.
 
-        NPU uses GE Graph via torchair which is configured explicitly in model_runner.
+        NPU uses ACL/GE Graph which is configured explicitly in model_runner.
         For @torch.compile decorated functions (sampler, layernorm, etc.), we disable
         compilation on NPU since they work fine without it.
         """

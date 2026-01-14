@@ -124,16 +124,16 @@ class Attention(nn.Module):
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
 
-            o = torch_npu.npu_fused_infer_attention_score(
+            o = torch_npu.npu_fused_infer_attention_score_v2(
                 q, k, v,
-                num_heads=self.num_heads,
+                num_query_heads=self.num_heads,
                 num_key_value_heads=self.num_kv_heads,
                 input_layout="TND",
-                scale=self.scale,
+                softmax_scale=self.scale,
                 sparse_mode=3,
                 atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_lengths=context.cu_seqlens_q[1:],
-                actual_seq_lengths_kv=context.cu_seqlens_k[1:],
+                actual_seq_qlen=context.cu_seqlens_q[1:],
+                actual_seq_kvlen=context.cu_seqlens_k[1:],
                 next_tokens=0
             )[0]
             o = o.view(-1, self.num_heads, self.head_dim)
