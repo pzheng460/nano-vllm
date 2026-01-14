@@ -178,7 +178,7 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
@@ -187,9 +187,11 @@ class ModelRunner:
             context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         else:
-            context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int64, pin_memory=True))
-            cu_seqlens_q = self.device.to_device(torch.arange(1, len(seqs) + 1, dtype=torch.int64, pin_memory=True))
-            set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+            # context_lens = self.device.to_device(context_lens)
+            # cu_seqlens_q = torch.arange(1, len(seqs) + 1, dtype=torch.int64)
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+
+            # set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -233,7 +235,8 @@ class ModelRunner:
             graph_vars["positions"][:bs] = positions
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].fill_(1)
+            # for i in range(len(graph_vars["context_lens"])):
+            #     graph_vars["context_lens"][i] = 1
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
@@ -294,9 +297,10 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.ones(max_bs, dtype=torch.int64)
+        # context_lens = torch.ones(max_bs, dtype=torch.int64)
+        context_lens = [1] * max_bs
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        cu_seqlens_q = torch.arange(1, max_bs + 1, dtype=torch.int64)
+        # cu_seqlens_q = torch.arange(1, max_bs + 1, dtype=torch.int64)
         outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.torch_dtype)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
@@ -304,9 +308,8 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.npu.NPUGraph()
-            set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], capturing=True)
             with torch.npu.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
@@ -321,6 +324,5 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
-            cu_seqlens_q=cu_seqlens_q,
             outputs=outputs,
         )

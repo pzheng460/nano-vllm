@@ -52,7 +52,7 @@ elif is_npu():
         N, num_kv_heads, head_dim = key.shape
         num_blocks = k_cache.shape[0]
         block_size = k_cache.shape[1]
-
+        
         k_cache_nz = k_cache.view(num_blocks, num_kv_heads * head_dim // NZ_DIM, block_size, NZ_DIM)
         v_cache_nz = v_cache.view(num_blocks, num_kv_heads * head_dim // NZ_DIM, block_size, NZ_DIM)
 
@@ -63,30 +63,6 @@ elif is_npu():
             v_cache_nz,
             slot_mapping
         )
-
-    # Global storage for ACL graph parameters (similar to vllm-ascend)
-    _graph_params = {
-        'workspaces': {},  # num_tokens -> workspace tensor
-        'handles': {},     # num_tokens -> list of handles
-        'events': {},      # num_tokens -> list of events
-        'attn_params': {}, # num_tokens -> list of attention params
-    }
-
-    def init_graph_params(batch_sizes: list):
-        """Initialize graph params for given batch sizes."""
-        for bs in batch_sizes:
-            _graph_params['workspaces'][bs] = None
-            _graph_params['handles'][bs] = []
-            _graph_params['events'][bs] = []
-            _graph_params['attn_params'][bs] = []
-
-    def reset_graph_params():
-        """Reset graph params after capture."""
-        for key in _graph_params:
-            if isinstance(_graph_params[key], dict):
-                for bs in _graph_params[key]:
-                    if isinstance(_graph_params[key][bs], list):
-                        _graph_params[key][bs] = []
 
 else:
     raise RuntimeError("No CUDA or NPU device available. DeviceBackend must be initialized before importing attention module.")
@@ -167,94 +143,24 @@ class Attention(nn.Module):
             block_size = k_cache.shape[1]
             k_cache_nz = k_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
             v_cache_nz = v_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
+            # actual_seq_qlen = torch.arange(1, len(batch_size) + 1, dtype=torch.int64)
+            actual_seq_qlen = [(i + 1) for i in range(batch_size)]
+            o, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                q,
+                k_cache_nz,
+                v_cache_nz,
+                num_query_heads=self.num_heads,
+                num_key_value_heads=self.num_kv_heads,
+                input_layout="TND",
+                softmax_scale=self.scale,
+                block_table=context.block_tables,
+                block_size=block_size,
+                sparse_mode=3,
+                atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
+                actual_seq_qlen=actual_seq_qlen,
+                actual_seq_kvlen=context.context_lens,
+            )
 
-            if context.capturing:
-                # ACL Graph capture mode - use graph_task_group for dynamic updates
-                o = self._forward_npu_aclgraph(q, k_cache_nz, v_cache_nz, context, batch_size, block_size)
-            else:
-                # Eager mode
-                o = torch_npu.npu_fused_infer_attention_score_v2(
-                    q,
-                    k_cache_nz,
-                    v_cache_nz,
-                    num_query_heads=self.num_heads,
-                    num_key_value_heads=self.num_kv_heads,
-                    input_layout="TND",
-                    softmax_scale=self.scale,
-                    block_table=context.block_tables,
-                    block_size=block_size,
-                    sparse_mode=3,
-                    atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
-                    actual_seq_qlen=context.cu_seqlens_q,
-                    actual_seq_kvlen=context.context_lens,
-                )[0]
             o = o.view(batch_size, self.num_heads, self.head_dim)
 
         return o
-
-    def _forward_npu_aclgraph(self, q: torch.Tensor, k_cache_nz: torch.Tensor, v_cache_nz: torch.Tensor, context, batch_size: int, block_size: int):
-        """NPU forward for ACL Graph capture mode using graph_task_group."""
-        num_tokens = batch_size
-        actual_seq_lengths_q = context.cu_seqlens_q.tolist()
-        actual_seq_lengths_kv = context.context_lens.tolist()
-
-        # Prepare output tensor
-        output = torch.empty(num_tokens, self.num_heads * self.head_dim, dtype=q.dtype, device=q.device)
-        softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-
-        # Get or compute workspace
-        workspace = _graph_params['workspaces'].get(num_tokens)
-        if workspace is None:
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                query=q,
-                key=k_cache_nz,
-                value=v_cache_nz,
-                atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
-                block_table=context.block_tables,
-                input_layout="TND",
-                block_size=block_size,
-                actual_seq_lengths=actual_seq_lengths_q,
-                actual_seq_lengths_kv=actual_seq_lengths_kv,
-                num_key_value_heads=self.num_kv_heads,
-                num_heads=self.num_heads,
-                sparse_mode=3,
-                scale=self.scale,
-            )
-            _graph_params['workspaces'][num_tokens] = workspace
-
-        # Use graph_task_group for dynamic parameter update during replay
-        stream = torch_npu.npu.current_stream()
-
-        event = torch.npu.ExternalEvent()
-        event.wait(stream)
-        event.reset(stream)
-        _graph_params['events'].setdefault(num_tokens, []).append(event)
-        _graph_params['attn_params'].setdefault(num_tokens, []).append(
-            (q, k_cache_nz, v_cache_nz, context.block_tables,
-             Attention.SHARE_MASK_TRIL_SPARSE, block_size,
-             actual_seq_lengths_kv, actual_seq_lengths_q, self.num_kv_heads,
-             self.num_heads, self.scale, output, softmax_lse)
-        )
-
-        torch.npu.graph_task_group_begin(stream)
-        torch_npu.npu_fused_infer_attention_score.out(
-            query=q,
-            key=k_cache_nz,
-            value=v_cache_nz,
-            atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
-            block_table=context.block_tables,
-            input_layout="TND",
-            block_size=block_size,
-            actual_seq_lengths=actual_seq_lengths_q,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
-            num_key_value_heads=self.num_kv_heads,
-            num_heads=self.num_heads,
-            scale=self.scale,
-            sparse_mode=3,
-            workspace=workspace,
-            out=[output, softmax_lse],
-        )
-        handle = torch.npu.graph_task_group_end(stream)
-        _graph_params['handles'].setdefault(num_tokens, []).append(handle)
-
-        return output
