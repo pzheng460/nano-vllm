@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from nanovllm.utils.context import get_context
+from nanovllm.utils.context import get_context, add_graph_handle
 from nanovllm.utils.device import is_npu, is_cuda
 
 # Initialize device-specific implementations at import time
@@ -143,24 +143,63 @@ class Attention(nn.Module):
             block_size = k_cache.shape[1]
             k_cache_nz = k_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
             v_cache_nz = v_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
-            # actual_seq_qlen = torch.arange(1, len(batch_size) + 1, dtype=torch.int64)
-            actual_seq_qlen = [(i + 1) for i in range(batch_size)]
-            o, _ = torch_npu.npu_fused_infer_attention_score_v2(
-                q,
-                k_cache_nz,
-                v_cache_nz,
-                num_query_heads=self.num_heads,
-                num_key_value_heads=self.num_kv_heads,
-                input_layout="TND",
-                softmax_scale=self.scale,
-                block_table=context.block_tables,
-                block_size=block_size,
-                sparse_mode=3,
-                atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
-                actual_seq_qlen=actual_seq_qlen,
-                actual_seq_kvlen=context.context_lens,
-            )
 
-            o = o.view(batch_size, self.num_heads, self.head_dim)
+            # Pre-allocate output tensors
+            o = torch.empty(batch_size, self.num_heads, self.head_dim, dtype=q.dtype, device=q.device)
+            softmax_lse = torch.empty(batch_size, dtype=torch.float32, device=q.device)
+
+            if context.capturing:
+                # ACL Graph capture mode: mark this op as updatable
+                stream = torch.npu.current_stream()
+                torch.npu.graph_task_group_begin(stream)
+
+                torch_npu.npu_fused_infer_attention_score_v2.out(
+                    q,
+                    k_cache_nz,
+                    v_cache_nz,
+                    num_query_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    input_layout="TND",
+                    softmax_scale=self.scale,
+                    block_table=context.block_tables,
+                    block_size=block_size,
+                    sparse_mode=3,
+                    atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
+                    actual_seq_qlen=context.cu_seqlens_q,
+                    actual_seq_kvlen=context.context_lens,
+                    out=[o, softmax_lse],
+                )
+
+                handle = torch.npu.graph_task_group_end(stream)
+                # Save handle and params for later update
+                add_graph_handle(
+                    bs=batch_size,
+                    handle=handle,
+                    attn_params=(
+                        q, k_cache_nz, v_cache_nz,
+                        self.num_heads, self.num_kv_heads,
+                        self.scale, context.block_tables, block_size,
+                        Attention.SHARE_MASK_TRIL_SPARSE,
+                        o, softmax_lse,
+                    )
+                )
+            else:
+                # Normal execution (eager or graph replay)
+                torch_npu.npu_fused_infer_attention_score_v2.out(
+                    q,
+                    k_cache_nz,
+                    v_cache_nz,
+                    num_query_heads=self.num_heads,
+                    num_key_value_heads=self.num_kv_heads,
+                    input_layout="TND",
+                    softmax_scale=self.scale,
+                    block_table=context.block_tables,
+                    block_size=block_size,
+                    sparse_mode=3,
+                    atten_mask=Attention.SHARE_MASK_TRIL_SPARSE,
+                    actual_seq_qlen=context.cu_seqlens_q,
+                    actual_seq_kvlen=context.context_lens,
+                    out=[o, softmax_lse],
+                )
 
         return o
