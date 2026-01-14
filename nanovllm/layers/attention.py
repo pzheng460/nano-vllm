@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from nanovllm.utils.context import get_context, add_graph_handle
+from nanovllm.utils.context import get_context, add_graph_handle, get_graph_params
 from nanovllm.utils.device import is_npu, is_cuda
 
 # Initialize device-specific implementations at import time
@@ -184,7 +184,7 @@ class Attention(nn.Module):
                     )
                 )
             else:
-                # Normal execution (eager or graph replay)
+                # eager mode
                 torch_npu.npu_fused_infer_attention_score_v2.out(
                     q,
                     k_cache_nz,
@@ -203,3 +203,34 @@ class Attention(nn.Module):
                 )
 
         return o
+
+    @staticmethod
+    def update_graph_params(graph_bs: int, cu_seqlens_q: list, context_lens: list):
+        """Update List parameters before ACL Graph replay.
+
+        NPU attention ops require cu_seqlens_q and context_lens as List,
+        which cannot be captured by graph. Use graph_task_update to update them.
+        """
+        # Pad to graph_bs size
+        padded_cu_seqlens_q = list(cu_seqlens_q) + [(i + 1) for i in range(len(cu_seqlens_q), graph_bs)]
+        padded_context_lens = list(context_lens) + [1] * (graph_bs - len(context_lens))
+
+        graph_params = get_graph_params()
+        stream = torch.npu.current_stream()
+
+        for handle, attn_params in zip(graph_params.handles[graph_bs], graph_params.attn_params[graph_bs]):
+            (q, k_cache_nz, v_cache_nz, num_heads, num_kv_heads,
+             scale, block_table, block_size, atten_mask, o, softmax_lse) = attn_params
+
+            torch.npu.graph_task_update_begin(stream, handle)
+            torch_npu.npu_fused_infer_attention_score_v2.out(
+                q, k_cache_nz, v_cache_nz,
+                num_query_heads=num_heads, num_key_value_heads=num_kv_heads,
+                input_layout="TND", softmax_scale=scale,
+                block_table=block_table, block_size=block_size,
+                sparse_mode=3, atten_mask=atten_mask,
+                actual_seq_qlen=padded_cu_seqlens_q,
+                actual_seq_kvlen=padded_context_lens,
+                out=[o, softmax_lse],
+            )
+            torch.npu.graph_task_update_end(stream)

@@ -8,7 +8,8 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context, init_graph_params, get_graph_params
+from nanovllm.layers.attention import Attention
+from nanovllm.utils.context import set_context, get_context, reset_context, init_graph_params
 from nanovllm.utils.loader import load_model
 from nanovllm.utils.device import get_device_backend
 
@@ -187,10 +188,7 @@ class ModelRunner:
             context_lens = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         else:
-            # context_lens = self.device.to_device(context_lens)
             cu_seqlens_q = [(i + 1) for i in range(len(seqs))]
-            # set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-
             set_context(False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
@@ -238,47 +236,10 @@ class ModelRunner:
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            # NPU-specific: Update attention params before replay
-            self._update_aclgraph_attn_params(graph_bs, context)
+            # NPU-specific: Update List params (cu_seqlens_q, context_lens) via graph_task_update
+            Attention.update_graph_params(graph_bs, context.cu_seqlens_q, context.context_lens)
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
-
-    def _update_aclgraph_attn_params(self, graph_bs: int, context):
-        """Update attention parameters before ACL Graph replay (NPU-specific)."""
-        import torch_npu
-
-        # Pad context_lens and cu_seqlens_q to graph_bs size
-        new_context_lens = list(context.context_lens) + [1] * (graph_bs - len(context.context_lens))
-        new_cu_seqlens_q = list(context.cu_seqlens_q) + [(i + 1) for i in range(len(context.cu_seqlens_q), graph_bs)]
-
-        graph_params = get_graph_params()
-        stream = torch.npu.current_stream()
-
-        for handle, attn_params in zip(
-            graph_params.handles[graph_bs],
-            graph_params.attn_params[graph_bs]
-        ):
-            (q, k_cache_nz, v_cache_nz, num_heads, num_kv_heads,
-             scale, block_table, block_size, atten_mask, o, softmax_lse) = attn_params
-
-            torch.npu.graph_task_update_begin(stream, handle)
-            torch_npu.npu_fused_infer_attention_score_v2.out(
-                q,
-                k_cache_nz,
-                v_cache_nz,
-                num_query_heads=num_heads,
-                num_key_value_heads=num_kv_heads,
-                input_layout="TND",
-                softmax_scale=scale,
-                block_table=block_table,
-                block_size=block_size,
-                sparse_mode=3,
-                atten_mask=atten_mask,
-                actual_seq_qlen=new_cu_seqlens_q[:graph_bs],
-                actual_seq_kvlen=new_context_lens[:graph_bs],
-                out=[o, softmax_lse],
-            )
-            torch.npu.graph_task_update_end(stream)
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -335,34 +296,26 @@ class ModelRunner:
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = [1] * max_bs
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        cu_seqlens_q = [(i + 1) for i in range(max_bs)]
         outputs = torch.zeros(max_bs, hf_config.hidden_size, dtype=hf_config.torch_dtype)
+        # NPU-specific: List params for attention (cannot be captured by graph)
+        context_lens = [1] * max_bs
+        cu_seqlens_q = [(i + 1) for i in range(max_bs)]
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
-
-        # Initialize graph params for storing handles
         init_graph_params(self.graph_bs)
 
         for bs in reversed(self.graph_bs):
             graph = torch.npu.NPUGraph()
-            # Use sliced lists matching current bs
-            cu_seqlens_q_bs = cu_seqlens_q[:bs]
-            context_lens_bs = context_lens[:bs]
-
-            # Warmup (capturing=False)
-            set_context(False, cu_seqlens_q=cu_seqlens_q_bs, slot_mapping=slot_mapping[:bs],
-                       context_lens=context_lens_bs, block_tables=block_tables[:bs], capturing=False)
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+            set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs],
+                       context_lens=context_lens[:bs], block_tables=block_tables[:bs], capturing=False)
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             reset_context()
-
-            # Capture (capturing=True to mark updatable ops)
-            set_context(False, cu_seqlens_q=cu_seqlens_q_bs, slot_mapping=slot_mapping[:bs],
-                       context_lens=context_lens_bs, block_tables=block_tables[:bs], capturing=True)
+            set_context(False, cu_seqlens_q=cu_seqlens_q[:bs], slot_mapping=slot_mapping[:bs],
+                       context_lens=context_lens[:bs], block_tables=block_tables[:bs], capturing=True)
             with torch.npu.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
@@ -373,8 +326,6 @@ class ModelRunner:
             input_ids=input_ids,
             positions=positions,
             slot_mapping=slot_mapping,
-            context_lens=context_lens,
             block_tables=block_tables,
-            cu_seqlens_q=cu_seqlens_q,
             outputs=outputs,
         )
