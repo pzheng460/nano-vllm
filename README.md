@@ -15,7 +15,7 @@ A lightweight vLLM implementation built from scratch.
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, ACL graph, etc.
-* ✅ **Multi-Platform Support** - GPU, NPU.
+* ✅ **Multi-Platform Support** - GPU, NPU
 
 ## Installation
 
@@ -65,9 +65,10 @@ docker run --rm \
 ```
 The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed in `/vllm-workspace` and installed in development mode (`pip install -e`) to help developer immediately take place changes without requiring a new installation.
 
-
-
-
+```bash
+pip install -e .
+```
+Install the nano-vllm from source.
 
 ## Model Download
 
