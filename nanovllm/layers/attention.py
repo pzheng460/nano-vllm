@@ -139,7 +139,7 @@ class Attention(nn.Module):
             o = o.view(-1, self.num_heads, self.head_dim)
         else:
             # decode
-            batch_size = q.size(0)
+            batch_size = q.shape[0]
             block_size = k_cache.shape[1]
             k_cache_nz = k_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)
             v_cache_nz = v_cache.view(-1, self.num_kv_heads, self.head_dim // NZ_DIM, block_size, NZ_DIM)

@@ -14,13 +14,60 @@ A lightweight vLLM implementation built from scratch.
 
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, ACL graph, etc.
+* ✅ **Multi-Platform Support** - GPU, NPU.
 
 ## Installation
+
+### GPU Installation
+
+For GPU users, 
 
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
+
+### Ascend NPU Installation
+
+For Huawei Atlas 800I/800T A2/A3 users, we recommend starting with Docker.
+
+```bash
+docker pull quay.io/ascend/vllm-ascend:v0.13.0rc1
+```
+```bash
+# Update --device according to your device (Atlas A2: /dev/davinci[0-7] Atlas A3:/dev/davinci[0-15]).
+# Update the vllm-ascend image according to your environment.
+# Note you should download the weight to /root/.cache in advance.
+export IMAGE=quay.io/ascend/vllm-ascend:v0.13.0rc1
+docker run --rm \
+    --name vllm-ascend-env \
+    --shm-size=1g \
+    --net=host \
+    --device /dev/davinci0 \
+    --device /dev/davinci1 \
+    --device /dev/davinci2 \
+    --device /dev/davinci3 \
+    --device /dev/davinci4 \
+    --device /dev/davinci5 \
+    --device /dev/davinci6 \
+    --device /dev/davinci7 \
+    --device /dev/davinci_manager \
+    --device /dev/devmm_svm \
+    --device /dev/hisi_hdc \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool \
+    -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+    -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+    -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+    -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v /root/.cache:/root/.cache \
+    -it $IMAGE bash
+```
+The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed in `/vllm-workspace` and installed in development mode (`pip install -e`) to help developer immediately take place changes without requiring a new installation.
+
+
+
+
 
 ## Model Download
 
