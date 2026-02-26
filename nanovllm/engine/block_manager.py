@@ -90,6 +90,9 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
+    def num_free_blocks(self) -> int:
+        return len(self.free_block_ids)
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
@@ -110,3 +113,20 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    def ensure_blocks_for(self, seq: Sequence, num_new_tokens: int) -> bool:
+        """Pre-allocate enough blocks for num_new_tokens speculative tokens.
+        Returns True if allocation succeeded, False otherwise."""
+        future_len = len(seq) + num_new_tokens
+        needed_blocks = (future_len + self.block_size - 1) // self.block_size
+        current_blocks = len(seq.block_table)
+        extra = needed_blocks - current_blocks
+        if extra <= 0:
+            return True
+        if extra > len(self.free_block_ids):
+            return False
+        for _ in range(extra):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            seq.block_table.append(block_id)
+        return True

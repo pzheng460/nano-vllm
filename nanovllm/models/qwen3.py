@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from transformers import Qwen3Config
 
@@ -213,3 +214,17 @@ class Qwen3ForCausalLM(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         return self.lm_head(hidden_states)
+
+    def compute_logits_all(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute logits for ALL positions (bypasses ParallelLMHead's last-index extraction)."""
+        tp_size = dist.get_world_size()
+        tp_rank = dist.get_rank()
+        logits = F.linear(hidden_states, self.lm_head.weight)
+        if tp_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(tp_size)] if tp_rank == 0 else None
+            dist.gather(logits, all_logits, 0)
+            logits = torch.cat(all_logits, -1) if tp_rank == 0 else None
+        return logits

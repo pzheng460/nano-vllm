@@ -5,11 +5,18 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("/mnt/scratch/weights/Qwen3-0.6B/")
-    tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=False, tensor_parallel_size=1)
+    model_path = os.path.expanduser("/mnt/data/weights/Qwen2-7B-Instruct/")
+    draft_path = os.path.expanduser("/mnt/data/weights/EAGLE-Qwen2-7B-Instruct/")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    llm = LLM(
+        model_path,
+        draft_model=draft_path,
+        num_speculative_tokens=5,
+        enforce_eager=True,
+        tensor_parallel_size=1,
+    )
 
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.001, max_tokens=256)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
@@ -31,12 +38,4 @@ def main():
 
 
 if __name__ == "__main__":
-    with open('output.log', 'w') as f:
-        sys.stdout = f
-        # sys.stderr = f
-        main()
-
-    # Restore original stdout and stderr
-    sys.stdout = sys.__stdout__
-    # sys.stderr = sys.__stderr__
-    print("Execution completed. Check output.log for details.")
+    main()

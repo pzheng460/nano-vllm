@@ -18,6 +18,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     device_type: Optional[str] = None  # "cuda", "npu", or None (auto)
+    draft_model: Optional[str] = None          # EAGLE checkpoint path
+    num_speculative_tokens: int = 5            # number of speculative tokens per step
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -26,6 +28,11 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.draft_model is not None:
+            assert os.path.isdir(self.draft_model)
+            self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model)
+        else:
+            self.draft_hf_config = None
 
 _current_config = None
 

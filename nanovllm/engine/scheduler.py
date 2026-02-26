@@ -11,6 +11,8 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        self.speculative = config.draft_model is not None
+        self.num_speculative_tokens = config.num_speculative_tokens
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -43,16 +45,28 @@ class Scheduler:
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
+            if self.speculative:
+                # Pre-allocate blocks for speculative tokens (k+1: last_token + k draft)
+                while not self.block_manager.ensure_blocks_for(seq, self.num_speculative_tokens + 1):
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
                 else:
-                    self.preempt(seq)
-                    break
+                    num_seqs += 1
+                    scheduled_seqs.append(seq)
             else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(seq)
+                while not self.block_manager.can_append(seq):
+                    if self.running:
+                        self.preempt(self.running.pop())
+                    else:
+                        self.preempt(seq)
+                        break
+                else:
+                    num_seqs += 1
+                    self.block_manager.may_append(seq)
+                    scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
@@ -69,3 +83,14 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+    def postprocess_speculative(self, seqs: list[Sequence], all_token_ids: list[list[int]]):
+        for seq, token_ids in zip(seqs, all_token_ids):
+            for token_id in token_ids:
+                seq.append_token(token_id)
+                self.block_manager.may_append(seq)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+                    break
