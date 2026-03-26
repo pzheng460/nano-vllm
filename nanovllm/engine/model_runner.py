@@ -15,6 +15,14 @@ from nanovllm.utils.loader import load_model
 from nanovllm.utils.device import get_device_backend
 
 
+def _get_model_cls(hf_config):
+    model_type = getattr(hf_config, 'model_type', 'qwen3')
+    if model_type == 'mimo':
+        from nanovllm.models.mimo import MiMoForCausalLM
+        return MiMoForCausalLM
+    return Qwen3ForCausalLM
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -34,23 +42,28 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device.device_name)
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_cls = _get_model_cls(hf_config)
+        self.model = model_cls(hf_config)
         load_model(self.model, config.model)
-        self.speculative = config.draft_model is not None
+        self.use_mtp = config.use_mtp
+        self.speculative = config.draft_model is not None or self.use_mtp
         self.num_speculative_tokens = config.num_speculative_tokens
-        if self.speculative:
+        if config.draft_model is not None:
             self.draft_model = EAGLEModel(
                 hf_config,
                 embed_tokens=self.model.model.embed_tokens,
                 lm_head=self.model.lm_head,
             )
             load_model(self.draft_model, config.draft_model)
-            self.last_hidden = {}  # seq_id -> hidden_state tensor
+        if self.speculative:
+            self.last_hidden = {}
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if self.speculative:
+        if config.draft_model is not None:
             self.allocate_draft_kv_cache()
+        if self.use_mtp:
+            self.allocate_mtp_kv_cache()
         if not self.enforce_eager:
             if self.device.is_cuda:
                 self.capture_cudagraph()
@@ -129,19 +142,25 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         # Account for draft model KV cache (1 layer, full MHA)
-        if self.speculative:
+        if self.speculative and config.draft_model is not None:
             num_attn_heads = hf_config.num_attention_heads // self.world_size
             draft_block_bytes = 2 * 1 * self.block_size * num_attn_heads * head_dim * hf_config.torch_dtype.itemsize
             block_bytes += draft_block_bytes
+        # Account for MTP KV cache (GQA, same kv_heads as main model)
+        if self.use_mtp:
+            num_mtp_layers = hf_config.num_nextn_predict_layers
+            mtp_block_bytes = 2 * num_mtp_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+            block_bytes += mtp_block_bytes
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        for layer in self.model.model.layers:
+            for module in layer.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
+                    layer_id += 1
 
     def allocate_draft_kv_cache(self):
         config = self.config
@@ -156,6 +175,24 @@ class ModelRunner:
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.draft_kv_cache[0, 0]
                 module.v_cache = self.draft_kv_cache[1, 0]
+
+    def allocate_mtp_kv_cache(self):
+        config = self.config
+        hf_config = config.hf_config
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        num_mtp_layers = hf_config.num_nextn_predict_layers
+        self.mtp_kv_cache = torch.empty(
+            2, num_mtp_layers, config.num_kvcache_blocks, self.block_size,
+            num_kv_heads, head_dim,
+        )
+        layer_id = 0
+        for mtp_layer in self.model.model.mtp_layers:
+            for module in mtp_layer.modules():
+                if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                    module.k_cache = self.mtp_kv_cache[0, layer_id]
+                    module.v_cache = self.mtp_kv_cache[1, layer_id]
+                    layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -277,6 +314,8 @@ class ModelRunner:
         if self.speculative:
             if is_prefill:
                 return self._run_prefill_with_hidden(seqs)
+            elif self.use_mtp:
+                return self._run_mtp_decode(seqs)
             else:
                 return self._run_speculative_decode(seqs)
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -288,12 +327,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _run_prefill_with_hidden(self, seqs: list[Sequence]) -> list[int]:
-        """Prefill that also saves last hidden states for EAGLE draft."""
+        """Prefill that also saves last hidden states for speculative draft."""
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         context = get_context()
         hidden = self.model(input_ids, positions)
-        # Save last hidden state per sequence
+        if self.use_mtp:
+            embeds = self.model.model.embed_tokens(input_ids)
+            self.model.model.mtp_layers[0](embeds, hidden, positions)
         last_indices = context.cu_seqlens_q[1:] - 1
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = hidden[last_indices[i]:last_indices[i]+1].clone()
@@ -411,6 +452,87 @@ class ModelRunner:
                     # All draft tokens accepted, add bonus token
                     accepted.append(target_predicted[k].item())
                 # Save last hidden state at accepted position
+                accepted_idx = offset + len(accepted) - 1
+                self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
+                all_accepted.append(accepted)
+                offset += num_verify
+            return all_accepted
+        else:
+            return None
+
+    @torch.inference_mode()
+    def _run_mtp_decode(self, seqs: list[Sequence]) -> list[list[int]]:
+        """Draft k tokens with MTP layers, then verify with target model."""
+        k = self.num_speculative_tokens
+        all_draft_tokens = []
+
+        mtp_layer = self.model.model.mtp_layers[0]
+        embed_tokens = self.model.model.embed_tokens
+
+        # === Draft phase (per-seq, eager) ===
+        for seq in seqs:
+            target_hidden = self.last_hidden[seq.seq_id]
+            draft_tokens = []
+            cur_token_id = seq.last_token
+            cur_pos = len(seq) - 1
+            for step in range(k):
+                input_id = self.device.to_device(
+                    torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
+                pos = self.device.to_device(
+                    torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
+                block_idx = cur_pos // self.block_size
+                block_offset = cur_pos % self.block_size
+                slot = seq.block_table[block_idx] * self.block_size + block_offset
+                slot_map = self.device.to_device(
+                    torch.tensor([slot], dtype=torch.int32, pin_memory=True))
+                block_table = self.device.to_device(
+                    torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
+                context_lens = self.device.to_device(
+                    torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
+                set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
+                token_embeds = embed_tokens(input_id)
+                mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
+                reset_context()
+                draft_logits = self.model.compute_logits_all(mtp_normed)
+                if self.rank == 0:
+                    d_token = draft_logits.argmax(dim=-1).item()
+                else:
+                    d_token = 0
+                if self.world_size > 1:
+                    d_tensor = torch.tensor([d_token], dtype=torch.int64, device=self.device.device_name)
+                    dist.broadcast(d_tensor, 0)
+                    d_token = d_tensor.item()
+                draft_tokens.append(d_token)
+                target_hidden = mtp_prenorm
+                cur_token_id = d_token
+                cur_pos += 1
+            all_draft_tokens.append(draft_tokens)
+
+        # === Verify phase (target model, prefill-like) ===
+        verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
+        hidden = self.model(verify_ids, verify_pos)
+        verify_embeds = embed_tokens(verify_ids)
+        mtp_layer(verify_embeds, hidden, verify_pos)
+        target_logits = self.model.compute_logits_all(self.model.model.norm(hidden))
+        reset_context()
+
+        # === Accept phase (greedy, rank 0 only) ===
+        if self.rank == 0:
+            all_accepted = []
+            offset = 0
+            for seq, draft_tokens in zip(seqs, all_draft_tokens):
+                num_verify = len(draft_tokens) + 1
+                seq_logits = target_logits[offset:offset + num_verify]
+                target_predicted = seq_logits.argmax(dim=-1)
+                accepted = []
+                for j in range(k):
+                    if target_predicted[j].item() == draft_tokens[j]:
+                        accepted.append(draft_tokens[j])
+                    else:
+                        accepted.append(target_predicted[j].item())
+                        break
+                else:
+                    accepted.append(target_predicted[k].item())
                 accepted_idx = offset + len(accepted) - 1
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)

@@ -11,7 +11,7 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.speculative = config.draft_model is not None
+        self.speculative = config.draft_model is not None or config.use_mtp
         self.num_speculative_tokens = config.num_speculative_tokens
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
@@ -88,9 +88,17 @@ class Scheduler:
         for seq, token_ids in zip(seqs, all_token_ids):
             for token_id in token_ids:
                 seq.append_token(token_id)
-                self.block_manager.may_append(seq)
                 if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
                     self.running.remove(seq)
                     break
+            else:
+                # Trim excess pre-allocated blocks
+                needed = seq.num_blocks
+                while len(seq.block_table) > needed:
+                    block_id = seq.block_table.pop()
+                    block = self.block_manager.blocks[block_id]
+                    block.ref_count -= 1
+                    if block.ref_count == 0:
+                        self.block_manager._deallocate_block(block_id)

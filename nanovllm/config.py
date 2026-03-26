@@ -25,12 +25,15 @@ class Config:
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
-        self.hf_config = AutoConfig.from_pretrained(self.model)
+        self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        self.use_mtp = getattr(self.hf_config, 'num_nextn_predict_layers', 0) > 0
+        if self.use_mtp and self.draft_model is None:
+            self.num_speculative_tokens = self.hf_config.num_nextn_predict_layers
         if self.draft_model is not None:
             assert os.path.isdir(self.draft_model)
-            self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model)
+            self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model, trust_remote_code=True)
         else:
             self.draft_hf_config = None
 

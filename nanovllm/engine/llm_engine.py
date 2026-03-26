@@ -27,9 +27,11 @@ class LLMEngine:
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
-        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
-        config.eos = self.tokenizer.eos_token_id
-        self.speculative = config.draft_model is not None
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True, trust_remote_code=True)
+        eos = self.tokenizer.eos_token_id
+        config.eos = eos[0] if isinstance(eos, list) else eos
+        self.speculative = config.draft_model is not None or config.use_mtp
+        self.num_speculative_tokens = config.num_speculative_tokens
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
@@ -47,16 +49,20 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        draft_count = accept_count = 0
         if self.speculative and not is_prefill:
             all_token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess_speculative(seqs, all_token_ids)
             num_tokens = -sum(len(tids) for tids in all_token_ids)
+            k = self.num_speculative_tokens
+            draft_count = k * len(seqs)
+            accept_count = sum(len(tids) - 1 for tids in all_token_ids)
         else:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess(seqs, token_ids)
             num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens
+        return outputs, num_tokens, draft_count, accept_count
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -75,18 +81,24 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        total_draft = total_accept = 0
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens = self.step()
+            output, num_tokens, draft_count, accept_count = self.step()
+            total_draft += draft_count
+            total_accept += accept_count
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
                 else:
                     decode_throughput = -num_tokens / (perf_counter() - t)
-                pbar.set_postfix({
+                postfix = {
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",
-                })
+                }
+                if total_draft > 0:
+                    postfix["Accept"] = f"{total_accept/total_draft:.1%}"
+                pbar.set_postfix(postfix)
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
@@ -95,4 +107,7 @@ class LLMEngine:
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:
             pbar.close()
+        if total_draft > 0:
+            print(f"Speculative decoding: {total_accept}/{total_draft} draft tokens accepted ({total_accept/total_draft:.1%}), "
+                  f"avg {total_accept/max(total_draft//self.num_speculative_tokens, 1):.2f} tokens/step")
         return outputs
