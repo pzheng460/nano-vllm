@@ -12,10 +12,13 @@ class VocabParallelEmbedding(nn.Module):
         self,
         num_embeddings: int,
         embedding_dim: int,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_group = tp_group
+        self.tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
+        self.tp_rank = 0 if self.tp_size == 1 else (dist.get_rank(tp_group) if tp_group is not None else dist.get_rank())
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
@@ -38,7 +41,7 @@ class VocabParallelEmbedding(nn.Module):
         y = F.embedding(x, self.weight)
         if self.tp_size > 1:
             y = mask.unsqueeze(1) * y
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=self.tp_group)
         return y
 
 
@@ -49,9 +52,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         num_embeddings: int,
         embedding_dim: int,
         bias: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
         assert not bias
-        super().__init__(num_embeddings, embedding_dim)
+        super().__init__(num_embeddings, embedding_dim, tp_group=tp_group, tp_size=tp_size)
 
     def forward(self, x: torch.Tensor):
         context = get_context()
@@ -61,6 +66,6 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0)
+            dist.gather(logits, all_logits, 0, group=self.tp_group)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
         return logits

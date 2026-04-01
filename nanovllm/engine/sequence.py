@@ -27,6 +27,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # SSD state
+        self.last_accepted_len = 0
+        self.recovery_token_id = None
 
     def __len__(self):
         return self.num_tokens
@@ -72,11 +75,12 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+        return (self.seq_id, self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.seq_id = state[0]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[1:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:

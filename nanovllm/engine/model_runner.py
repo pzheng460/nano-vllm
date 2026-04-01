@@ -1,5 +1,6 @@
 import pickle
 import torch
+import torch.nn.functional as F
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -20,6 +21,11 @@ def _get_model_cls(hf_config):
     if model_type == 'mimo':
         from nanovllm.models.mimo import MiMoForCausalLM
         return MiMoForCausalLM
+    # PanGu model types
+    pangu_types = {'PanguProMoE', 'PanguProMoEV2', 'PanguUltraMoE', 'PanguEmbedded', 'pangu'}
+    if model_type in pangu_types or getattr(hf_config, 'param_sink_number', 0) > 0:
+        from nanovllm.models.pangu import PanguForCausalLM
+        return PanguForCausalLM
     return Qwen3ForCausalLM
 
 
@@ -30,29 +36,43 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.tp_size = config.tensor_parallel_size
+        self.world_size = config.num_gpus  # includes draft rank if async
         self.rank = rank
         self.event = event
 
-        # Get device backend (already initialized in nanovllm.__init__)
         self.device = get_device_backend()
 
-        dist.init_process_group(self.device.get_dist_backend(), "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        # Unified process group: all ranks (target TP + draft) join one world
+        dist.init_process_group(self.device.get_dist_backend(), "tcp://localhost:2333",
+                                world_size=self.world_size, rank=rank)
+        # Sub-groups IMMEDIATELY after init (collective, all ranks must participate)
+        tp_ranks = list(range(self.tp_size))
+        self.tp_group = dist.new_group(tp_ranks) if self.world_size > 1 else None
+        self.async_pg = None
+        if config.draft_async:
+            self.async_pg = dist.new_group([0, config.draft_rank])
+            self.draft_rank = config.draft_rank
+
         self.device.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device.device_name)
         model_cls = _get_model_cls(hf_config)
-        self.model = model_cls(hf_config)
+        self.model = model_cls(hf_config, tp_group=self.tp_group, tp_size=self.tp_size)
         load_model(self.model, config.model)
         self.use_mtp = config.use_mtp
+        self.draft_async = config.draft_async
         self.speculative = config.draft_model is not None or self.use_mtp
+        # MTP uses its own shared_head (norm + head trained together, NOT shared with target lm_head)
         self.num_speculative_tokens = config.num_speculative_tokens
         if config.draft_model is not None:
             self.draft_model = EAGLEModel(
                 hf_config,
                 embed_tokens=self.model.model.embed_tokens,
                 lm_head=self.model.lm_head,
+                tp_group=self.tp_group,
+                tp_size=self.tp_size,
             )
             load_model(self.draft_model, config.draft_model)
         if self.speculative:
@@ -72,19 +92,27 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        # Pre-allocate NCCL buffers for SSD communication
+        if self.draft_async and rank == 0:
+            d = self.device.device_name
+            self._cmd_buf = torch.zeros(1, dtype=torch.int64, device=d)
+            self._meta_buf = torch.zeros(8, dtype=torch.int64, device=d)
+            self._hidden_buf = torch.zeros(1, hf_config.hidden_size, dtype=hf_config.torch_dtype, device=d)
+            self._draft_tokens_buf = torch.zeros(config.num_speculative_tokens, dtype=torch.int64, device=d)
+
+        if self.tp_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
-            else:
-                dist.barrier()
+                dist.barrier(group=self.tp_group)
+            elif rank < self.tp_size:
+                dist.barrier(group=self.tp_group)
                 self.shm = SharedMemory(name="nanovllm")
                 self.loop()
 
     def exit(self):
-        if self.world_size > 1:
+        if self.tp_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(group=self.tp_group)
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
@@ -100,7 +128,7 @@ class ModelRunner:
                 break
 
     def read_shm(self):
-        assert self.world_size > 1 and self.rank > 0
+        assert self.tp_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
@@ -108,7 +136,7 @@ class ModelRunner:
         return method_name, args
 
     def write_shm(self, method_name, *args):
-        assert self.world_size > 1 and self.rank == 0
+        assert self.tp_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
@@ -117,7 +145,7 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        if self.tp_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
@@ -128,8 +156,22 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        # During warmup, skip SSD communication (draft not ready yet)
+        saved_async = self.draft_async
+        self.draft_async = False
         self.run(seqs, True)
+        self.draft_async = saved_async
         self.device.empty_cache()
+
+    def _get_kv_head_dim(self):
+        """Get the effective head_dim for KV cache allocation.
+        For PanGu with sink attention, head_dim = qk_rope_dim + qk_nope_dim."""
+        hf = self.config.hf_config
+        qk_rope_dim = getattr(hf, 'qk_rope_dim', None)
+        qk_nope_dim = getattr(hf, 'qk_nope_dim', None)
+        if qk_rope_dim is not None and qk_nope_dim is not None:
+            return qk_rope_dim + qk_nope_dim
+        return getattr(hf, "head_dim", hf.hidden_size // hf.num_attention_heads)
 
     def allocate_kv_cache(self):
         config = self.config
@@ -138,12 +180,12 @@ class ModelRunner:
         used = total - free
         peak = self.device.memory_stats()["allocated_bytes.all.peak"]
         current = self.device.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        num_kv_heads = hf_config.num_key_value_heads // self.tp_size
+        head_dim = self._get_kv_head_dim()
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         # Account for draft model KV cache (1 layer, full MHA)
         if self.speculative and config.draft_model is not None:
-            num_attn_heads = hf_config.num_attention_heads // self.world_size
+            num_attn_heads = hf_config.num_attention_heads // self.tp_size
             draft_block_bytes = 2 * 1 * self.block_size * num_attn_heads * head_dim * hf_config.torch_dtype.itemsize
             block_bytes += draft_block_bytes
         # Account for MTP KV cache (GQA, same kv_heads as main model)
@@ -151,9 +193,12 @@ class ModelRunner:
             num_mtp_layers = hf_config.num_nextn_predict_layers
             mtp_block_bytes = 2 * num_mtp_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
             block_bytes += mtp_block_bytes
+        # Reserve blocks for sink KV
+        num_sink_blocks = config.num_sink_blocks
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        assert config.num_kvcache_blocks > num_sink_blocks
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+        from nanovllm.models.pangu import PanguSinkAttention
         layer_id = 0
         for layer in self.model.model.layers:
             for module in layer.modules():
@@ -161,6 +206,10 @@ class ModelRunner:
                     module.k_cache = self.kv_cache[0, layer_id]
                     module.v_cache = self.kv_cache[1, layer_id]
                     layer_id += 1
+            # After setting cache, populate sink KV on PanguSinkAttention
+            if num_sink_blocks > 0 and hasattr(layer, 'self_attn') and isinstance(layer.self_attn, PanguSinkAttention):
+                layer.self_attn.sink_block_ids = list(range(num_sink_blocks))
+                layer.self_attn._populate_sink_to_cache(self.block_size)
 
     def allocate_draft_kv_cache(self):
         config = self.config
@@ -179,13 +228,15 @@ class ModelRunner:
     def allocate_mtp_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        num_kv_heads = hf_config.num_key_value_heads // self.tp_size
+        head_dim = self._get_kv_head_dim()
         num_mtp_layers = hf_config.num_nextn_predict_layers
+        num_sink_blocks = config.num_sink_blocks
         self.mtp_kv_cache = torch.empty(
             2, num_mtp_layers, config.num_kvcache_blocks, self.block_size,
             num_kv_heads, head_dim,
         )
+        from nanovllm.models.pangu import PanguSinkAttention
         layer_id = 0
         for mtp_layer in self.model.model.mtp_layers:
             for module in mtp_layer.modules():
@@ -193,6 +244,12 @@ class ModelRunner:
                     module.k_cache = self.mtp_kv_cache[0, layer_id]
                     module.v_cache = self.mtp_kv_cache[1, layer_id]
                     layer_id += 1
+            # Populate sink KV for MTP's decoder layer
+            if num_sink_blocks > 0 and hasattr(mtp_layer, 'mtp_block'):
+                attn = getattr(mtp_layer.mtp_block, 'self_attn', None)
+                if isinstance(attn, PanguSinkAttention):
+                    attn.sink_block_ids = list(range(num_sink_blocks))
+                    attn._populate_sink_to_cache(self.block_size)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -231,6 +288,15 @@ class ModelRunner:
                 slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+            # Prepend sink block IDs for prefix cache prefill
+            if self.config.num_sink_blocks > 0:
+                sink_ids = list(range(self.config.num_sink_blocks))
+                bs = block_tables.size(0)
+                sink_cols = torch.tensor([sink_ids] * bs, dtype=torch.int32, device=block_tables.device)
+                block_tables = torch.cat([sink_cols, block_tables], dim=1)
+                sink_ctx = self.config.sink_len
+                cu_seqlens_k = [cu_seqlens_k[0]] + [c + sink_ctx * i for i, c in enumerate(cu_seqlens_k[1:], 1)]
+                max_seqlen_k += sink_ctx
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         cu_seqlens_q = self.device.to_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True))
@@ -247,7 +313,7 @@ class ModelRunner:
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
+            context_lens.append(len(seq))  # No sink adjustment; handled inside attention
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
@@ -267,6 +333,10 @@ class ModelRunner:
             temperatures.append(seq.temperature)
         temperatures = self.device.to_device(torch.tensor(temperatures, dtype=torch.float32, pin_memory=True))
         return temperatures
+
+    def lm_head_logits(self, hidden_normed: torch.Tensor) -> torch.Tensor:
+        """Compute logits from already-normed hidden states (avoids double-norm)."""
+        return self.model.lm_head(hidden_normed)
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -313,7 +383,11 @@ class ModelRunner:
     def run(self, seqs: list[Sequence], is_prefill: bool):
         if self.speculative:
             if is_prefill:
+                if self.draft_async:
+                    return self._run_ssd_prefill_with_hidden(seqs)
                 return self._run_prefill_with_hidden(seqs)
+            elif self.draft_async:
+                return self._run_ssd_decode(seqs)
             elif self.use_mtp:
                 return self._run_mtp_decode(seqs)
             else:
@@ -331,15 +405,26 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         context = get_context()
-        hidden = self.model(input_ids, positions)
-        if self.use_mtp:
-            embeds = self.model.model.embed_tokens(input_ids)
-            self.model.model.mtp_layers[0](embeds, hidden, positions)
+        hidden = self.model(input_ids, positions)  # unnormed residual
+        # PanGu MTP expects normed hidden (vLLM's OpenPanguModel returns normed)
+        hidden_normed = self.model.model.norm(hidden)
         last_indices = context.cu_seqlens_q[1:] - 1
-        for i, seq in enumerate(seqs):
-            self.last_hidden[seq.seq_id] = hidden[last_indices[i]:last_indices[i]+1].clone()
-        logits = self.model.compute_logits(hidden)
+        logits = self.lm_head_logits(hidden_normed)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        if self.use_mtp:
+            # vLLM shifts input_ids for MTP: position i gets token_{i+1}'s embedding
+            shifted_ids = input_ids.clone()
+            shifted_ids[:-1] = input_ids[1:]
+            # Last position of each seq gets the sampled next token
+            if self.rank == 0:
+                for i, idx in enumerate(last_indices.tolist()):
+                    shifted_ids[idx] = token_ids[i]
+            if self.tp_size > 1:
+                dist.broadcast(shifted_ids, 0, group=self.tp_group)
+            embeds = self.model.model.embed_tokens(shifted_ids)
+            self.model.model.mtp_layers[0](embeds, hidden_normed, positions)
+        for i, seq in enumerate(seqs):
+            self.last_hidden[seq.seq_id] = hidden_normed[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
 
@@ -372,6 +457,15 @@ class ModelRunner:
                 slot = seq.block_table[block_idx] * self.block_size + block_offset
                 slot_mapping.append(slot)
         block_tables = self.prepare_block_tables(seqs)
+        # Prepend sink block IDs for verify (needed for sink attention with cache)
+        if self.config.num_sink_blocks > 0:
+            sink_ids = list(range(self.config.num_sink_blocks))
+            bs = block_tables.size(0)
+            sink_cols = torch.tensor([sink_ids] * bs, dtype=torch.int32, device=block_tables.device)
+            block_tables = torch.cat([sink_cols, block_tables], dim=1)
+            sink_ctx = self.config.sink_len
+            cu_seqlens_k = [cu_seqlens_k[0]] + [c + sink_ctx * i for i, c in enumerate(cu_seqlens_k[1:], 1)]
+            max_seqlen_k += sink_ctx
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         cu_seqlens_q = self.device.to_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True))
@@ -417,9 +511,9 @@ class ModelRunner:
                 else:
                     d_token = 0
                 # Broadcast draft token in TP
-                if self.world_size > 1:
+                if self.tp_size > 1:
                     d_tensor = torch.tensor([d_token], dtype=torch.int64, device=self.device.device_name)
-                    dist.broadcast(d_tensor, 0)
+                    dist.broadcast(d_tensor, 0, group=self.tp_group)
                     d_token = d_tensor.item()
                 draft_tokens.append(d_token)
                 target_hidden = draft_hidden
@@ -493,27 +587,32 @@ class ModelRunner:
                 token_embeds = embed_tokens(input_id)
                 mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
                 reset_context()
-                draft_logits = self.model.compute_logits_all(mtp_normed)
+                # MTP draft logits using shared_head (norm + head trained together)
+                draft_logits = F.linear(mtp_normed, mtp_layer.shared_head.head.weight)
+                if self.tp_size > 1:
+                    all_logits = [torch.empty_like(draft_logits) for _ in range(self.tp_size)] if self.rank == 0 else None
+                    dist.gather(draft_logits, all_logits, 0, group=self.tp_group)
+                    draft_logits = torch.cat(all_logits, -1) if self.rank == 0 else None
                 if self.rank == 0:
                     d_token = draft_logits.argmax(dim=-1).item()
+                    pass
                 else:
                     d_token = 0
-                if self.world_size > 1:
+                if self.tp_size > 1:
                     d_tensor = torch.tensor([d_token], dtype=torch.int64, device=self.device.device_name)
-                    dist.broadcast(d_tensor, 0)
+                    dist.broadcast(d_tensor, 0, group=self.tp_group)
                     d_token = d_tensor.item()
                 draft_tokens.append(d_token)
-                target_hidden = mtp_prenorm
+                target_hidden = mtp_normed  # PanGu MTP expects normed hidden
                 cur_token_id = d_token
                 cur_pos += 1
             all_draft_tokens.append(draft_tokens)
 
         # === Verify phase (target model, prefill-like) ===
         verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
-        hidden = self.model(verify_ids, verify_pos)
-        verify_embeds = embed_tokens(verify_ids)
-        mtp_layer(verify_embeds, hidden, verify_pos)
-        target_logits = self.model.compute_logits_all(self.model.model.norm(hidden))
+        hidden = self.model(verify_ids, verify_pos)  # unnormed residual
+        hidden_normed = self.model.model.norm(hidden)
+        target_logits = self.model.compute_logits_all(hidden_normed)
         reset_context()
 
         # === Accept phase (greedy, rank 0 only) ===
@@ -533,6 +632,256 @@ class ModelRunner:
                         break
                 else:
                     accepted.append(target_predicted[k].item())
+                all_accepted.append(accepted)
+                offset += num_verify
+        else:
+            all_accepted = [[] for _ in seqs]
+
+        # === Update MTP KV cache in DECODE mode ===
+        offset = 0
+        for seq_idx, seq in enumerate(seqs):
+            num_accepted = len(all_accepted[seq_idx]) if self.rank == 0 else 0
+            if self.tp_size > 1:
+                na_t = torch.tensor([num_accepted], dtype=torch.int64, device=self.device.device_name)
+                dist.broadcast(na_t, 0, group=self.tp_group)
+                num_accepted = na_t.item()
+            num_verify = len(all_draft_tokens[seq_idx]) + 1
+            base_pos = len(seq) - 1
+            for j in range(num_accepted):
+                cur_pos = base_pos + j
+                if self.rank == 0:
+                    tok_id = all_accepted[seq_idx][j]
+                else:
+                    tok_id = 0
+                if self.tp_size > 1:
+                    tt = torch.tensor([tok_id], dtype=torch.int64, device=self.device.device_name)
+                    dist.broadcast(tt, 0, group=self.tp_group)
+                    tok_id = tt.item()
+                input_id = self.device.to_device(torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
+                pos = self.device.to_device(torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
+                block_idx = cur_pos // self.block_size
+                block_offset = cur_pos % self.block_size
+                slot = seq.block_table[block_idx] * self.block_size + block_offset
+                slot_map = self.device.to_device(torch.tensor([slot], dtype=torch.int32, pin_memory=True))
+                block_table = self.device.to_device(torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
+                context_lens = self.device.to_device(
+                    torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
+                set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
+                token_embeds = embed_tokens(input_id)
+                target_h = hidden_normed[offset + j:offset + j + 1]
+                mtp_layer(token_embeds, target_h, pos)
+                reset_context()
+            # Save last accepted hidden for next round
+            if self.rank == 0:
+                accepted_idx = offset + len(all_accepted[seq_idx]) - 1
+                self.last_hidden[seq.seq_id] = hidden_normed[accepted_idx:accepted_idx + 1].clone()
+            offset += num_verify
+
+        if self.rank == 0:
+            return all_accepted
+        return None
+
+    def _send_cmd(self, cmd: int):
+        """Send command to draft via NCCL."""
+        if not hasattr(self, '_cmd_buf'):
+            return
+        self._cmd_buf[0] = cmd
+        dist.send(self._cmd_buf, dst=self.draft_rank, group=self.async_pg)
+
+    @torch.inference_mode()
+    def _run_ssd_prefill_with_hidden(self, seqs: list[Sequence]) -> list[int]:
+        """SSD prefill: run target model, send hidden to draft via NCCL."""
+        input_ids, positions = self.prepare_prefill(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        context = get_context()
+
+        hidden = self.model(input_ids, positions)
+
+        if self.use_mtp:
+            embeds = self.model.model.embed_tokens(input_ids)
+            self.model.model.mtp_layers[0](embeds, hidden, positions)
+
+        last_indices = context.cu_seqlens_q[1:] - 1
+        for i, seq in enumerate(seqs):
+            self.last_hidden[seq.seq_id] = hidden[last_indices[i]:last_indices[i]+1].clone()
+
+            if self.rank == 0 and self.async_pg is not None:
+                start = 0 if i == 0 else context.cu_seqlens_q[i].item()
+                end = context.cu_seqlens_q[i + 1].item()
+                n = end - start
+                seq_positions = list(range(seq.num_cached_tokens, len(seq)))
+                seq_tokens = seq[seq.num_cached_tokens:]
+                bt = seq.block_table
+
+                # Send cmd=1 (prefill) + metadata via NCCL
+                self._send_cmd(1)
+                meta = torch.tensor([seq.seq_id, n, len(bt)], dtype=torch.int64, device=self.device.device_name)
+                dist.send(meta, dst=self.draft_rank, group=self.async_pg)
+                dist.send(torch.tensor(seq_tokens, dtype=torch.int64, device=self.device.device_name),
+                          dst=self.draft_rank, group=self.async_pg)
+                dist.send(hidden[start:end].contiguous(), dst=self.draft_rank, group=self.async_pg)
+                dist.send(torch.tensor(seq_positions, dtype=torch.int64, device=self.device.device_name),
+                          dst=self.draft_rank, group=self.async_pg)
+                dist.send(torch.tensor(bt, dtype=torch.int32, device=self.device.device_name),
+                          dst=self.draft_rank, group=self.async_pg)
+                # Wait for ack
+                ack = torch.zeros(1, dtype=torch.int64, device=self.device.device_name)
+                dist.recv(ack, src=self.draft_rank, group=self.async_pg)
+
+        logits = self.model.compute_logits(hidden)
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        reset_context()
+
+        if self.rank == 0:
+            for seq, tid in zip(seqs, token_ids):
+                seq.recovery_token_id = tid
+        return token_ids
+
+    @torch.inference_mode()
+    def _run_ssd_decode(self, seqs: list[Sequence]) -> list[list[int]]:
+        """SSD decode: send spec request to draft via NCCL, verify with target."""
+        k = self.num_speculative_tokens
+        all_draft_tokens = []
+        d = self.device.device_name
+
+        # === Speculation phase ===
+        # Check if draft has cached result (from last step's early_speculate).
+        # Target knows what candidates it sent — if recovery_token is in candidates → hit.
+        # On hit: NCCL to draft (fast). On miss: local MTP (same as sync, no penalty).
+        mtp_layer = self.model.model.mtp_layers[0]
+        embed_tokens = self.model.model.embed_tokens
+        if self.rank == 0 and self.async_pg is not None:
+            if not hasattr(self, '_last_candidates'):
+                self._last_candidates = {}
+            for seq in seqs:
+                candidates = self._last_candidates.get(seq.seq_id, set())
+                if seq.last_token in candidates:
+                    # Cache HIT path: lightweight lookup — just send 3 ints, recv K ints
+                    self._send_cmd(6)  # cmd=6: cache_lookup
+                    lookup = torch.tensor([seq.seq_id, seq.last_accepted_len, seq.last_token],
+                                          dtype=torch.int64, device=d)
+                    dist.send(lookup, dst=self.draft_rank, group=self.async_pg)
+                    dist.recv(self._draft_tokens_buf[:k], src=self.draft_rank, group=self.async_pg)
+                    all_draft_tokens.append(self._draft_tokens_buf[:k].tolist())
+                else:
+                    # Cache MISS path: local MTP on target GPU (identical to sync)
+                    target_hidden = self.last_hidden[seq.seq_id]
+                    draft_tokens = []
+                    cur_token_id = seq.last_token
+                    cur_pos = len(seq) - 1
+                    for step in range(k):
+                        input_id = self.device.to_device(
+                            torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
+                        pos = self.device.to_device(
+                            torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
+                        block_idx = cur_pos // self.block_size
+                        block_offset = cur_pos % self.block_size
+                        slot = seq.block_table[block_idx] * self.block_size + block_offset
+                        slot_map = self.device.to_device(
+                            torch.tensor([slot], dtype=torch.int32, pin_memory=True))
+                        bt = seq.block_table
+                        if self.config.num_sink_blocks > 0:
+                            bt = list(range(self.config.num_sink_blocks)) + bt
+                        sink_ctx_ssd = self.config.num_sink_blocks * self.block_size
+                        block_table = self.device.to_device(
+                            torch.tensor([bt], dtype=torch.int32, pin_memory=True))
+                        context_lens = self.device.to_device(
+                            torch.tensor([cur_pos + 1 + sink_ctx_ssd], dtype=torch.int32, pin_memory=True))
+                        set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
+                        token_embeds = embed_tokens(input_id)
+                        mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
+                        reset_context()
+                        draft_logits = self.model.compute_logits_all(mtp_normed)
+                        d_token = draft_logits.argmax(dim=-1).item()
+                        draft_tokens.append(d_token)
+                        target_hidden = mtp_prenorm
+                        cur_token_id = d_token
+                        cur_pos += 1
+                    all_draft_tokens.append(draft_tokens)
+
+        # Broadcast draft tokens to TP workers
+        if self.tp_size > 1:
+            for i, seq in enumerate(seqs):
+                for j in range(k):
+                    d_tensor = torch.tensor([all_draft_tokens[i][j]], dtype=torch.int64, device=d)
+                    dist.broadcast(d_tensor, 0, group=self.tp_group)
+                    if self.rank != 0:
+                        all_draft_tokens[i][j] = d_tensor.item()
+
+        # === Verify phase (layer-by-layer for early hidden extraction) ===
+        verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
+        model_inner = self.model.model
+        early_layer = len(model_inner.layers) - 8
+
+        hidden_states = model_inner.embed_tokens(verify_ids)
+        residual = None
+        for i, layer in enumerate(model_inner.layers):
+            hidden_states, residual = layer(verify_pos, hidden_states, residual)
+            if i == early_layer and self.rank == 0 and self.async_pg is not None:
+                # At layer N-2: extract early hidden at ALL K+1 verify positions
+                early_hidden_all = (hidden_states + residual)
+                offset_e = 0
+                for seq_i, (seq, dt) in enumerate(zip(seqs, all_draft_tokens)):
+                    nv = len(dt) + 1  # K+1 positions
+                    all_pos_early = early_hidden_all[offset_e:offset_e + nv]  # [K+1, hidden]
+                    # Send cmd + meta + all K+1 hidden states
+                    self._send_cmd(5)
+                    meta = torch.tensor([seq.seq_id, k, nv, len(seq) + len(dt)],
+                                        dtype=torch.int64, device=d)
+                    dist.send(meta, dst=self.draft_rank, group=self.async_pg)
+                    dist.send(all_pos_early.contiguous(),
+                              dst=self.draft_rank, group=self.async_pg)
+                    if not hasattr(self, '_early_hiddens_for_candidates'):
+                        self._early_hiddens_for_candidates = {}
+                    self._early_hiddens_for_candidates[seq.seq_id] = all_pos_early.clone()
+                    offset_e += nv
+
+        hidden_states, residual = model_inner.norm(hidden_states, residual)
+        hidden = residual
+
+        # MTP KV cache update on target side
+        verify_embeds = model_inner.embed_tokens(verify_ids)
+        model_inner.mtp_layers[0](verify_embeds, hidden, verify_pos)
+        target_logits = self.model.compute_logits_all(model_inner.norm(hidden))
+        reset_context()
+
+        # === Accept phase ===
+        # Compute candidates (off critical path) to predict hit/miss next step
+        # Mirror draft's computation: for each of K+1 positions, norm → lm_head → topF
+        if self.rank == 0 and self.async_pg is not None:
+            if not hasattr(self, '_last_candidates'):
+                self._last_candidates = {}
+            if hasattr(self, '_early_hiddens_for_candidates'):
+                fan = self.config.async_fan_out
+                for seq_id, eh_all in self._early_hiddens_for_candidates.items():
+                    # eh_all: [K+1, hidden] — all verify positions
+                    all_cands = set()
+                    en = model_inner.norm(eh_all)  # [K+1, hidden]
+                    el = F.linear(en, self.model.lm_head.weight)  # [K+1, V]
+                    _, topf = torch.topk(el, fan, dim=-1)  # [K+1, F]
+                    all_cands = set(topf.reshape(-1).tolist())
+                    self._last_candidates[seq_id] = all_cands
+                self._early_hiddens_for_candidates = {}
+
+        if self.rank == 0:
+            all_accepted = []
+            offset = 0
+            for seq, draft_tokens in zip(seqs, all_draft_tokens):
+                num_verify = len(draft_tokens) + 1
+                seq_logits = target_logits[offset:offset + num_verify]
+                target_predicted = seq_logits.argmax(dim=-1)
+                accepted = []
+                for j in range(k):
+                    if target_predicted[j].item() == draft_tokens[j]:
+                        accepted.append(draft_tokens[j])
+                    else:
+                        accepted.append(target_predicted[j].item())
+                        break
+                else:
+                    accepted.append(target_predicted[k].item())
+
+                seq.last_accepted_len = len(accepted) - 1
+                seq.recovery_token_id = accepted[-1]
                 accepted_idx = offset + len(accepted) - 1
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
@@ -546,7 +895,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size + config.num_sink_blocks
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
@@ -584,7 +933,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size + config.num_sink_blocks
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)

@@ -25,12 +25,16 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int, num_reserved_blocks: int = 0):
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        # Reserve first num_reserved_blocks for sink KV (never freed)
+        self.num_reserved_blocks = num_reserved_blocks
+        self.free_block_ids: deque[int] = deque(range(num_reserved_blocks, num_blocks))
+        self.used_block_ids: set[int] = set(range(num_reserved_blocks))
+        for i in range(num_reserved_blocks):
+            self.blocks[i].ref_count = 1  # Keep reserved blocks permanently
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):

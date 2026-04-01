@@ -17,11 +17,14 @@ class LinearBase(nn.Module):
         output_size: int,
         bias: bool = False,
         tp_dim: int | None = None,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
         super().__init__()
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_group = tp_group
+        self.tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
+        self.tp_rank = 0 if self.tp_size == 1 else (dist.get_rank(tp_group) if tp_group is not None else dist.get_rank())
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -41,8 +44,10 @@ class ReplicatedLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
-        super().__init__(input_size, output_size, bias)
+        super().__init__(input_size, output_size, bias, tp_group=tp_group, tp_size=tp_size)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
@@ -58,9 +63,11 @@ class ColumnParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
-        tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        _tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
+        super().__init__(input_size, divide(output_size, _tp_size), bias, 0, tp_group=tp_group, tp_size=tp_size)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -80,9 +87,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         input_size: int,
         output_sizes: list[int],
         bias: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
         self.output_sizes = output_sizes
-        super().__init__(input_size, sum(output_sizes), bias)
+        super().__init__(input_size, sum(output_sizes), bias, tp_group=tp_group, tp_size=tp_size)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
@@ -102,14 +111,16 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_heads: int,
         total_num_kv_heads: int | None = None,
         bias: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
-        tp_size = dist.get_world_size()
+        _tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, tp_size)
-        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+        self.num_heads = divide(total_num_heads, _tp_size)
+        self.num_kv_heads = divide(total_num_kv_heads, _tp_size)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
-        super().__init__(hidden_size, output_size, bias)
+        super().__init__(hidden_size, output_size, bias, tp_group=tp_group, tp_size=tp_size)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
         param_data = param.data
@@ -135,9 +146,11 @@ class RowParallelLinear(LinearBase):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ):
-        tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        _tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
+        super().__init__(divide(input_size, _tp_size), output_size, bias, 1, tp_group=tp_group, tp_size=tp_size)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -149,5 +162,5 @@ class RowParallelLinear(LinearBase):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
-            dist.all_reduce(y)
+            dist.all_reduce(y, group=self.tp_group)
         return y

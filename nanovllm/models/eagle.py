@@ -23,15 +23,17 @@ class EAGLEAttention(nn.Module):
         rms_norm_eps: float = 1e-06,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        tp_group: dist.ProcessGroup | None = None,
+        tp_size: int | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        _tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
+        assert self.total_num_heads % _tp_size == 0
+        self.num_heads = self.total_num_heads // _tp_size
         self.total_num_kv_heads = num_kv_heads
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size
+        assert self.total_num_kv_heads % _tp_size == 0
+        self.num_kv_heads = self.total_num_kv_heads // _tp_size
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
@@ -43,11 +45,15 @@ class EAGLEAttention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=True,
+            tp_group=tp_group,
+            tp_size=tp_size,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
+            tp_group=tp_group,
+            tp_size=tp_size,
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -80,10 +86,9 @@ class EAGLEAttention(nn.Module):
 
 
 class EAGLEDecoderLayer(nn.Module):
-    """EAGLE decoder layer: no input_layernorm, only post_attention_layernorm.
-    Matches the EAGLE-Qwen2-7B-Instruct checkpoint structure."""
+    """EAGLE decoder layer: no input_layernorm, only post_attention_layernorm."""
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, tp_group=None, tp_size=None) -> None:
         super().__init__()
         hidden_size = config.hidden_size
         self.self_attn = EAGLEAttention(
@@ -95,11 +100,15 @@ class EAGLEDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            tp_group=tp_group,
+            tp_size=tp_size,
         )
         self.mlp = Qwen3MLP(
             hidden_size=hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            tp_group=tp_group,
+            tp_size=tp_size,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
@@ -127,13 +136,13 @@ class EAGLEModel(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config, embed_tokens, lm_head):
+    def __init__(self, config, embed_tokens, lm_head, tp_group=None, tp_size=None):
         super().__init__()
         hidden_size = config.hidden_size
         self.embed_tokens = embed_tokens   # shared, frozen
         self.lm_head = lm_head             # shared, frozen
-        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True)
-        self.layers = nn.ModuleList([EAGLEDecoderLayer(config)])
+        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_group=tp_group, tp_size=tp_size)
+        self.layers = nn.ModuleList([EAGLEDecoderLayer(config, tp_group=tp_group, tp_size=tp_size)])
 
     def forward(
         self,

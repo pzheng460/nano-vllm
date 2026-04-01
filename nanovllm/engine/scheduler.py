@@ -13,7 +13,10 @@ class Scheduler:
         self.eos = config.eos
         self.speculative = config.draft_model is not None or config.use_mtp
         self.num_speculative_tokens = config.num_speculative_tokens
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # SSD needs extra block pre-allocation for tree decode
+        self.ssd_lookahead = getattr(config, 'ssd_total_lookahead', 0)
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
+                                         num_reserved_blocks=getattr(config, 'num_sink_blocks', 0))
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -47,7 +50,9 @@ class Scheduler:
             seq = self.running.popleft()
             if self.speculative:
                 # Pre-allocate blocks for speculative tokens (k+1: last_token + k draft)
-                while not self.block_manager.ensure_blocks_for(seq, self.num_speculative_tokens + 1):
+                # SSD needs extra for tree decode positions
+                lookahead = self.ssd_lookahead if self.ssd_lookahead > 0 else self.num_speculative_tokens + 1
+                while not self.block_manager.ensure_blocks_for(seq, lookahead):
                     if self.running:
                         self.preempt(self.running.pop())
                     else:

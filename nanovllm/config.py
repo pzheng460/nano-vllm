@@ -20,6 +20,13 @@ class Config:
     device_type: Optional[str] = None  # "cuda", "npu", or None (auto)
     draft_model: Optional[str] = None          # EAGLE checkpoint path
     num_speculative_tokens: int = 5            # number of speculative tokens per step
+    # SSD (Speculative Streaming Decoding) options
+    draft_async: bool = False                  # enable SSD async draft on separate GPU
+    draft_gpu: int = -1                        # GPU for draft model (-1 = auto)
+    async_fan_out: int = 3                     # fan-out for tree speculation
+    num_gpus: int = -1                         # total world size (auto-computed)
+    draft_rank: int = -1                       # rank of draft process (auto-computed)
+    disable_mtp: bool = False                  # force disable MTP speculative decoding
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -28,14 +35,34 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
-        self.use_mtp = getattr(self.hf_config, 'num_nextn_predict_layers', 0) > 0
-        if self.use_mtp and self.draft_model is None:
+        self.use_mtp = (not self.disable_mtp) and getattr(self.hf_config, 'num_nextn_predict_layers', 0) > 0
+        if self.use_mtp and self.draft_model is None and not self.draft_async:
             self.num_speculative_tokens = self.hf_config.num_nextn_predict_layers
+        # PanGu sink attention config
+        self.sink_len = getattr(self.hf_config, 'param_sink_number', 0) or 0
+        # No dedicated sink blocks. Sink KV is embedded in each sequence's first block.
+        # Slot offset = sink_len; position mapping handled by model_runner.
+        self.num_sink_blocks = 0
         if self.draft_model is not None:
             assert os.path.isdir(self.draft_model)
             self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model, trust_remote_code=True)
         else:
             self.draft_hf_config = None
+        # SSD: compute world size and draft rank
+        self.num_gpus = self.tensor_parallel_size + (1 if self.draft_async else 0)
+        if self.draft_async:
+            assert self.use_mtp, "SSD async draft requires MTP model"
+            self.draft_rank = self.tensor_parallel_size
+            if self.draft_gpu == -1:
+                self.draft_gpu = self.draft_rank
+            # Compute fan-out list: async_fan_out at each of K+1 positions
+            K = self.num_speculative_tokens
+            F = self.async_fan_out
+            self.fan_out_list = [F] * (K + 1)
+            self.mq_len = sum(self.fan_out_list)
+            # Total lookahead for block pre-allocation:
+            # speculative tokens (K+1) + tree decode positions (K * MQ_LEN)
+            self.ssd_total_lookahead = K + 1 + K * self.mq_len
 
 _current_config = None
 

@@ -24,6 +24,10 @@ def _load_weight(model, packed_modules_mapping, weight_name, weight_tensor):
 
 
 def load_model(model: nn.Module, path: str):
+    # If model has custom load_weights, use it (e.g., PanGu with MoE)
+    if hasattr(model, 'load_weights'):
+        model.load_weights(path)
+        return
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     safetensor_files = glob(os.path.join(path, "*.safetensors"))
     if safetensor_files:

@@ -4,6 +4,7 @@ from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import torch.distributed as dist
 
 from nanovllm.config import Config, get_config, set_config, reset_config
 from nanovllm.sampling_params import SamplingParams
@@ -19,14 +20,36 @@ class LLMEngine:
         config = get_config()
         self.ps = []
         self.events = []
+        self.draft_async = config.draft_async
         ctx = mp.get_context("spawn")
+
+        # Spawn TP workers (ranks 1..tp_size-1)
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
+
+        # Spawn draft process BEFORE rank 0 init (collective init_process_group)
+        if config.draft_async:
+            from nanovllm.engine._draft_entry import draft_entry
+            init_q = ctx.Queue()
+            self.draft_process = ctx.Process(
+                target=draft_entry,
+                args=(config, config.draft_rank, init_q),
+            )
+            self.draft_process.start()
+            self.ps.append(self.draft_process)
+
+        # Rank 0 joins (blocks in init_process_group until all ranks ready)
         self.model_runner = ModelRunner(config, 0, self.events)
+
+        # Wait for draft to report its num_kvcache_blocks
+        if config.draft_async:
+            num_blocks = init_q.get(timeout=180)
+            init_q.close()
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True, trust_remote_code=True)
         eos = self.tokenizer.eos_token_id
         config.eos = eos[0] if isinstance(eos, list) else eos
@@ -36,6 +59,9 @@ class LLMEngine:
         atexit.register(self.exit)
 
     def exit(self):
+        # Send exit to draft via NCCL
+        if self.draft_async and self.model_runner.async_pg is not None:
+            self.model_runner._send_cmd(2)  # exit
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
@@ -61,6 +87,16 @@ class LLMEngine:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess(seqs, token_ids)
             num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        # Clean up finished sequences in draft
+        if self.draft_async and self.model_runner.async_pg is not None:
+            for seq in seqs:
+                if seq.is_finished:
+                    self.model_runner._send_cmd(3)  # cleanup
+                    import torch
+                    meta = torch.tensor([seq.seq_id], dtype=torch.int64, device=self.model_runner.device.device_name)
+                    dist.send(meta, dst=self.model_runner.draft_rank, group=self.model_runner.async_pg)
+                    ack = torch.zeros(1, dtype=torch.int64, device=self.model_runner.device.device_name)
+                    dist.recv(ack, src=self.model_runner.draft_rank, group=self.model_runner.async_pg)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens, draft_count, accept_count
 
