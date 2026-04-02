@@ -413,9 +413,16 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         context = get_context()
-        hidden = self.model(input_ids, positions)  # unnormed residual
-        # PanGu MTP expects normed hidden (vLLM's OpenPanguModel returns normed)
-        hidden_normed = self.model.model.norm(hidden)
+        model_out = self.model(input_ids, positions)
+        # MiMo returns unnormed residual; Qwen3 returns normed hidden
+        if self._mtp_uses_unnormed:
+            # MiMo: model returns unnormed, need to norm for logits
+            hidden = model_out  # unnormed
+            hidden_normed = self.model.model.norm(hidden)
+        else:
+            # Qwen3/Qwen2/PanGu: model returns normed
+            hidden_normed = model_out
+            hidden = model_out  # already normed (no unnormed available)
         last_indices = context.cu_seqlens_q[1:] - 1
         logits = self.lm_head_logits(hidden_normed)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
@@ -432,7 +439,8 @@ class ModelRunner:
             embeds = self.model.model.embed_tokens(shifted_ids)
             mtp_hidden = hidden if self._mtp_uses_unnormed else hidden_normed
             self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
-        save_hidden = hidden if self._mtp_uses_unnormed else hidden_normed
+        # MiMo MTP needs unnormed; EAGLE/PanGu use whatever the model returns
+        save_hidden = hidden
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
@@ -534,7 +542,11 @@ class ModelRunner:
         # === Verify phase (target model, prefill-like) ===
         input_ids, positions = self._prepare_verify(seqs, all_draft_tokens)
         hidden = self.model(input_ids, positions)
-        target_logits = self.model.compute_logits_all(hidden)
+        # MiMo returns unnormed → norm for logits; Qwen3 returns normed → use directly
+        if self._mtp_uses_unnormed:
+            target_logits = self.model.compute_logits_all(self.model.model.norm(hidden))
+        else:
+            target_logits = self.model.compute_logits_all(hidden)
         reset_context()
 
         # === Accept phase (greedy, rank 0 only) ===
