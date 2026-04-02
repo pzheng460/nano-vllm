@@ -51,6 +51,9 @@ class MiMoMTPLayer(nn.Module):
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (normed, prenorm). normed for logits, prenorm for chaining."""
+        # Mask inputs at position 0 (no prior context for MTP), matching vLLM
+        input_embeds = input_embeds.clone()
+        input_embeds[positions == 0] = 0
         input_embeds = self.token_layernorm(input_embeds)
         previous_hidden = self.hidden_layernorm(hidden_states)
         hidden = self.input_proj(torch.cat([previous_hidden, input_embeds], dim=-1))

@@ -24,6 +24,7 @@ class Config:
     draft_async: bool = False                  # enable SSD async draft on separate GPU
     draft_gpu: int = -1                        # GPU for draft model (-1 = auto)
     async_fan_out: int = 3                     # fan-out for tree speculation
+    ssd_early_layers: int = 2                  # extract early hidden at layer N-X
     num_gpus: int = -1                         # total world size (auto-computed)
     draft_rank: int = -1                       # rank of draft process (auto-computed)
     disable_mtp: bool = False                  # force disable MTP speculative decoding
@@ -37,7 +38,9 @@ class Config:
         assert self.max_num_batched_tokens >= self.max_model_len
         self.use_mtp = (not self.disable_mtp) and getattr(self.hf_config, 'num_nextn_predict_layers', 0) > 0
         if self.use_mtp and self.draft_model is None and not self.draft_async:
-            self.num_speculative_tokens = self.hf_config.num_nextn_predict_layers
+            # Only auto-set K if user didn't override (default is 5)
+            if self.num_speculative_tokens == 5:
+                self.num_speculative_tokens = self.hf_config.num_nextn_predict_layers
         # PanGu sink attention config
         self.sink_len = getattr(self.hf_config, 'param_sink_number', 0) or 0
         # No dedicated sink blocks. Sink KV is embedded in each sequence's first block.

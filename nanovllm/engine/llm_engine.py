@@ -76,6 +76,7 @@ class LLMEngine:
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         draft_count = accept_count = 0
+        per_pos_accept = [0] * self.num_speculative_tokens if self.speculative else []
         if self.speculative and not is_prefill:
             all_token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess_speculative(seqs, all_token_ids)
@@ -83,6 +84,10 @@ class LLMEngine:
             k = self.num_speculative_tokens
             draft_count = k * len(seqs)
             accept_count = sum(len(tids) - 1 for tids in all_token_ids)
+            for tids in all_token_ids:
+                num_accepted = len(tids) - 1  # number of draft positions accepted
+                for j in range(min(num_accepted, k)):
+                    per_pos_accept[j] += 1
         else:
             token_ids = self.model_runner.call("run", seqs, is_prefill)
             self.scheduler.postprocess(seqs, token_ids)
@@ -98,7 +103,7 @@ class LLMEngine:
                     ack = torch.zeros(1, dtype=torch.int64, device=self.model_runner.device.device_name)
                     dist.recv(ack, src=self.model_runner.draft_rank, group=self.model_runner.async_pg)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        return outputs, num_tokens, draft_count, accept_count
+        return outputs, num_tokens, draft_count, accept_count, per_pos_accept
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -118,11 +123,19 @@ class LLMEngine:
         outputs = {}
         prefill_throughput = decode_throughput = 0.
         total_draft = total_accept = 0
+        k = self.num_speculative_tokens
+        total_per_pos = [0] * k
+        total_per_pos_total = [0] * k
         while not self.is_finished():
             t = perf_counter()
-            output, num_tokens, draft_count, accept_count = self.step()
+            output, num_tokens, draft_count, accept_count, per_pos_accept = self.step()
             total_draft += draft_count
             total_accept += accept_count
+            if draft_count > 0:
+                n_seqs = draft_count // k
+                for j in range(k):
+                    total_per_pos[j] += per_pos_accept[j]
+                    total_per_pos_total[j] += n_seqs
             if use_tqdm:
                 if num_tokens > 0:
                     prefill_throughput = num_tokens / (perf_counter() - t)
@@ -145,5 +158,10 @@ class LLMEngine:
             pbar.close()
         if total_draft > 0:
             print(f"Speculative decoding: {total_accept}/{total_draft} draft tokens accepted ({total_accept/total_draft:.1%}), "
-                  f"avg {total_accept/max(total_draft//self.num_speculative_tokens, 1):.2f} tokens/step")
+                  f"avg {total_accept/max(total_draft//k, 1):.2f} tokens/step")
+            per_pos_str = ", ".join(
+                f"pos{j}: {total_per_pos[j]}/{total_per_pos_total[j]} ({total_per_pos[j]/max(total_per_pos_total[j],1):.1%})"
+                for j in range(k)
+            )
+            print(f"Per-position acceptance: {per_pos_str}")
         return outputs

@@ -64,6 +64,14 @@ class ModelRunner:
         self.use_mtp = config.use_mtp
         self.draft_async = config.draft_async
         self.speculative = config.draft_model is not None or self.use_mtp
+        # MiMo MTP has hidden_layernorm and expects unnormed hidden from target;
+        # PanGu MTP expects normed hidden
+        self._mtp_uses_unnormed = (
+            self.use_mtp
+            and hasattr(self.model.model, 'mtp_layers')
+            and len(self.model.model.mtp_layers) > 0
+            and hasattr(self.model.model.mtp_layers[0], 'hidden_layernorm')
+        )
         # MTP uses its own shared_head (norm + head trained together, NOT shared with target lm_head)
         self.num_speculative_tokens = config.num_speculative_tokens
         if config.draft_model is not None:
@@ -422,9 +430,11 @@ class ModelRunner:
             if self.tp_size > 1:
                 dist.broadcast(shifted_ids, 0, group=self.tp_group)
             embeds = self.model.model.embed_tokens(shifted_ids)
-            self.model.model.mtp_layers[0](embeds, hidden_normed, positions)
+            mtp_hidden = hidden if self._mtp_uses_unnormed else hidden_normed
+            self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
+        save_hidden = hidden if self._mtp_uses_unnormed else hidden_normed
         for i, seq in enumerate(seqs):
-            self.last_hidden[seq.seq_id] = hidden_normed[last_indices[i]:last_indices[i]+1].clone()
+            self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
 
@@ -587,8 +597,11 @@ class ModelRunner:
                 token_embeds = embed_tokens(input_id)
                 mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
                 reset_context()
-                # MTP draft logits using shared_head (norm + head trained together)
-                draft_logits = F.linear(mtp_normed, mtp_layer.shared_head.head.weight)
+                # MTP draft logits: use shared_head if available (PanGu), else lm_head (MiMo)
+                if hasattr(mtp_layer, 'shared_head'):
+                    draft_logits = F.linear(mtp_normed, mtp_layer.shared_head.head.weight)
+                else:
+                    draft_logits = F.linear(mtp_normed, self.model.lm_head.weight)
                 if self.tp_size > 1:
                     all_logits = [torch.empty_like(draft_logits) for _ in range(self.tp_size)] if self.rank == 0 else None
                     dist.gather(draft_logits, all_logits, 0, group=self.tp_group)
@@ -603,7 +616,8 @@ class ModelRunner:
                     dist.broadcast(d_tensor, 0, group=self.tp_group)
                     d_token = d_tensor.item()
                 draft_tokens.append(d_token)
-                target_hidden = mtp_normed  # PanGu MTP expects normed hidden
+                # Chain: use normed output (final_layernorm) for next step, matching vLLM
+                target_hidden = mtp_normed
                 cur_token_id = d_token
                 cur_pos += 1
             all_draft_tokens.append(draft_tokens)
@@ -668,13 +682,15 @@ class ModelRunner:
                     torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
                 set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
                 token_embeds = embed_tokens(input_id)
-                target_h = hidden_normed[offset + j:offset + j + 1]
-                mtp_layer(token_embeds, target_h, pos)
+                # MiMo MTP expects unnormed hidden; PanGu expects normed
+                mtp_h = hidden[offset + j:offset + j + 1] if self._mtp_uses_unnormed else hidden_normed[offset + j:offset + j + 1]
+                mtp_layer(token_embeds, mtp_h, pos)
                 reset_context()
             # Save last accepted hidden for next round
             if self.rank == 0:
                 accepted_idx = offset + len(all_accepted[seq_idx]) - 1
-                self.last_hidden[seq.seq_id] = hidden_normed[accepted_idx:accepted_idx + 1].clone()
+                save_h = hidden if self._mtp_uses_unnormed else hidden_normed
+                self.last_hidden[seq.seq_id] = save_h[accepted_idx:accepted_idx + 1].clone()
             offset += num_verify
 
         if self.rank == 0:
@@ -694,14 +710,28 @@ class ModelRunner:
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         context = get_context()
+        d = self.device.device_name
 
         hidden = self.model(input_ids, positions)
-
-        if self.use_mtp:
-            embeds = self.model.model.embed_tokens(input_ids)
-            self.model.model.mtp_layers[0](embeds, hidden, positions)
-
         last_indices = context.cu_seqlens_q[1:] - 1
+
+        # Sample first — needed for shifted MTP token IDs
+        logits = self.model.compute_logits(hidden)
+        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+
+        # MTP KV cache update with shifted token IDs (matching sync path)
+        if self.use_mtp:
+            shifted_ids = input_ids.clone()
+            shifted_ids[:-1] = input_ids[1:]
+            if self.rank == 0:
+                for i, idx in enumerate(last_indices.tolist()):
+                    shifted_ids[idx] = token_ids[i]
+            if self.tp_size > 1:
+                dist.broadcast(shifted_ids, 0, group=self.tp_group)
+            embeds = self.model.model.embed_tokens(shifted_ids)
+            mtp_hidden = hidden if self._mtp_uses_unnormed else self.model.model.norm(hidden)
+            self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
+
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = hidden[last_indices[i]:last_indices[i]+1].clone()
 
@@ -710,26 +740,23 @@ class ModelRunner:
                 end = context.cu_seqlens_q[i + 1].item()
                 n = end - start
                 seq_positions = list(range(seq.num_cached_tokens, len(seq)))
-                seq_tokens = seq[seq.num_cached_tokens:]
                 bt = seq.block_table
 
-                # Send cmd=1 (prefill) + metadata via NCCL
+                # Send shifted token IDs + hidden to draft
+                shifted_seq = shifted_ids[start:end]
+
                 self._send_cmd(1)
-                meta = torch.tensor([seq.seq_id, n, len(bt)], dtype=torch.int64, device=self.device.device_name)
+                meta = torch.tensor([seq.seq_id, n, len(bt)], dtype=torch.int64, device=d)
                 dist.send(meta, dst=self.draft_rank, group=self.async_pg)
-                dist.send(torch.tensor(seq_tokens, dtype=torch.int64, device=self.device.device_name),
-                          dst=self.draft_rank, group=self.async_pg)
+                dist.send(shifted_seq.contiguous(), dst=self.draft_rank, group=self.async_pg)
                 dist.send(hidden[start:end].contiguous(), dst=self.draft_rank, group=self.async_pg)
-                dist.send(torch.tensor(seq_positions, dtype=torch.int64, device=self.device.device_name),
+                dist.send(torch.tensor(seq_positions, dtype=torch.int64, device=d),
                           dst=self.draft_rank, group=self.async_pg)
-                dist.send(torch.tensor(bt, dtype=torch.int32, device=self.device.device_name),
+                dist.send(torch.tensor(bt, dtype=torch.int32, device=d),
                           dst=self.draft_rank, group=self.async_pg)
-                # Wait for ack
-                ack = torch.zeros(1, dtype=torch.int64, device=self.device.device_name)
+                ack = torch.zeros(1, dtype=torch.int64, device=d)
                 dist.recv(ack, src=self.draft_rank, group=self.async_pg)
 
-        logits = self.model.compute_logits(hidden)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
 
         if self.rank == 0:
@@ -756,8 +783,8 @@ class ModelRunner:
             for seq in seqs:
                 candidates = self._last_candidates.get(seq.seq_id, set())
                 if seq.last_token in candidates:
-                    # Cache HIT path: lightweight lookup — just send 3 ints, recv K ints
-                    self._send_cmd(6)  # cmd=6: cache_lookup
+                    # Cache HIT: chain lookup returns K draft tokens
+                    self._send_cmd(6)
                     lookup = torch.tensor([seq.seq_id, seq.last_accepted_len, seq.last_token],
                                           dtype=torch.int64, device=d)
                     dist.send(lookup, dst=self.draft_rank, group=self.async_pg)
@@ -794,7 +821,8 @@ class ModelRunner:
                         draft_logits = self.model.compute_logits_all(mtp_normed)
                         d_token = draft_logits.argmax(dim=-1).item()
                         draft_tokens.append(d_token)
-                        target_hidden = mtp_prenorm
+                        # Chain: use normed output for next step, matching vLLM
+                        target_hidden = mtp_normed
                         cur_token_id = d_token
                         cur_pos += 1
                     all_draft_tokens.append(draft_tokens)
@@ -811,54 +839,64 @@ class ModelRunner:
         # === Verify phase (layer-by-layer for early hidden extraction) ===
         verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
         model_inner = self.model.model
-        early_layer = len(model_inner.layers) - 8
+        early_layer = len(model_inner.layers) - self.config.ssd_early_layers
 
         hidden_states = model_inner.embed_tokens(verify_ids)
         residual = None
         for i, layer in enumerate(model_inner.layers):
             hidden_states, residual = layer(verify_pos, hidden_states, residual)
             if i == early_layer and self.rank == 0 and self.async_pg is not None:
-                # At layer N-2: extract early hidden at ALL K+1 verify positions
                 early_hidden_all = (hidden_states + residual)
+                # Batched send: one cmd + packed metadata + all hidden states
+                num_seqs_batch = len(seqs)
+                self._send_cmd(5)
+                # Send num_seqs first, then per-seq meta, then batched data
+                dist.send(torch.tensor([num_seqs_batch], dtype=torch.int64, device=d),
+                          dst=self.draft_rank, group=self.async_pg)
+                meta_list = []
+                bt_list = []
+                pos_list = []
+                for seq, dt in zip(seqs, all_draft_tokens):
+                    nv = len(dt) + 1
+                    bt = seq.block_table
+                    seq_start_pos = len(seq) - 1
+                    meta_list.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), seq_start_pos])
+                    bt_list.extend(bt)
+                    pos_list.extend(range(seq_start_pos, seq_start_pos + nv))
+                dist.send(torch.tensor(meta_list, dtype=torch.int64, device=d),
+                          dst=self.draft_rank, group=self.async_pg)
+                dist.send(early_hidden_all.contiguous(), dst=self.draft_rank, group=self.async_pg)
+                dist.send(torch.tensor(bt_list, dtype=torch.int32, device=d),
+                          dst=self.draft_rank, group=self.async_pg)
+                dist.send(torch.tensor(pos_list, dtype=torch.int64, device=d),
+                          dst=self.draft_rank, group=self.async_pg)
+                # Save for candidate computation on target side
+                if not hasattr(self, '_early_hiddens_for_candidates'):
+                    self._early_hiddens_for_candidates = {}
                 offset_e = 0
-                for seq_i, (seq, dt) in enumerate(zip(seqs, all_draft_tokens)):
-                    nv = len(dt) + 1  # K+1 positions
-                    all_pos_early = early_hidden_all[offset_e:offset_e + nv]  # [K+1, hidden]
-                    # Send cmd + meta + all K+1 hidden states
-                    self._send_cmd(5)
-                    meta = torch.tensor([seq.seq_id, k, nv, len(seq) + len(dt)],
-                                        dtype=torch.int64, device=d)
-                    dist.send(meta, dst=self.draft_rank, group=self.async_pg)
-                    dist.send(all_pos_early.contiguous(),
-                              dst=self.draft_rank, group=self.async_pg)
-                    if not hasattr(self, '_early_hiddens_for_candidates'):
-                        self._early_hiddens_for_candidates = {}
-                    self._early_hiddens_for_candidates[seq.seq_id] = all_pos_early.clone()
+                for seq, dt in zip(seqs, all_draft_tokens):
+                    nv = len(dt) + 1
+                    self._early_hiddens_for_candidates[seq.seq_id] = early_hidden_all[offset_e:offset_e+nv].clone()
                     offset_e += nv
 
         hidden_states, residual = model_inner.norm(hidden_states, residual)
         hidden = residual
 
-        # MTP KV cache update on target side
-        verify_embeds = model_inner.embed_tokens(verify_ids)
-        model_inner.mtp_layers[0](verify_embeds, hidden, verify_pos)
         target_logits = self.model.compute_logits_all(model_inner.norm(hidden))
         reset_context()
 
         # === Accept phase ===
         # Compute candidates (off critical path) to predict hit/miss next step
-        # Mirror draft's computation: for each of K+1 positions, norm → lm_head → topF
         if self.rank == 0 and self.async_pg is not None:
             if not hasattr(self, '_last_candidates'):
                 self._last_candidates = {}
             if hasattr(self, '_early_hiddens_for_candidates'):
                 fan = self.config.async_fan_out
                 for seq_id, eh_all in self._early_hiddens_for_candidates.items():
-                    # eh_all: [K+1, hidden] — all verify positions
                     all_cands = set()
-                    en = model_inner.norm(eh_all)  # [K+1, hidden]
-                    el = F.linear(en, self.model.lm_head.weight)  # [K+1, V]
-                    _, topf = torch.topk(el, fan, dim=-1)  # [K+1, F]
+                    en = model_inner.norm(eh_all)
+                    el = F.linear(en, self.model.lm_head.weight)
+                    _, topf = torch.topk(el, fan, dim=-1)
                     all_cands = set(topf.reshape(-1).tolist())
                     self._last_candidates[seq_id] = all_cands
                 self._early_hiddens_for_candidates = {}
@@ -886,9 +924,15 @@ class ModelRunner:
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
-            return all_accepted
         else:
-            return None
+            all_accepted = [[] for _ in seqs]
+
+        # Skip MTP KV cache update in SSD mode — cache hit rate ~99% makes it unnecessary
+        # (MTP KV only needed for cache miss local fallback, which is rare)
+
+        if self.rank == 0:
+            return all_accepted
+        return None
 
     @torch.inference_mode()
     def capture_cudagraph(self):

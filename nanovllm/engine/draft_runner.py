@@ -139,8 +139,10 @@ class MTPDraftRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         block_bytes = 2 * num_mtp_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        num_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // max(block_bytes, 1)
-        num_blocks = max(num_blocks, 1)
+        # Draft only needs MTP KV cache — cap to max concurrent tokens, not fill GPU
+        max_tokens = config.max_num_seqs * (config.max_model_len // self.block_size + 1)
+        avail_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // max(block_bytes, 1)
+        num_blocks = min(max(avail_blocks, 1), max_tokens)
         config.num_kvcache_blocks = num_blocks
         self.mtp_kv_cache = torch.empty(
             2, num_mtp_layers, num_blocks, self.block_size,
@@ -407,72 +409,103 @@ class MTPDraftRunner:
         # Cache is populated by early_speculate (cmd=5) during next verify
 
     def handle_early_speculate(self):
-        """Receive early hidden at ALL K+1 verify positions from target.
-        For each position j, do lm_head → topF → embed → MTP → cache.
-        Total (K+1)*F cache entries covering all accept/reject outcomes.
-        Runs IN PARALLEL with target's remaining layers + accept."""
-        meta = torch.zeros(4, dtype=torch.int64, device=self.device)
+        """Receive batched early hidden for all seqs from target.
+        For each seq: norm → lm_head → topF → embed → MTP → cache."""
+        # Receive num_seqs
+        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+        dist.recv(ns_buf, src=0, group=self.async_pg)
+        num_seqs = int(ns_buf[0].item())
+
+        # Receive per-seq metadata: [sid, nv, ntok, btlen, spos] * num_seqs
+        meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
-        seq_id = int(meta[0].item())
-        K = int(meta[1].item())
-        nv = int(meta[2].item())  # K+1
-        num_tokens = int(meta[3].item())
 
-        early_hidden = torch.zeros(nv, self.hf_config.hidden_size,
-                                   dtype=self.hf_config.torch_dtype, device=self.device)
-        dist.recv(early_hidden, src=0, group=self.async_pg)
+        seq_infos = []
+        total_nv = 0
+        total_bt = 0
+        for i in range(num_seqs):
+            b = i * 5
+            sid, nv, ntok, btlen, spos = (int(meta[b+j].item()) for j in range(5))
+            seq_infos.append((sid, nv, ntok, btlen, spos))
+            total_nv += nv
+            total_bt += btlen
 
-        # For each of K+1 positions: norm → lm_head → topF candidates
+        # Receive batched data
+        early_hidden_all = torch.zeros(total_nv, self.hf_config.hidden_size,
+                                       dtype=self.hf_config.torch_dtype, device=self.device)
+        dist.recv(early_hidden_all, src=0, group=self.async_pg)
+        all_bt = torch.zeros(total_bt, dtype=torch.int32, device=self.device)
+        dist.recv(all_bt, src=0, group=self.async_pg)
+        all_pos = torch.zeros(total_nv, dtype=torch.int64, device=self.device)
+        dist.recv(all_pos, src=0, group=self.async_pg)
+
+        # Process each seq
         fan = self.F
-        normed_h = self.draft_model.model.norm(early_hidden)  # [K+1, hidden]
-        early_logits = self.compute_logits_all(normed_h)       # [K+1, V]
-        _, all_candidates = torch.topk(early_logits, fan, dim=-1)  # [K+1, F]
+        h_off = 0
+        bt_off = 0
+        for sid, nv, ntok, btlen, spos in seq_infos:
+            early_hidden = early_hidden_all[h_off:h_off+nv]
+            block_table = all_bt[bt_off:bt_off+btlen]
+            verify_pos = all_pos[h_off:h_off+nv]
+            h_off += nv
+            bt_off += btlen
 
-        # Flatten: (K+1)*F candidates total
-        total = nv * fan
-        flat_candidates = all_candidates.reshape(-1)                    # [(K+1)*F]
-        flat_embeds = self.embed_tokens(flat_candidates)                # [(K+1)*F, hidden]
-        # Each candidate's hidden = early_hidden at its position, repeated F times
-        flat_hidden = early_hidden.repeat_interleave(fan, dim=0)        # [(K+1)*F, hidden]
-        # Position indices: position j maps to accepted_len j
-        flat_acc_lens = torch.arange(nv, device=self.device, dtype=torch.int64).repeat_interleave(fan)
+            normed_h = self.draft_model.model.norm(early_hidden)
+            early_logits = self.compute_logits_all(normed_h)
+            _, cands = torch.topk(early_logits, fan, dim=-1)
 
-        # Batched MTP: all (K+1)*F candidates in one forward
-        bt_dummy = torch.zeros(total, 1, dtype=torch.int32, device=self.device)
-        slot_dummy = torch.zeros(total, dtype=torch.int32, device=self.device)
-        ctx_dummy = torch.ones(total, dtype=torch.int32, device=self.device) * (num_tokens + 1)
-        pos_t = torch.full((total,), num_tokens, dtype=torch.int64, device=self.device)
+            total = nv * fan
+            flat_cands = cands.reshape(-1)
+            flat_embeds = self.embed_tokens(flat_cands)
+            flat_hidden = early_hidden.repeat_interleave(fan, dim=0)
+            flat_acc_lens = torch.arange(nv, device=self.device, dtype=torch.int64).repeat_interleave(fan)
+            flat_pos = verify_pos.repeat_interleave(fan)
 
-        set_context(False, slot_mapping=slot_dummy, context_lens=ctx_dummy, block_tables=bt_dummy)
-        normed_out, prenorm = self.mtp_layer(flat_embeds, flat_hidden, pos_t)
-        reset_context()
-        logits = self.compute_logits_all(normed_out)  # [(K+1)*F, V]
-        draft_tokens = logits.argmax(dim=-1)          # [(K+1)*F]
+            slot_list = []
+            for p in flat_pos.tolist():
+                p = int(p)
+                slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
+            slot_t = torch.tensor(slot_list, dtype=torch.int32, device=self.device)
+            bt_exp = block_table.unsqueeze(0).expand(total, -1).contiguous()
+            ctx_lens = (flat_pos + 1).to(torch.int32)
 
-        # Store (K+1)*F cache entries
-        seq_ids = torch.full((total,), seq_id, dtype=torch.int64, device=self.device)
-        keys = torch.stack([seq_ids, flat_acc_lens, flat_candidates], dim=1)  # [(K+1)*F, 3]
-        tokens = draft_tokens.unsqueeze(1)  # [(K+1)*F, 1]
-        self.tree_caches[seq_id] = (keys, tokens)
+            set_context(False, slot_mapping=slot_t, context_lens=ctx_lens, block_tables=bt_exp)
+            normed_out, _ = self.mtp_layer(flat_embeds, flat_hidden, flat_pos)
+            reset_context()
+            logits = self.compute_logits_all(normed_out)
+            draft_tokens = logits.argmax(dim=-1)
+
+            seq_ids = torch.full((total,), sid, dtype=torch.int64, device=self.device)
+            keys = torch.stack([seq_ids, flat_acc_lens, flat_cands], dim=1)
+            self.tree_caches[sid] = (keys, draft_tokens.unsqueeze(1))
 
     def handle_cache_lookup(self):
-        """Lightweight cache hit: receive 3 ints, lookup, return K tokens."""
+        """Chain lookup: receive (seq_id, accepted_len, recovery_token), do K chained lookups."""
         lookup = torch.zeros(3, dtype=torch.int64, device=self.device)
         dist.recv(lookup, src=0, group=self.async_pg)
         seq_id, accepted_len, recovery_token = int(lookup[0].item()), int(lookup[1].item()), int(lookup[2].item())
 
-        # Look up cache
         result = torch.zeros(self.K, dtype=torch.int64, device=self.device)
+        hit = False
         if seq_id in self.tree_caches:
             cache_keys, cache_tokens = self.tree_caches[seq_id]
-            request_key = torch.tensor([[seq_id, accepted_len, recovery_token]], dtype=torch.int64, device=self.device)
-            match = torch.all(request_key.unsqueeze(1) == cache_keys.unsqueeze(0), dim=2).squeeze(0)
-            if match.any():
-                idx = match.float().argmax().item()
-                result[:] = cache_tokens[idx]
-                MTPDraftRunner._hit += 1
-            else:
-                MTPDraftRunner._miss += 1
+            cur_token = recovery_token
+            for step in range(self.K):
+                request_key = torch.tensor([[seq_id, accepted_len + step, cur_token]],
+                                           dtype=torch.int64, device=self.device)
+                match = torch.all(request_key == cache_keys, dim=1)
+                if match.any():
+                    idx = match.float().argmax().item()
+                    d = cache_tokens[idx, 0].item()
+                    result[step] = d
+                    cur_token = d
+                    if step == 0:
+                        hit = True
+                else:
+                    # Chain broken — fill remaining with 0
+                    break
+        if hit:
+            MTPDraftRunner._hit += 1
         else:
             MTPDraftRunner._miss += 1
         dist.send(result, dst=0, group=self.async_pg)
