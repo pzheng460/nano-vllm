@@ -239,167 +239,115 @@ class PanguSinkAttention(nn.Module):
         return output
 
     def _forward_with_sink(self, q, k, v):
-        """Attention with sink KV prepended."""
+        """Attention with sink KV prepended. Unified path for prefill and decode."""
         context = get_context()
         k_cache, v_cache = self.attn.k_cache, self.attn.v_cache
 
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
-        if context.is_prefill:
-            return self._prefill_with_sink(q, k, v, context, k_cache, v_cache)
-        else:
-            return self._decode_with_sink(q, context, k_cache, v_cache)
-
-    def _prefill_with_sink(self, q, k, v, context, k_cache, v_cache):
-        """Prefill: prepend sink KV to each sequence's KV."""
         if self.sink_len == 0 or self._sink_k.numel() == 0:
-            # No sink, fall back to standard
-            if context.block_tables is not None:
-                k, v = k_cache, v_cache
-            return flash_attn_varlen_func(
-                q, k, v,
-                max_seqlen_q=context.max_seqlen_q,
-                cu_seqlens_q=context.cu_seqlens_q,
-                max_seqlen_k=context.max_seqlen_k,
-                cu_seqlens_k=context.cu_seqlens_k,
-                softmax_scale=self.scaling, causal=True,
-                block_table=context.block_tables)
-
-        if context.block_tables is not None:
-            if len(self.sink_block_ids) > 0:
-                # Sink blocks are in block_tables; cu_seqlens_k already adjusted
+            # No sink: standard attention
+            if context.is_prefill:
+                if context.block_tables is not None:
+                    k, v = k_cache, v_cache
                 return flash_attn_varlen_func(
-                    q, k_cache, v_cache,
-                    max_seqlen_q=context.max_seqlen_q,
-                    cu_seqlens_q=context.cu_seqlens_q,
-                    max_seqlen_k=context.max_seqlen_k,
-                    cu_seqlens_k=context.cu_seqlens_k,
+                    q, k, v,
+                    max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                     softmax_scale=self.scaling, causal=True,
                     block_table=context.block_tables)
-            # No sink blocks in block_tables: gather from cache, prepend sink, use varlen
-            cu_q = context.cu_seqlens_q
-            cu_k = context.cu_seqlens_k
-            num_seqs = cu_q.numel() - 1
-            block_size = k_cache.shape[1]
-            sink_k, sink_v = self._sink_k, self._sink_v
-            new_k_parts, new_v_parts = [], []
-            new_cu_k = [0]
-            for i in range(num_seqs):
-                # cu_seqlens_k includes sink_len; subtract to get actual cached KV length
-                total_k = cu_k[i + 1].item() - cu_k[i].item()
-                cached_k_len = total_k - self.sink_len
-                # Gather cached KV from block_table
-                bt = context.block_tables[i]
-                n_blocks = (cached_k_len + block_size - 1) // block_size
-                cached_k, cached_v = [], []
-                rem = cached_k_len
-                for b in range(n_blocks):
-                    bid = bt[b].item()
-                    take = min(rem, block_size)
-                    cached_k.append(k_cache[bid, :take])
-                    cached_v.append(v_cache[bid, :take])
-                    rem -= take
-                new_k_parts.append(sink_k)
-                new_v_parts.append(sink_v)
-                new_k_parts.extend(cached_k)
-                new_v_parts.extend(cached_v)
-                new_cu_k.append(new_cu_k[-1] + total_k)
-            new_k = torch.cat(new_k_parts, dim=0)
-            new_v = torch.cat(new_v_parts, dim=0)
-            new_cu_k = torch.tensor(new_cu_k, dtype=torch.int32, device=q.device)
-            new_max_k = context.max_seqlen_k
-            return flash_attn_varlen_func(
-                q, new_k, new_v,
-                max_seqlen_q=context.max_seqlen_q,
-                cu_seqlens_q=cu_q,
-                max_seqlen_k=new_max_k,
-                cu_seqlens_k=new_cu_k,
-                softmax_scale=self.scaling, causal=True)
+            else:
+                o = flash_attn_with_kvcache(
+                    q.unsqueeze(1), k_cache, v_cache,
+                    cache_seqlens=context.context_lens, block_table=context.block_tables,
+                    softmax_scale=self.scaling, causal=True)
+                return o.squeeze(1)
 
-        # No prefix cache: prepend sink K/V to each sequence's K/V
+        # --- Sink attention: gather from cache + prepend sink, always use varlen ---
+        if context.block_tables is not None:
+            # Decode or verify-with-cache: gather KV from cache
+            return self._gather_and_attend_with_sink(q, context, k_cache, v_cache)
+        else:
+            # Initial prefill (no cache): prepend sink to current batch K/V
+            return self._initial_prefill_with_sink(q, k, v, context)
+
+    def _gather_and_attend_with_sink(self, q, context, k_cache, v_cache):
+        """Unified sink attention for both decode and verify/prefill-with-cache.
+        Gathers KV from cache, prepends sink, uses flash_attn_varlen_func."""
+        block_size = k_cache.shape[1]
+        sink_k, sink_v = self._sink_k, self._sink_v
+
+        # Get per-sequence Q lengths and cached KV lengths
+        if context.is_prefill:
+            cu_q_in = context.cu_seqlens_q
+            num_seqs = cu_q_in.numel() - 1
+            # cu_seqlens_k has NO sink adjustment — raw cached lengths
+            seq_k_lens = [(context.cu_seqlens_k[i+1] - context.cu_seqlens_k[i]).item()
+                          for i in range(num_seqs)]
+        else:
+            num_seqs = q.shape[0]
+            cu_q_in = None
+            seq_k_lens = context.context_lens.tolist()
+
+        new_k_parts, new_v_parts = [], []
+        new_cu_q, new_cu_k = [0], [0]
+        for i in range(num_seqs):
+            cached_len = seq_k_lens[i]
+            # Prepend sink
+            new_k_parts.append(sink_k)
+            new_v_parts.append(sink_v)
+            # Gather cached KV from block_table
+            bt = context.block_tables[i]
+            rem = cached_len
+            for b in range((cached_len + block_size - 1) // block_size):
+                bid = bt[b].item()
+                take = min(rem, block_size)
+                new_k_parts.append(k_cache[bid, :take])
+                new_v_parts.append(v_cache[bid, :take])
+                rem -= take
+            new_cu_k.append(new_cu_k[-1] + self.sink_len + cached_len)
+            q_len = (cu_q_in[i+1] - cu_q_in[i]).item() if cu_q_in is not None else 1
+            new_cu_q.append(new_cu_q[-1] + q_len)
+
+        all_k = torch.cat(new_k_parts, dim=0)
+        all_v = torch.cat(new_v_parts, dim=0)
+        cu_q = torch.tensor(new_cu_q, dtype=torch.int32, device=q.device)
+        cu_k = torch.tensor(new_cu_k, dtype=torch.int32, device=q.device)
+        max_q = max(new_cu_q[i+1] - new_cu_q[i] for i in range(num_seqs))
+        max_k = max(new_cu_k[i+1] - new_cu_k[i] for i in range(num_seqs))
+
+        return flash_attn_varlen_func(
+            q, all_k, all_v,
+            max_seqlen_q=max_q, cu_seqlens_q=cu_q,
+            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
+            softmax_scale=self.scaling, causal=True)
+
+    def _initial_prefill_with_sink(self, q, k, v, context):
+        """Initial prefill (no cache): prepend sink K/V to current batch K/V."""
         cu_k = context.cu_seqlens_k
         num_seqs = cu_k.numel() - 1
-        sink_k = self._sink_k  # [sink_len, num_kv_heads, head_dim]
-        sink_v = self._sink_v
+        sink_k, sink_v = self._sink_k, self._sink_v
 
-        # Build expanded K/V with sink prepended per sequence
-        new_k_parts = []
-        new_v_parts = []
+        new_k_parts, new_v_parts = [], []
         new_cu_k = [0]
         for i in range(num_seqs):
-            start = cu_k[i].item()
-            end = cu_k[i + 1].item()
+            start, end = cu_k[i].item(), cu_k[i + 1].item()
             new_k_parts.append(sink_k)
             new_k_parts.append(k[start:end])
             new_v_parts.append(sink_v)
             new_v_parts.append(v[start:end])
             new_cu_k.append(new_cu_k[-1] + self.sink_len + (end - start))
 
-        new_k = torch.cat(new_k_parts, dim=0)
-        new_v = torch.cat(new_v_parts, dim=0)
+        all_k = torch.cat(new_k_parts, dim=0)
+        all_v = torch.cat(new_v_parts, dim=0)
         new_cu_k = torch.tensor(new_cu_k, dtype=torch.int32, device=q.device)
-        new_max_k = context.max_seqlen_k + self.sink_len
 
-        o = flash_attn_varlen_func(
-            q, new_k, new_v,
-            max_seqlen_q=context.max_seqlen_q,
-            cu_seqlens_q=context.cu_seqlens_q,
-            max_seqlen_k=new_max_k,
-            cu_seqlens_k=new_cu_k,
-            softmax_scale=self.scaling, causal=True)
-        return o
-
-    def _decode_with_sink(self, q, context, k_cache, v_cache):
-        """Decode with sink: prepend sink K/V tensors, use varlen with block_table."""
-        if self.sink_len == 0 or self._sink_k.numel() == 0:
-            o = flash_attn_with_kvcache(
-                q.unsqueeze(1), k_cache, v_cache,
-                cache_seqlens=context.context_lens,
-                block_table=context.block_tables,
-                softmax_scale=self.scaling, causal=True)
-            return o.squeeze(1)
-
-        # Prepend sink K/V to each sequence, then use varlen + block_table for cached KV.
-        # flash_attn_varlen_func with block_table reads KV from cache;
-        # we prepend sink as direct tensors by interleaving.
-        bs = q.shape[0]
-        sink_k = self._sink_k  # [sink_len, num_kv_heads, head_dim]
-        sink_v = self._sink_v
-
-        # Build per-seq K/V: for each seq, concat [sink_k_tensor, cached_k_from_blocks]
-        # We gather cached K/V from block_table manually
-        block_size = k_cache.shape[1]
-        parts_k, parts_v = [], []
-        cu_k_list = [0]
-        for i in range(bs):
-            seq_len = context.context_lens[i].item()
-            parts_k.append(sink_k)
-            parts_v.append(sink_v)
-            # Gather from cache using block_table
-            bt = context.block_tables[i]
-            n_blocks = (seq_len + block_size - 1) // block_size
-            rem = seq_len
-            for b in range(n_blocks):
-                bid = bt[b].item()
-                take = min(rem, block_size)
-                parts_k.append(k_cache[bid, :take])
-                parts_v.append(v_cache[bid, :take])
-                rem -= take
-            cu_k_list.append(cu_k_list[-1] + self.sink_len + seq_len)
-
-        all_k = torch.cat(parts_k, dim=0)
-        all_v = torch.cat(parts_v, dim=0)
-        cu_q = torch.arange(0, bs + 1, dtype=torch.int32, device=q.device)
-        cu_k = torch.tensor(cu_k_list, dtype=torch.int32, device=q.device)
-        max_k = max(cu_k_list[i + 1] - cu_k_list[i] for i in range(bs))
-
-        o = flash_attn_varlen_func(
+        return flash_attn_varlen_func(
             q, all_k, all_v,
-            max_seqlen_q=1, cu_seqlens_q=cu_q,
-            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
+            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+            max_seqlen_k=context.max_seqlen_k + self.sink_len, cu_seqlens_k=new_cu_k,
             softmax_scale=self.scaling, causal=True)
-        return o
 
 
 # ---------------------------------------------------------------------------

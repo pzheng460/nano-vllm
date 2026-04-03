@@ -474,17 +474,7 @@ class ModelRunner:
                 slot = seq.block_table[block_idx] * self.block_size + block_offset
                 slot_mapping.append(slot)
         block_tables = self.prepare_block_tables(seqs)
-        # Adjust for sink attention: add sink_len to cu_seqlens_k even with num_sink_blocks=0
-        # (PanguSinkAttention prepends _sink_k/_sink_v internally in prefill-with-cache path)
-        if self.config.sink_len > 0:
-            sink_ctx = self.config.sink_len
-            cu_seqlens_k = [cu_seqlens_k[0]] + [c + sink_ctx * i for i, c in enumerate(cu_seqlens_k[1:], 1)]
-            max_seqlen_k += sink_ctx
-        if self.config.num_sink_blocks > 0:
-            sink_ids = list(range(self.config.num_sink_blocks))
-            bs = block_tables.size(0)
-            sink_cols = torch.tensor([sink_ids] * bs, dtype=torch.int32, device=block_tables.device)
-            block_tables = torch.cat([sink_cols, block_tables], dim=1)
+        # Sink KV is handled inside PanguSinkAttention (no external adjustment needed)
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         cu_seqlens_q = self.device.to_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True))
@@ -643,6 +633,7 @@ class ModelRunner:
         reset_context()
 
         # === Accept phase (greedy, rank 0 only) ===
+        d = self.device.device_name
         if self.rank == 0:
             all_accepted = []
             offset = 0
@@ -669,7 +660,7 @@ class ModelRunner:
         for seq_idx, seq in enumerate(seqs):
             num_accepted = len(all_accepted[seq_idx]) if self.rank == 0 else 0
             if self.tp_size > 1:
-                na_t = torch.tensor([num_accepted], dtype=torch.int64, device=self.device.device_name)
+                na_t = torch.tensor([num_accepted], dtype=torch.int64, device=d)
                 dist.broadcast(na_t, 0, group=self.tp_group)
                 num_accepted = na_t.item()
             num_verify = len(all_draft_tokens[seq_idx]) + 1
@@ -681,7 +672,7 @@ class ModelRunner:
                 else:
                     tok_id = 0
                 if self.tp_size > 1:
-                    tt = torch.tensor([tok_id], dtype=torch.int64, device=self.device.device_name)
+                    tt = torch.tensor([tok_id], dtype=torch.int64, device=d)
                     dist.broadcast(tt, 0, group=self.tp_group)
                     tok_id = tt.item()
                 input_id = self.device.to_device(torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
@@ -691,19 +682,16 @@ class ModelRunner:
                 slot = seq.block_table[block_idx] * self.block_size + block_offset
                 slot_map = self.device.to_device(torch.tensor([slot], dtype=torch.int32, pin_memory=True))
                 block_table = self.device.to_device(torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
-                context_lens = self.device.to_device(
-                    torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
+                context_lens = self.device.to_device(torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
                 set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
                 token_embeds = embed_tokens(input_id)
-                # MiMo MTP expects unnormed hidden; PanGu expects normed
-                mtp_h = hidden[offset + j:offset + j + 1] if self._mtp_uses_unnormed else hidden_normed[offset + j:offset + j + 1]
+                mtp_h = hidden[offset + j:offset + j + 1]
                 mtp_layer(token_embeds, mtp_h, pos)
                 reset_context()
             # Save last accepted hidden for next round
             if self.rank == 0:
                 accepted_idx = offset + len(all_accepted[seq_idx]) - 1
-                save_h = hidden if self._mtp_uses_unnormed else hidden_normed
-                self.last_hidden[seq.seq_id] = save_h[accepted_idx:accepted_idx + 1].clone()
+                self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx + 1].clone()
             offset += num_verify
 
         if self.rank == 0:
