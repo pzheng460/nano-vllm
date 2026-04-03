@@ -795,7 +795,6 @@ class ModelRunner:
             for seq in seqs:
                 candidates = self._last_candidates.get(seq.seq_id, set())
                 if seq.last_token in candidates:
-                    # Cache HIT: chain lookup returns K draft tokens
                     self._send_cmd(6)
                     lookup = torch.tensor([seq.seq_id, seq.last_accepted_len, seq.last_token],
                                           dtype=torch.int64, device=d)
@@ -803,44 +802,48 @@ class ModelRunner:
                     dist.recv(self._draft_tokens_buf[:k], src=self.draft_rank, group=self.async_pg)
                     all_draft_tokens.append(self._draft_tokens_buf[:k].tolist())
                 else:
-                    # Cache MISS path: local MTP on target GPU (identical to sync)
-                    target_hidden = self.last_hidden[seq.seq_id]
-                    draft_tokens = []
-                    cur_token_id = seq.last_token
-                    cur_pos = len(seq) - 1
-                    for step in range(k):
-                        input_id = self.device.to_device(
-                            torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
-                        pos = self.device.to_device(
-                            torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
-                        block_idx = cur_pos // self.block_size
-                        block_offset = cur_pos % self.block_size
-                        slot = seq.block_table[block_idx] * self.block_size + block_offset
-                        slot_map = self.device.to_device(
-                            torch.tensor([slot], dtype=torch.int32, pin_memory=True))
-                        bt = seq.block_table
-                        if self.config.num_sink_blocks > 0:
-                            bt = list(range(self.config.num_sink_blocks)) + bt
-                        sink_ctx_ssd = self.config.num_sink_blocks * self.block_size
-                        block_table = self.device.to_device(
-                            torch.tensor([bt], dtype=torch.int32, pin_memory=True))
-                        context_lens = self.device.to_device(
-                            torch.tensor([cur_pos + 1 + sink_ctx_ssd], dtype=torch.int32, pin_memory=True))
-                        set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
-                        token_embeds = embed_tokens(input_id)
-                        mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
-                        reset_context()
-                        draft_logits = self.model.compute_logits_all(mtp_normed)
-                        d_token = draft_logits.argmax(dim=-1).item()
-                        draft_tokens.append(d_token)
-                        # Chain: use normed output for next step, matching vLLM
-                        target_hidden = mtp_normed
-                        cur_token_id = d_token
-                        cur_pos += 1
-                    all_draft_tokens.append(draft_tokens)
+                    if self.tp_size > 1:
+                        all_draft_tokens.append([0] * k)
+                    else:
+                        # Cache MISS: local MTP on target GPU
+                        target_hidden = self.last_hidden[seq.seq_id]
+                        draft_tokens = []
+                        cur_token_id = seq.last_token
+                        cur_pos = len(seq) - 1
+                        for step in range(k):
+                            input_id = self.device.to_device(
+                                torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
+                            pos = self.device.to_device(
+                                torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
+                            block_idx = cur_pos // self.block_size
+                            block_offset = cur_pos % self.block_size
+                            slot = seq.block_table[block_idx] * self.block_size + block_offset
+                            slot_map = self.device.to_device(
+                                torch.tensor([slot], dtype=torch.int32, pin_memory=True))
+                            bt = seq.block_table
+                            if self.config.num_sink_blocks > 0:
+                                bt = list(range(self.config.num_sink_blocks)) + bt
+                            sink_ctx_ssd = self.config.num_sink_blocks * self.block_size
+                            block_table_t = self.device.to_device(
+                                torch.tensor([bt], dtype=torch.int32, pin_memory=True))
+                            context_lens = self.device.to_device(
+                                torch.tensor([cur_pos + 1 + sink_ctx_ssd], dtype=torch.int32, pin_memory=True))
+                            set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table_t)
+                            token_embeds = embed_tokens(input_id)
+                            mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
+                            reset_context()
+                            draft_logits = self.model.compute_logits_all(mtp_normed)
+                            d_token = draft_logits.argmax(dim=-1).item()
+                            draft_tokens.append(d_token)
+                            target_hidden = mtp_normed
+                            cur_token_id = d_token
+                            cur_pos += 1
+                        all_draft_tokens.append(draft_tokens)
 
         # Broadcast draft tokens to TP workers
         if self.tp_size > 1:
+            if self.rank != 0:
+                all_draft_tokens = [[0] * k for _ in seqs]
             for i, seq in enumerate(seqs):
                 for j in range(k):
                     d_tensor = torch.tensor([all_draft_tokens[i][j]], dtype=torch.int64, device=d)
@@ -855,16 +858,17 @@ class ModelRunner:
 
         hidden_states = model_inner.embed_tokens(verify_ids)
         residual = None
+        _async_send_handles = []
+        _early_hidden_for_cand = None
         for i, layer in enumerate(model_inner.layers):
             hidden_states, residual = layer(verify_pos, hidden_states, residual)
             if i == early_layer and self.rank == 0 and self.async_pg is not None:
-                early_hidden_all = (hidden_states + residual)
-                # Batched send: one cmd + packed metadata + all hidden states
+                early_hidden_all = (hidden_states + residual).clone()
+                _early_hidden_for_cand = early_hidden_all
+                # Non-blocking sends: overlap with remaining layers
                 num_seqs_batch = len(seqs)
-                self._send_cmd(5)
-                # Send num_seqs first, then per-seq meta, then batched data
-                dist.send(torch.tensor([num_seqs_batch], dtype=torch.int64, device=d),
-                          dst=self.draft_rank, group=self.async_pg)
+                cmd_t = torch.tensor([5], dtype=torch.int64, device=d)
+                ns_t = torch.tensor([num_seqs_batch], dtype=torch.int64, device=d)
                 meta_list = []
                 bt_list = []
                 pos_list = []
@@ -875,23 +879,31 @@ class ModelRunner:
                     meta_list.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), seq_start_pos])
                     bt_list.extend(bt)
                     pos_list.extend(range(seq_start_pos, seq_start_pos + nv))
-                dist.send(torch.tensor(meta_list, dtype=torch.int64, device=d),
-                          dst=self.draft_rank, group=self.async_pg)
-                dist.send(early_hidden_all.contiguous(), dst=self.draft_rank, group=self.async_pg)
-                dist.send(torch.tensor(bt_list, dtype=torch.int32, device=d),
-                          dst=self.draft_rank, group=self.async_pg)
-                dist.send(torch.tensor(pos_list, dtype=torch.int64, device=d),
-                          dst=self.draft_rank, group=self.async_pg)
-                # Save for candidate computation on target side
-                if not hasattr(self, '_early_hiddens_for_candidates'):
-                    self._early_hiddens_for_candidates = {}
-                offset_e = 0
-                for seq, dt in zip(seqs, all_draft_tokens):
-                    nv = len(dt) + 1
-                    self._early_hiddens_for_candidates[seq.seq_id] = early_hidden_all[offset_e:offset_e+nv].clone()
-                    offset_e += nv
+                meta_t = torch.tensor(meta_list, dtype=torch.int64, device=d)
+                bt_t = torch.tensor(bt_list, dtype=torch.int32, device=d)
+                pos_t = torch.tensor(pos_list, dtype=torch.int64, device=d)
+                _async_send_handles = [
+                    dist.isend(cmd_t, dst=self.draft_rank, group=self.async_pg),
+                    dist.isend(ns_t, dst=self.draft_rank, group=self.async_pg),
+                    dist.isend(meta_t, dst=self.draft_rank, group=self.async_pg),
+                    dist.isend(early_hidden_all, dst=self.draft_rank, group=self.async_pg),
+                    dist.isend(bt_t, dst=self.draft_rank, group=self.async_pg),
+                    dist.isend(pos_t, dst=self.draft_rank, group=self.async_pg),
+                ]
 
         hidden_states, residual = model_inner.norm(hidden_states, residual)
+
+        # Wait for async sends to complete before proceeding
+        for h in _async_send_handles:
+            h.wait()
+        if _early_hidden_for_cand is not None:
+            if not hasattr(self, '_early_hiddens_for_candidates'):
+                self._early_hiddens_for_candidates = {}
+            offset_e = 0
+            for seq, dt in zip(seqs, all_draft_tokens):
+                nv = len(dt) + 1
+                self._early_hiddens_for_candidates[seq.seq_id] = _early_hidden_for_cand[offset_e:offset_e+nv].clone()
+                offset_e += nv
         hidden = residual
 
         target_logits = self.model.compute_logits_all(model_inner.norm(hidden))
@@ -905,12 +917,10 @@ class ModelRunner:
             if hasattr(self, '_early_hiddens_for_candidates'):
                 fan = self.config.async_fan_out
                 for seq_id, eh_all in self._early_hiddens_for_candidates.items():
-                    all_cands = set()
                     en = model_inner.norm(eh_all)
                     el = F.linear(en, self.model.lm_head.weight)
                     _, topf = torch.topk(el, fan, dim=-1)
-                    all_cands = set(topf.reshape(-1).tolist())
-                    self._last_candidates[seq_id] = all_cands
+                    self._last_candidates[seq_id] = set(topf.reshape(-1).tolist())
                 self._early_hiddens_for_candidates = {}
 
         if self.rank == 0:

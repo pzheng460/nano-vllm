@@ -18,6 +18,13 @@ from nanovllm.utils.context import set_context, reset_context
 from nanovllm.utils.loader import _load_weight
 from nanovllm.utils.device import get_device_backend
 
+_PANGU_TYPES = {'PanguProMoE', 'PanguProMoEV2', 'PanguUltraMoE', 'PanguEmbedded', 'pangu'}
+
+
+def _is_pangu(hf_config):
+    model_type = getattr(hf_config, 'model_type', '')
+    return model_type in _PANGU_TYPES or getattr(hf_config, 'param_sink_number', 0) > 0
+
 
 def _load_draft_model(model, path):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
@@ -66,6 +73,108 @@ class MiMoMTPDraftModel(torch.nn.Module):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
 
+class PanguMTPDraftModel(torch.nn.Module):
+    packed_modules_mapping = {
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(self, config):
+        super().__init__()
+        from nanovllm.models.pangu import PanguMTPLayer, PanguModel
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, tp_size=1)
+        self.model.mtp_layers = torch.nn.ModuleList([
+            PanguMTPLayer(config, layer_idx=config.num_hidden_layers + i, tp_size=1)
+            for i in range(getattr(config, 'num_nextn_predict_layers', 1))
+        ])
+        # Main model norm + lm_head (for early_speculate candidate computation)
+        self.model.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, tp_size=1)
+        if getattr(config, 'tie_word_embeddings', False):
+            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+
+
+def _load_pangu_draft_model(model, path, hf_config):
+    """Load Pangu draft model with MTP weight name rewriting and MoE expert handling."""
+    import re
+    from nanovllm.utils.loader import default_weight_loader
+
+    num_hidden = hf_config.num_hidden_layers
+    num_mtp = getattr(hf_config, 'num_nextn_predict_layers', 0)
+    spec_layer_names = ["enorm", "hnorm", "eh_proj", "shared_head"]
+    packed_modules_mapping = model.packed_modules_mapping
+    params_dict = dict(model.named_parameters())
+
+    safetensor_files = sorted(glob(os.path.join(path, "*.safetensors")))
+    for file in safetensor_files:
+        with safe_open(file, "pt", "cpu") as f:
+            for weight_name in f.keys():
+                name = weight_name
+                # Only load MTP layers, embed_tokens, lm_head, model.norm
+                is_mtp = False
+                for mtp_idx in range(num_mtp):
+                    layer_idx = num_hidden + mtp_idx
+                    old_prefix = f"model.layers.{layer_idx}."
+                    if not name.startswith(old_prefix):
+                        continue
+                    is_mtp = True
+                    is_spec = any(w in name for w in spec_layer_names)
+                    is_shared = "embed_tokens" in name
+                    if is_shared:
+                        name = name.replace(old_prefix, "model.")
+                    elif is_spec:
+                        name = name.replace(old_prefix, f"model.mtp_layers.{mtp_idx}.")
+                    else:
+                        name = name.replace(old_prefix, f"model.mtp_layers.{mtp_idx}.mtp_block.")
+                    break
+                # Also load embed_tokens, lm_head, model.norm
+                if not is_mtp:
+                    if not any(k in name for k in ["embed_tokens", "lm_head", "model.norm."]):
+                        continue
+                # e_score_correction_bias remapping
+                if name.endswith("e_score_correction_bias") and "gate." not in name:
+                    name = name.replace("e_score_correction_bias", "gate.e_score_correction_bias")
+                # Handle MoE expert weights
+                m = re.search(r'\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$', name)
+                if m:
+                    expert_id = int(m.group(1))
+                    proj_type = m.group(2)
+                    moe_prefix = name[:m.start()] + ".mlp."
+                    if proj_type in ("gate_proj", "up_proj"):
+                        param_name = moe_prefix + "w13_weight"
+                        shard_id = 0 if proj_type == "gate_proj" else 1
+                    else:
+                        param_name = moe_prefix + "w2_weight"
+                        shard_id = None
+                    if param_name in params_dict:
+                        param = params_dict[param_name]
+                        loader = getattr(param, "weight_loader")
+                        if shard_id is not None:
+                            loader(param, f.get_tensor(weight_name), shard_id, expert_id=expert_id)
+                        else:
+                            loader(param, f.get_tensor(weight_name), expert_id=expert_id)
+                    continue
+                # Handle packed modules (gate_up_proj)
+                loaded = False
+                for ckpt_name, (param_name, shard_id) in packed_modules_mapping.items():
+                    if f".{ckpt_name}." in name:
+                        mapped = name.replace(ckpt_name, param_name)
+                        if mapped in params_dict:
+                            param = params_dict[mapped]
+                            loader = getattr(param, "weight_loader")
+                            loader(param, f.get_tensor(weight_name), shard_id)
+                            loaded = True
+                        break
+                if loaded:
+                    continue
+                # Direct load
+                if name in params_dict:
+                    param = params_dict[name]
+                    loader = getattr(param, "weight_loader", default_weight_loader)
+                    loader(param, f.get_tensor(weight_name))
+
+
 class MTPDraftRunner:
 
     def __init__(self, config: Config, rank: int, init_q=None):
@@ -97,8 +206,13 @@ class MTPDraftRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device(self.device)
 
-        self.draft_model = MiMoMTPDraftModel(hf_config)
-        _load_draft_model(self.draft_model, config.model)
+        self.is_pangu = _is_pangu(hf_config)
+        if self.is_pangu:
+            self.draft_model = PanguMTPDraftModel(hf_config)
+            _load_pangu_draft_model(self.draft_model, config.model, hf_config)
+        else:
+            self.draft_model = MiMoMTPDraftModel(hf_config)
+            _load_draft_model(self.draft_model, config.model)
 
         self.mtp_layer = self.draft_model.model.mtp_layers[0]
         self.embed_tokens = self.draft_model.model.embed_tokens
@@ -106,23 +220,28 @@ class MTPDraftRunner:
 
         # Warmup + allocate KV cache (same sizing as target)
         self._warmup_and_allocate_kv_cache()
+        # Populate sink KV for Pangu MTP layers
+        if self.is_pangu:
+            self._populate_pangu_sink_kv()
         # Send num_kvcache_blocks to target via init_q
         if init_q is not None:
             init_q.put(config.num_kvcache_blocks)
             init_q.close()
 
-        # CUDA graph capture for single-token MTP decode
-        self._capture_mtp_graph()
+        # CUDA graph capture for single-token MTP decode (skip for Pangu: MoE breaks graph)
+        if not self.is_pangu:
+            self._capture_mtp_graph()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        self.tree_decode = config.ssd_tree_decode
         self._reset_tree_cache()
         self.last_hidden = {}
         # Pre-allocate recv buffers
         self._cmd_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
 
-        print(f"[MTPDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}", flush=True)
+        print(f"[MTPDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}, tree_decode={self.tree_decode}", flush=True)
 
     def _warmup_and_allocate_kv_cache(self):
         """Compute available memory and allocate MTP KV cache."""
@@ -131,7 +250,13 @@ class MTPDraftRunner:
         torch.cuda.empty_cache()
 
         num_kv_heads = hf_config.num_key_value_heads
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+        # Pangu uses qk_rope_dim + qk_nope_dim as head_dim for KV cache
+        qk_rope = getattr(hf_config, 'qk_rope_dim', None)
+        qk_nope = getattr(hf_config, 'qk_nope_dim', None)
+        if qk_rope is not None and qk_nope is not None:
+            head_dim = qk_rope + qk_nope
+        else:
+            head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         num_mtp_layers = hf_config.num_nextn_predict_layers
         # Compute num_blocks from available memory
         free, total = torch.cuda.mem_get_info()
@@ -155,6 +280,15 @@ class MTPDraftRunner:
                     module.k_cache = self.mtp_kv_cache[0, layer_id]
                     module.v_cache = self.mtp_kv_cache[1, layer_id]
                     layer_id += 1
+
+    def _populate_pangu_sink_kv(self):
+        """Finalize Pangu sink KV params (k_layernorm + v_padding) after weight loading."""
+        from nanovllm.models.pangu import PanguSinkAttention
+        for mtp_layer in self.draft_model.model.mtp_layers:
+            if hasattr(mtp_layer, 'mtp_block'):
+                attn = getattr(mtp_layer.mtp_block, 'self_attn', None)
+                if isinstance(attn, PanguSinkAttention):
+                    attn.post_weight_load()
 
     @torch.inference_mode()
     def _capture_mtp_graph(self):
@@ -206,6 +340,12 @@ class MTPDraftRunner:
     def compute_logits_all(self, hidden_states):
         return F.linear(hidden_states, self.lm_head.weight)
 
+    def compute_mtp_logits(self, hidden_states):
+        """Compute logits using MTP's own head (Pangu shared_head) or main lm_head (MiMo)."""
+        if hasattr(self.mtp_layer, 'shared_head'):
+            return F.linear(hidden_states, self.mtp_layer.shared_head.head.weight)
+        return F.linear(hidden_states, self.lm_head.weight)
+
     @torch.inference_mode()
     def _mtp_step(self, token_id, hidden_state, cur_pos, block_table_t):
         """Single MTP forward step using CUDA graph. Returns (prenorm, logits, next_token)."""
@@ -229,13 +369,13 @@ class MTPDraftRunner:
         self._mtp_graph.replay()
         reset_context()
 
-        logits = self.compute_logits_all(g["out_normed"])
+        logits = self.compute_mtp_logits(g["out_normed"])
         next_token = logits.argmax(dim=-1).item()
         return g["out_prenorm"][0].clone(), logits.squeeze(0), next_token
 
     @torch.inference_mode()
     def jit_speculate(self, recovery_token, hidden_state, num_tokens, block_table_t):
-        K = self.K
+        K = self.Kneng
         draft_tokens = []
         cur_token = recovery_token
         cur_pos = num_tokens - 1
@@ -311,7 +451,7 @@ class MTPDraftRunner:
             embeds = self.embed_tokens(current_ids)
             normed, prenorm = self.mtp_layer(embeds, hidden_states, rope_positions)
             reset_context()
-            logits = self.compute_logits_all(normed)
+            logits = self.compute_mtp_logits(normed)
             next_tokens = logits.argmax(dim=-1)
             spec_tokens[:, depth] = next_tokens
             hidden_states = prenorm
@@ -461,23 +601,56 @@ class MTPDraftRunner:
             flat_acc_lens = torch.arange(nv, device=self.device, dtype=torch.int64).repeat_interleave(fan)
             flat_pos = verify_pos.repeat_interleave(fan)
 
-            slot_list = []
-            for p in flat_pos.tolist():
-                p = int(p)
-                slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
-            slot_t = torch.tensor(slot_list, dtype=torch.int32, device=self.device)
-            bt_exp = block_table.unsqueeze(0).expand(total, -1).contiguous()
-            ctx_lens = (flat_pos + 1).to(torch.int32)
+            if self.tree_decode and self.K > 1:
+                # Tree decode: run K MTP steps per candidate, store K tokens per entry
+                max_bi = block_table.shape[0] - 1
+                base_vpos = spos + nv  # virtual positions start after verify range
+                all_draft = []
+                current_embeds = flat_embeds
+                current_hidden = flat_hidden
+                bt_exp = block_table.unsqueeze(0).expand(total, -1).contiguous()
 
-            set_context(False, slot_mapping=slot_t, context_lens=ctx_lens, block_tables=bt_exp)
-            normed_out, _ = self.mtp_layer(flat_embeds, flat_hidden, flat_pos)
-            reset_context()
-            logits = self.compute_logits_all(normed_out)
-            draft_tokens = logits.argmax(dim=-1)
+                for depth in range(self.K):
+                    vpos = torch.arange(total, device=self.device, dtype=torch.int64) + base_vpos + depth * total
+                    rope_pos = flat_pos + depth
+                    bi = (vpos // self.block_size).long().clamp(0, max_bi)
+                    bo = (vpos % self.block_size).int()
+                    slot_t = (block_table[bi] * self.block_size + bo).int()
+                    ctx_lens = (vpos + 1).to(torch.int32)
 
-            seq_ids = torch.full((total,), sid, dtype=torch.int64, device=self.device)
-            keys = torch.stack([seq_ids, flat_acc_lens, flat_cands], dim=1)
-            self.tree_caches[sid] = (keys, draft_tokens.unsqueeze(1))
+                    set_context(False, slot_mapping=slot_t, context_lens=ctx_lens, block_tables=bt_exp)
+                    normed_out, prenorm = self.mtp_layer(current_embeds, current_hidden, rope_pos)
+                    reset_context()
+
+                    logits = self.compute_mtp_logits(normed_out)
+                    next_tokens = logits.argmax(dim=-1)
+                    all_draft.append(next_tokens)
+                    current_hidden = prenorm
+                    current_embeds = self.embed_tokens(next_tokens)
+
+                spec_tokens = torch.stack(all_draft, dim=1)  # (total, K)
+                seq_ids = torch.full((total,), sid, dtype=torch.int64, device=self.device)
+                keys = torch.stack([seq_ids, flat_acc_lens, flat_cands], dim=1)
+                self.tree_caches[sid] = (keys, spec_tokens)
+            else:
+                # Single MTP step + chain lookup (original path)
+                slot_list = []
+                for p in flat_pos.tolist():
+                    p = int(p)
+                    slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
+                slot_t = torch.tensor(slot_list, dtype=torch.int32, device=self.device)
+                bt_exp = block_table.unsqueeze(0).expand(total, -1).contiguous()
+                ctx_lens = (flat_pos + 1).to(torch.int32)
+
+                set_context(False, slot_mapping=slot_t, context_lens=ctx_lens, block_tables=bt_exp)
+                normed_out, _ = self.mtp_layer(flat_embeds, flat_hidden, flat_pos)
+                reset_context()
+                logits = self.compute_mtp_logits(normed_out)
+                draft_tokens = logits.argmax(dim=-1)
+
+                seq_ids = torch.full((total,), sid, dtype=torch.int64, device=self.device)
+                keys = torch.stack([seq_ids, flat_acc_lens, flat_cands], dim=1)
+                self.tree_caches[sid] = (keys, draft_tokens.unsqueeze(1))
 
     def handle_cache_lookup(self):
         """Chain lookup: receive (seq_id, accepted_len, recovery_token), do K chained lookups."""
@@ -489,21 +662,33 @@ class MTPDraftRunner:
         hit = False
         if seq_id in self.tree_caches:
             cache_keys, cache_tokens = self.tree_caches[seq_id]
-            cur_token = recovery_token
-            for step in range(self.K):
-                request_key = torch.tensor([[seq_id, accepted_len + step, cur_token]],
+            if self.tree_decode:
+                # Direct lookup: single match returns all K tokens
+                request_key = torch.tensor([[seq_id, accepted_len, recovery_token]],
                                            dtype=torch.int64, device=self.device)
                 match = torch.all(request_key == cache_keys, dim=1)
                 if match.any():
                     idx = match.float().argmax().item()
-                    d = cache_tokens[idx, 0].item()
-                    result[step] = d
-                    cur_token = d
-                    if step == 0:
-                        hit = True
-                else:
-                    # Chain broken — fill remaining with 0
-                    break
+                    k = min(self.K, cache_tokens.shape[1])
+                    result[:k] = cache_tokens[idx, :k]
+                    hit = True
+            else:
+                # Chain lookup (original path)
+                cur_token = recovery_token
+                for step in range(self.K):
+                    request_key = torch.tensor([[seq_id, accepted_len + step, cur_token]],
+                                               dtype=torch.int64, device=self.device)
+                    match = torch.all(request_key == cache_keys, dim=1)
+                    if match.any():
+                        idx = match.float().argmax().item()
+                        d = cache_tokens[idx, 0].item()
+                        result[step] = d
+                        cur_token = d
+                        if step == 0:
+                            hit = True
+                    else:
+                        # Chain broken — fill remaining with 0
+                        break
         if hit:
             MTPDraftRunner._hit += 1
         else:

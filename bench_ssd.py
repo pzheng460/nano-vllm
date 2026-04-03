@@ -32,6 +32,8 @@ if __name__ == '__main__':
                         help='SSD: extract early hidden at layer N-X (default: 2)')
     parser.add_argument('--fan-out', type=int, default=3)
     parser.add_argument('--K', type=int, default=3)
+    parser.add_argument('--tree-decode', action='store_true',
+                        help='SSD: tree decode (K MTP steps per candidate) vs chain lookup')
     args = parser.parse_args()
 
     if args.mode == 'sync1':
@@ -46,5 +48,7 @@ if __name__ == '__main__':
                    draft_async=True, draft_gpu=1,
                    num_speculative_tokens=args.K,
                    async_fan_out=args.fan_out,
-                   ssd_early_layers=args.early_layers)
-        bench(f'Async SSD K={args.K} early={args.early_layers} fan={args.fan_out}', llm)
+                   ssd_early_layers=args.early_layers,
+                   ssd_tree_decode=args.tree_decode)
+        td = ' tree' if args.tree_decode else ' chain'
+        bench(f'Async SSD K={args.K} early={args.early_layers} fan={args.fan_out}{td}', llm)
