@@ -44,8 +44,8 @@ class Config:
                 self.num_speculative_tokens = self.hf_config.num_nextn_predict_layers
         # PanGu sink attention config
         self.sink_len = getattr(self.hf_config, 'param_sink_number', 0) or 0
-        # No dedicated sink blocks. Sink KV is embedded in each sequence's first block.
-        # Slot offset = sink_len; position mapping handled by model_runner.
+        # No dedicated sink blocks. Sink KV is embedded in _sink_k/_sink_v buffers
+        # and prepended by PanguSinkAttention during attention computation.
         self.num_sink_blocks = 0
         if self.draft_model is not None:
             assert os.path.isdir(self.draft_model)

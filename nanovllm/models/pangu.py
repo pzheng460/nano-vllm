@@ -267,16 +267,56 @@ class PanguSinkAttention(nn.Module):
                 block_table=context.block_tables)
 
         if context.block_tables is not None:
-            # Prefix cache path: sink blocks already in block tables,
-            # cu_seqlens_k already adjusted by model_runner
+            if len(self.sink_block_ids) > 0:
+                # Sink blocks are in block_tables; cu_seqlens_k already adjusted
+                return flash_attn_varlen_func(
+                    q, k_cache, v_cache,
+                    max_seqlen_q=context.max_seqlen_q,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_k=context.max_seqlen_k,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    softmax_scale=self.scaling, causal=True,
+                    block_table=context.block_tables)
+            # No sink blocks in block_tables: gather from cache, prepend sink, use varlen
+            cu_q = context.cu_seqlens_q
+            cu_k = context.cu_seqlens_k
+            num_seqs = cu_q.numel() - 1
+            block_size = k_cache.shape[1]
+            sink_k, sink_v = self._sink_k, self._sink_v
+            new_k_parts, new_v_parts = [], []
+            new_cu_k = [0]
+            for i in range(num_seqs):
+                q_start = cu_q[i].item()
+                q_end = cu_q[i + 1].item()
+                seq_k_len = cu_k[i + 1].item() - cu_k[i].item()
+                # Gather cached KV from block_table
+                bt = context.block_tables[i]
+                n_blocks = (seq_k_len + block_size - 1) // block_size
+                cached_k, cached_v = [], []
+                rem = seq_k_len
+                for b in range(n_blocks):
+                    bid = bt[b].item()
+                    take = min(rem, block_size)
+                    cached_k.append(k_cache[bid, :take])
+                    cached_v.append(v_cache[bid, :take])
+                    rem -= take
+                # Overwrite positions being verified with fresh KV (already stored by store_kvcache)
+                new_k_parts.append(sink_k)
+                new_v_parts.append(sink_v)
+                new_k_parts.extend(cached_k)
+                new_v_parts.extend(cached_v)
+                new_cu_k.append(new_cu_k[-1] + self.sink_len + seq_k_len)
+            new_k = torch.cat(new_k_parts, dim=0)
+            new_v = torch.cat(new_v_parts, dim=0)
+            new_cu_k = torch.tensor(new_cu_k, dtype=torch.int32, device=q.device)
+            new_max_k = context.max_seqlen_k
             return flash_attn_varlen_func(
-                q, k_cache, v_cache,
+                q, new_k, new_v,
                 max_seqlen_q=context.max_seqlen_q,
-                cu_seqlens_q=context.cu_seqlens_q,
-                max_seqlen_k=context.max_seqlen_k,
-                cu_seqlens_k=context.cu_seqlens_k,
-                softmax_scale=self.scaling, causal=True,
-                block_table=context.block_tables)
+                cu_seqlens_q=cu_q,
+                max_seqlen_k=new_max_k,
+                cu_seqlens_k=new_cu_k,
+                softmax_scale=self.scaling, causal=True)
 
         # No prefix cache: prepend sink K/V to each sequence's K/V
         cu_k = context.cu_seqlens_k

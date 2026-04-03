@@ -64,13 +64,12 @@ class ModelRunner:
         self.use_mtp = config.use_mtp
         self.draft_async = config.draft_async
         self.speculative = config.draft_model is not None or self.use_mtp
-        # MiMo MTP has hidden_layernorm and expects unnormed hidden from target;
-        # PanGu MTP expects normed hidden
+        # MTP layers have their own hidden norm (MiMo: hidden_layernorm, PanGu: hnorm)
+        # and always expect unnormed hidden from the target model's residual stream
         self._mtp_uses_unnormed = (
             self.use_mtp
             and hasattr(self.model.model, 'mtp_layers')
             and len(self.model.model.mtp_layers) > 0
-            and hasattr(self.model.model.mtp_layers[0], 'hidden_layernorm')
         )
         # MTP uses its own shared_head (norm + head trained together, NOT shared with target lm_head)
         self.num_speculative_tokens = config.num_speculative_tokens
@@ -475,15 +474,17 @@ class ModelRunner:
                 slot = seq.block_table[block_idx] * self.block_size + block_offset
                 slot_mapping.append(slot)
         block_tables = self.prepare_block_tables(seqs)
-        # Prepend sink block IDs for verify (needed for sink attention with cache)
+        # Adjust for sink attention: add sink_len to cu_seqlens_k even with num_sink_blocks=0
+        # (PanguSinkAttention prepends _sink_k/_sink_v internally in prefill-with-cache path)
+        if self.config.sink_len > 0:
+            sink_ctx = self.config.sink_len
+            cu_seqlens_k = [cu_seqlens_k[0]] + [c + sink_ctx * i for i, c in enumerate(cu_seqlens_k[1:], 1)]
+            max_seqlen_k += sink_ctx
         if self.config.num_sink_blocks > 0:
             sink_ids = list(range(self.config.num_sink_blocks))
             bs = block_tables.size(0)
             sink_cols = torch.tensor([sink_ids] * bs, dtype=torch.int32, device=block_tables.device)
             block_tables = torch.cat([sink_cols, block_tables], dim=1)
-            sink_ctx = self.config.sink_len
-            cu_seqlens_k = [cu_seqlens_k[0]] + [c + sink_ctx * i for i, c in enumerate(cu_seqlens_k[1:], 1)]
-            max_seqlen_k += sink_ctx
         input_ids = self.device.to_device(torch.tensor(input_ids, dtype=torch.int64, pin_memory=True))
         positions = self.device.to_device(torch.tensor(positions, dtype=torch.int64, pin_memory=True))
         cu_seqlens_q = self.device.to_device(torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True))
