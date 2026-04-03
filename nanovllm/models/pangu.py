@@ -286,26 +286,25 @@ class PanguSinkAttention(nn.Module):
             new_k_parts, new_v_parts = [], []
             new_cu_k = [0]
             for i in range(num_seqs):
-                q_start = cu_q[i].item()
-                q_end = cu_q[i + 1].item()
-                seq_k_len = cu_k[i + 1].item() - cu_k[i].item()
+                # cu_seqlens_k includes sink_len; subtract to get actual cached KV length
+                total_k = cu_k[i + 1].item() - cu_k[i].item()
+                cached_k_len = total_k - self.sink_len
                 # Gather cached KV from block_table
                 bt = context.block_tables[i]
-                n_blocks = (seq_k_len + block_size - 1) // block_size
+                n_blocks = (cached_k_len + block_size - 1) // block_size
                 cached_k, cached_v = [], []
-                rem = seq_k_len
+                rem = cached_k_len
                 for b in range(n_blocks):
                     bid = bt[b].item()
                     take = min(rem, block_size)
                     cached_k.append(k_cache[bid, :take])
                     cached_v.append(v_cache[bid, :take])
                     rem -= take
-                # Overwrite positions being verified with fresh KV (already stored by store_kvcache)
                 new_k_parts.append(sink_k)
                 new_v_parts.append(sink_v)
                 new_k_parts.extend(cached_k)
                 new_v_parts.extend(cached_v)
-                new_cu_k.append(new_cu_k[-1] + self.sink_len + seq_k_len)
+                new_cu_k.append(new_cu_k[-1] + total_k)
             new_k = torch.cat(new_k_parts, dim=0)
             new_v = torch.cat(new_v_parts, dim=0)
             new_cu_k = torch.tensor(new_cu_k, dtype=torch.int32, device=q.device)
