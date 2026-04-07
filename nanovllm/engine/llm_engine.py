@@ -94,6 +94,27 @@ class LLMEngine:
             num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         # Clean up finished sequences in draft
         if self.draft_async and self.model_runner.async_pg is not None:
+            # Drain pending push from draft BEFORE cleanup (NCCL ordering)
+            mr = self.model_runner
+            if getattr(mr, '_push_pending', False) and not is_prefill:
+                import torch
+                d = mr.device.device_name
+                if not hasattr(mr, '_local_tree_cache'):
+                    mr._local_tree_cache = {}
+                sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
+                dist.recv(sz_buf, src=mr.draft_rank, group=mr.async_pg)
+                buf_size = int(sz_buf[0].item())
+                push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
+                dist.recv(push_buf, src=mr.draft_rank, group=mr.async_pg)
+                idx = 0
+                n_push = int(push_buf[idx].item()); idx += 1
+                for _ in range(n_push):
+                    sid = int(push_buf[idx].item()); n_e = int(push_buf[idx+1].item()); K_a = int(push_buf[idx+2].item()); idx += 3
+                    if n_e > 0:
+                        keys = push_buf[idx:idx+n_e*3].reshape(n_e, 3).clone(); idx += n_e*3
+                        tokens = push_buf[idx:idx+n_e*K_a].reshape(n_e, K_a).clone(); idx += n_e*K_a
+                        mr._local_tree_cache[sid] = (keys, tokens)
+                mr._push_pending = False
             for seq in seqs:
                 if seq.is_finished:
                     self.model_runner._send_cmd(3)  # cleanup

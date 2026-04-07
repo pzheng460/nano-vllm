@@ -26,6 +26,7 @@ def _get_model_cls(hf_config):
     if model_type in pangu_types or getattr(hf_config, 'param_sink_number', 0) > 0:
         from nanovllm.models.pangu import PanguForCausalLM
         return PanguForCausalLM
+    # Qwen2 and Qwen3 share the same architecture (bias/no-bias handled by attention_bias flag)
     return Qwen3ForCausalLM
 
 
@@ -221,7 +222,7 @@ class ModelRunner:
     def allocate_draft_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        num_attn_heads = hf_config.num_attention_heads // self.world_size
+        num_attn_heads = hf_config.num_attention_heads // self.tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         self.draft_kv_cache = torch.empty(
             2, 1, config.num_kvcache_blocks, self.block_size,
@@ -438,8 +439,17 @@ class ModelRunner:
             embeds = self.model.model.embed_tokens(shifted_ids)
             mtp_hidden = hidden if self._mtp_uses_unnormed else hidden_normed
             self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
-        # MiMo MTP needs unnormed; EAGLE/PanGu use whatever the model returns
+        # EAGLE uses normed hidden (trained with model.model() output which is post-RMSNorm);
+        # MiMo MTP uses unnormed (model returns it directly)
         save_hidden = hidden
+        # Populate EAGLE KV cache during prefill so draft attention has valid context
+        if hasattr(self, 'draft_model'):
+            ctx = get_context()
+            set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
+                        ctx.max_seqlen_k, ctx.slot_mapping, None, None)
+            self.draft_model(input_ids, positions, hidden_normed)
+            set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
+                        ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
@@ -532,8 +542,8 @@ class ModelRunner:
 
         # === Verify phase (target model, prefill-like) ===
         input_ids, positions = self._prepare_verify(seqs, all_draft_tokens)
-        hidden = self.model(input_ids, positions)
-        # MiMo returns unnormed → norm for logits; Qwen3 returns normed → use directly
+        hidden = self.model(input_ids, positions)  # normed for Qwen2/3, unnormed for MiMo
+        # MiMo returns unnormed → norm for logits; Qwen2/3 returns normed → use directly
         if self._mtp_uses_unnormed:
             target_logits = self.model.compute_logits_all(self.model.model.norm(hidden))
         else:
@@ -558,11 +568,44 @@ class ModelRunner:
                 else:
                     # All draft tokens accepted, add bonus token
                     accepted.append(target_predicted[k].item())
-                # Save last hidden state at accepted position
+                # Save normed hidden at accepted position (EAGLE trained with normed hidden)
                 accepted_idx = offset + len(accepted) - 1
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
+
+            # === EAGLE first-pass: update EAGLE KV for accepted tokens (matches vLLM) ===
+            if hasattr(self, 'draft_model'):
+                d = self.device.device_name
+                offset = 0
+                for seq_idx, seq in enumerate(seqs):
+                    num_accepted = len(all_accepted[seq_idx])
+                    num_verify = len(all_draft_tokens[seq_idx]) + 1
+                    seq_start_pos = len(seq) - 1
+                    # Update EAGLE KV at accepted positions with real target hidden
+                    # (skip last accepted — next round's first draft step overwrites it)
+                    for j in range(num_accepted - 1):
+                        acc_pos = seq_start_pos + j + 1
+                        tok_id = all_accepted[seq_idx][j]
+                        target_h = hidden[offset + j + 1:offset + j + 2]
+                        inp = self.device.to_device(
+                            torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
+                        p = self.device.to_device(
+                            torch.tensor([acc_pos], dtype=torch.int64, pin_memory=True))
+                        bi = acc_pos // self.block_size
+                        bo = acc_pos % self.block_size
+                        sl = seq.block_table[bi] * self.block_size + bo
+                        sm = self.device.to_device(
+                            torch.tensor([sl], dtype=torch.int32, pin_memory=True))
+                        bt = self.device.to_device(
+                            torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
+                        cl = self.device.to_device(
+                            torch.tensor([acc_pos + 1], dtype=torch.int32, pin_memory=True))
+                        set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt)
+                        self.draft_model(inp, p, target_h)
+                        reset_context()
+                    offset += num_verify
+
             return all_accepted
         else:
             return None
@@ -721,6 +764,7 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
 
         # MTP KV cache update with shifted token IDs (matching sync path)
+        eagle_async = self.config.eagle_async
         if self.use_mtp:
             shifted_ids = input_ids.clone()
             shifted_ids[:-1] = input_ids[1:]
@@ -733,6 +777,8 @@ class ModelRunner:
             mtp_hidden = hidden if self._mtp_uses_unnormed else self.model.model.norm(hidden)
             self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
 
+        # EAGLE async: skip local EAGLE KV prefill — draft GPU handles cache miss via JIT (cmd=0)
+
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = hidden[last_indices[i]:last_indices[i]+1].clone()
 
@@ -743,13 +789,14 @@ class ModelRunner:
                 seq_positions = list(range(seq.num_cached_tokens, len(seq)))
                 bt = seq.block_table
 
-                # Send shifted token IDs + hidden to draft
-                shifted_seq = shifted_ids[start:end]
+                # EAGLE: send original token IDs + normed hidden
+                # MTP: send shifted token IDs + hidden
+                send_ids = input_ids[start:end] if eagle_async else shifted_ids[start:end]
 
                 self._send_cmd(1)
                 meta = torch.tensor([seq.seq_id, n, len(bt)], dtype=torch.int64, device=d)
                 dist.send(meta, dst=self.draft_rank, group=self.async_pg)
-                dist.send(shifted_seq.contiguous(), dst=self.draft_rank, group=self.async_pg)
+                dist.send(send_ids.contiguous(), dst=self.draft_rank, group=self.async_pg)
                 dist.send(hidden[start:end].contiguous(), dst=self.draft_rank, group=self.async_pg)
                 dist.send(torch.tensor(seq_positions, dtype=torch.int64, device=d),
                           dst=self.draft_rank, group=self.async_pg)
@@ -774,27 +821,110 @@ class ModelRunner:
 
         # === Speculation phase ===
         # Check if draft has cached result (from last step's early_speculate).
-        # Target knows what candidates it sent — if recovery_token is in candidates → hit.
-        # On hit: NCCL to draft (fast). On miss: local MTP (same as sync, no penalty).
-        mtp_layer = self.model.model.mtp_layers[0]
-        embed_tokens = self.model.model.embed_tokens
+        # On hit: NCCL to draft (fast). On miss: local MTP/EAGLE fallback.
+        eagle_async = self.config.eagle_async
+        if not eagle_async:
+            mtp_layer = self.model.model.mtp_layers[0]
         if self.rank == 0 and self.async_pg is not None:
             if not hasattr(self, '_last_candidates'):
                 self._last_candidates = {}
-            for seq in seqs:
-                candidates = self._last_candidates.get(seq.seq_id, set())
-                if seq.last_token in candidates:
-                    self._send_cmd(6)
-                    lookup = torch.tensor([seq.seq_id, seq.last_accepted_len, seq.last_token],
-                                          dtype=torch.int64, device=d)
-                    dist.send(lookup, dst=self.draft_rank, group=self.async_pg)
-                    dist.recv(self._draft_tokens_buf[:k], src=self.draft_rank, group=self.async_pg)
-                    all_draft_tokens.append(self._draft_tokens_buf[:k].tolist())
-                else:
-                    if self.tp_size > 1:
-                        all_draft_tokens.append([0] * k)
+
+            if eagle_async:
+                # Use locally pushed tree cache (received in llm_engine.step() after previous step)
+                if not hasattr(self, '_local_tree_cache'):
+                    self._local_tree_cache = {}
+                for seq in seqs:
+                    local_cache = self._local_tree_cache.get(seq.seq_id)
+                    if local_cache is not None:
+                        keys, tokens = local_cache
+                        acc_len = seq.last_accepted_len
+                        if tokens.shape[1] >= k:
+                            # Tree mode: direct lookup returns all K tokens
+                            req = torch.tensor([[seq.seq_id, acc_len, seq.last_token]],
+                                                dtype=torch.int64, device=d)
+                            match = torch.all(req == keys, dim=1)
+                            if match.any():
+                                idx = match.float().argmax().item()
+                                all_draft_tokens.append(tokens[idx, :k].tolist())
+                                continue
+                        else:
+                            # Chain mode: K chained lookups
+                            draft_tokens = []
+                            cur_token = seq.last_token
+                            hit = False
+                            for step in range(k):
+                                req = torch.tensor([[seq.seq_id, acc_len + step, cur_token]],
+                                                    dtype=torch.int64, device=d)
+                                match = torch.all(req == keys, dim=1)
+                                if match.any():
+                                    idx = match.float().argmax().item()
+                                    cur_token = tokens[idx, 0].item()
+                                    draft_tokens.append(cur_token)
+                                    if step == 0:
+                                        hit = True
+                                else:
+                                    draft_tokens.extend([0] * (k - step))
+                                    break
+                            if hit:
+                                all_draft_tokens.append(draft_tokens)
+                                continue
+                    # Cache miss: JIT on draft (only happens on first step or rare miss)
+                    self._send_cmd(0)
+                    meta = torch.tensor([seq.seq_id, getattr(seq, 'last_accepted_len', 0),
+                                          seq.last_token, len(seq), len(seq.block_table)],
+                                         dtype=torch.int64, device=d)
+                    dist.send(meta, dst=self.draft_rank, group=self.async_pg)
+                    dist.send(self.last_hidden[seq.seq_id].squeeze(0).contiguous(),
+                               dst=self.draft_rank, group=self.async_pg)
+                    dist.send(torch.tensor(seq.block_table, dtype=torch.int32, device=d),
+                               dst=self.draft_rank, group=self.async_pg)
+                    jit_buf = torch.zeros(k, dtype=torch.int64, device=d)
+                    dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
+                    all_draft_tokens.append(jit_buf.tolist())
+            else:
+                # MTP path: per-seq cache lookup/miss
+                for seq in seqs:
+                    candidates = self._last_candidates.get(seq.seq_id, set())
+                    if seq.last_token in candidates:
+                        self._send_cmd(6)
+                        lookup = torch.tensor([seq.seq_id, seq.last_accepted_len, seq.last_token],
+                                              dtype=torch.int64, device=d)
+                        dist.send(lookup, dst=self.draft_rank, group=self.async_pg)
+                        dist.recv(self._draft_tokens_buf[:k], src=self.draft_rank, group=self.async_pg)
+                        all_draft_tokens.append(self._draft_tokens_buf[:k].tolist())
+                    elif False:
+                        # OLD: local EAGLE on target GPU (disabled)
+                        target_hidden = self.last_hidden[seq.seq_id]
+                        draft_tokens = []
+                        cur_token_id = seq.last_token
+                        cur_pos = len(seq) - 1
+                        for step in range(k):
+                            input_id = self.device.to_device(
+                                torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
+                            pos = self.device.to_device(
+                                torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
+                            block_idx = cur_pos // self.block_size
+                            block_offset = cur_pos % self.block_size
+                            slot = seq.block_table[block_idx] * self.block_size + block_offset
+                            slot_map = self.device.to_device(
+                                torch.tensor([slot], dtype=torch.int32, pin_memory=True))
+                            block_table_t = self.device.to_device(
+                                torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
+                            context_lens = self.device.to_device(
+                                torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
+                            set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table_t)
+                            draft_hidden = self.draft_model(input_id, pos, target_hidden)
+                            reset_context()
+                            draft_logits = self.model.compute_logits_all(draft_hidden)
+                            d_token = draft_logits.argmax(dim=-1).item()
+                            draft_tokens.append(d_token)
+                            target_hidden = draft_hidden
+                            cur_token_id = d_token
+                            cur_pos += 1
+                        all_draft_tokens.append(draft_tokens)
                     else:
                         # Cache MISS: local MTP on target GPU
+                        embed_tokens = self.model.model.embed_tokens
                         target_hidden = self.last_hidden[seq.seq_id]
                         draft_tokens = []
                         cur_token_id = seq.last_token
@@ -893,9 +1023,9 @@ class ModelRunner:
                 nv = len(dt) + 1
                 self._early_hiddens_for_candidates[seq.seq_id] = _early_hidden_for_cand[offset_e:offset_e+nv].clone()
                 offset_e += nv
-        hidden = residual
+        hidden = residual  # unnormed, for MTP last_hidden
 
-        target_logits = self.model.compute_logits_all(model_inner.norm(hidden))
+        target_logits = self.model.compute_logits_all(hidden_states)
         reset_context()
 
         # === Accept phase ===
@@ -932,7 +1062,9 @@ class ModelRunner:
                 seq.last_accepted_len = len(accepted) - 1
                 seq.recovery_token_id = accepted[-1]
                 accepted_idx = offset + len(accepted) - 1
-                self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
+                # EAGLE needs normed hidden; MTP needs unnormed (residual)
+                save_h = hidden_states if eagle_async else hidden
+                self.last_hidden[seq.seq_id] = save_h[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
         else:
@@ -941,9 +1073,14 @@ class ModelRunner:
         # Skip MTP KV cache update in SSD mode — cache hit rate ~99% makes it unnecessary
         # (MTP KV only needed for cache miss local fallback, which is rare)
 
+        # Mark push as pending — will be received at the beginning of next step
+        if eagle_async and self.rank == 0 and self.async_pg is not None:
+            self._push_pending = True
+
         if self.rank == 0:
             return all_accepted
         return None
+
 
     @torch.inference_mode()
     def capture_cudagraph(self):

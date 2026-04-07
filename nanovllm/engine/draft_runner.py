@@ -579,78 +579,145 @@ class MTPDraftRunner:
         all_pos = torch.zeros(total_nv, dtype=torch.int64, device=self.device)
         dist.recv(all_pos, src=0, group=self.async_pg)
 
-        # Process each seq
+        # === Batched processing: all seqs' candidates in one MTP forward ===
         fan = self.F
+        d = self.device
+
+        # 1. Batch norm + lm_head + topk for all seqs at once
+        normed_all = self.draft_model.model.norm(early_hidden_all)
+        early_logits_all = self.compute_logits_all(normed_all)
+        _, cands_all = torch.topk(early_logits_all, fan, dim=-1)  # (total_nv, fan)
+
+        # 2. Build per-seq expanded tensors, then concatenate
+        all_flat_cands = []
+        all_flat_hidden = []
+        all_flat_acc_lens = []
+        all_flat_pos = []
+        all_flat_sids = []
+        all_slot_list = []
+        all_ctx_lens = []
+        all_bt_rows = []
+        # For tree decode: per-seq base_vpos and max_bi
+        per_seq_meta = []  # (total_per_seq, base_vpos, max_bi, block_table)
+
         h_off = 0
         bt_off = 0
+        grand_total = 0
         for sid, nv, ntok, btlen, spos in seq_infos:
+            cands = cands_all[h_off:h_off+nv]  # (nv, fan)
             early_hidden = early_hidden_all[h_off:h_off+nv]
             block_table = all_bt[bt_off:bt_off+btlen]
             verify_pos = all_pos[h_off:h_off+nv]
-            h_off += nv
-            bt_off += btlen
-
-            normed_h = self.draft_model.model.norm(early_hidden)
-            early_logits = self.compute_logits_all(normed_h)
-            _, cands = torch.topk(early_logits, fan, dim=-1)
 
             total = nv * fan
             flat_cands = cands.reshape(-1)
-            flat_embeds = self.embed_tokens(flat_cands)
             flat_hidden = early_hidden.repeat_interleave(fan, dim=0)
-            flat_acc_lens = torch.arange(nv, device=self.device, dtype=torch.int64).repeat_interleave(fan)
+            flat_acc_lens = torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan)
             flat_pos = verify_pos.repeat_interleave(fan)
+            flat_sids = torch.full((total,), sid, dtype=torch.int64, device=d)
+
+            all_flat_cands.append(flat_cands)
+            all_flat_hidden.append(flat_hidden)
+            all_flat_acc_lens.append(flat_acc_lens)
+            all_flat_pos.append(flat_pos)
+            all_flat_sids.append(flat_sids)
 
             if self.tree_decode and self.K > 1:
-                # Tree decode: run K MTP steps per candidate, store K tokens per entry
                 max_bi = block_table.shape[0] - 1
-                base_vpos = spos + nv  # virtual positions start after verify range
-                all_draft = []
-                current_embeds = flat_embeds
-                current_hidden = flat_hidden
-                bt_exp = block_table.unsqueeze(0).expand(total, -1).contiguous()
-
-                for depth in range(self.K):
-                    vpos = torch.arange(total, device=self.device, dtype=torch.int64) + base_vpos + depth * total
-                    rope_pos = flat_pos + depth
-                    bi = (vpos // self.block_size).long().clamp(0, max_bi)
-                    bo = (vpos % self.block_size).int()
-                    slot_t = (block_table[bi] * self.block_size + bo).int()
-                    ctx_lens = (vpos + 1).to(torch.int32)
-
-                    set_context(False, slot_mapping=slot_t, context_lens=ctx_lens, block_tables=bt_exp)
-                    normed_out, prenorm = self.mtp_layer(current_embeds, current_hidden, rope_pos)
-                    reset_context()
-
-                    logits = self.compute_mtp_logits(normed_out)
-                    next_tokens = logits.argmax(dim=-1)
-                    all_draft.append(next_tokens)
-                    current_hidden = prenorm
-                    current_embeds = self.embed_tokens(next_tokens)
-
-                spec_tokens = torch.stack(all_draft, dim=1)  # (total, K)
-                seq_ids = torch.full((total,), sid, dtype=torch.int64, device=self.device)
-                keys = torch.stack([seq_ids, flat_acc_lens, flat_cands], dim=1)
-                self.tree_caches[sid] = (keys, spec_tokens)
+                base_vpos = spos + nv
+                per_seq_meta.append((total, base_vpos, max_bi, block_table, grand_total))
             else:
-                # Single MTP step + chain lookup (original path)
-                slot_list = []
+                # Chain: compute slots from flat_pos
                 for p in flat_pos.tolist():
                     p = int(p)
-                    slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
-                slot_t = torch.tensor(slot_list, dtype=torch.int32, device=self.device)
-                bt_exp = block_table.unsqueeze(0).expand(total, -1).contiguous()
-                ctx_lens = (flat_pos + 1).to(torch.int32)
+                    all_slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
+                all_ctx_lens.append((flat_pos + 1).to(torch.int32))
+                bt_exp = block_table.unsqueeze(0).expand(total, -1)
+                all_bt_rows.append(bt_exp)
 
-                set_context(False, slot_mapping=slot_t, context_lens=ctx_lens, block_tables=bt_exp)
-                normed_out, _ = self.mtp_layer(flat_embeds, flat_hidden, flat_pos)
+            grand_total += total
+            h_off += nv
+            bt_off += btlen
+
+        # Concatenate all seqs
+        batch_cands = torch.cat(all_flat_cands)
+        batch_hidden = torch.cat(all_flat_hidden)
+        batch_acc_lens = torch.cat(all_flat_acc_lens)
+        batch_pos = torch.cat(all_flat_pos)
+        batch_sids = torch.cat(all_flat_sids)
+        batch_embeds = self.embed_tokens(batch_cands)
+
+        if self.tree_decode and self.K > 1:
+            # 3a. Batched tree decode: K steps for ALL seqs' candidates at once
+            all_draft = []
+            current_hidden = batch_hidden
+            current_ids = batch_cands
+            for depth in range(self.K):
+                all_slots = []
+                all_ctxs = []
+                all_ropes = []
+                all_bts = []
+                for total_s, base_vpos, max_bi, block_table, goffset in per_seq_meta:
+                    vpos = torch.arange(total_s, device=d, dtype=torch.int64) + base_vpos + depth * total_s
+                    all_ropes.append(batch_pos[goffset:goffset+total_s] + depth)
+                    bi = (vpos // self.block_size).long().clamp(0, max_bi)
+                    bo = (vpos % self.block_size).int()
+                    all_slots.append((block_table[bi] * self.block_size + bo).int())
+                    all_ctxs.append((vpos + 1).to(torch.int32))
+                    all_bts.append(block_table.unsqueeze(0).expand(total_s, -1))
+                b_slots = torch.cat(all_slots)
+                b_ctxs = torch.cat(all_ctxs)
+                b_ropes = torch.cat(all_ropes)
+                max_btl = max(bt.shape[1] for bt in all_bts)
+                b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bts]).contiguous()
+
+                set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
+                eagle_out = self.draft_model(current_ids, b_ropes, current_hidden)
                 reset_context()
-                logits = self.compute_mtp_logits(normed_out)
-                draft_tokens = logits.argmax(dim=-1)
+                logits = F.linear(eagle_out, self.lm_head.weight)
+                next_tokens = logits.argmax(dim=-1)
+                all_draft.append(next_tokens)
+                current_hidden = eagle_out
+                current_ids = next_tokens
 
-                seq_ids = torch.full((total,), sid, dtype=torch.int64, device=self.device)
-                keys = torch.stack([seq_ids, flat_acc_lens, flat_cands], dim=1)
-                self.tree_caches[sid] = (keys, draft_tokens.unsqueeze(1))
+            spec_tokens = torch.stack(all_draft, dim=1)
+            offset = 0
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                total = nv * fan
+                keys = torch.stack([batch_sids[offset:offset+total],
+                                     batch_acc_lens[offset:offset+total],
+                                     batch_cands[offset:offset+total]], dim=1)
+                self.tree_caches[sid] = (keys, spec_tokens[offset:offset+total])
+                offset += total
+        else:
+            # 3b. Batched chain: single MTP step for ALL seqs' candidates
+            batch_slots = torch.tensor(all_slot_list, dtype=torch.int32, device=d)
+            batch_ctxs = torch.cat(all_ctx_lens)
+            max_bt_len = max(bt.shape[1] for bt in all_bt_rows)
+            padded = []
+            for bt in all_bt_rows:
+                if bt.shape[1] < max_bt_len:
+                    pad = torch.zeros(bt.shape[0], max_bt_len - bt.shape[1], dtype=torch.int32, device=d)
+                    padded.append(torch.cat([bt, pad], dim=1))
+                else:
+                    padded.append(bt)
+            batch_bt = torch.cat(padded).contiguous()
+
+            set_context(False, slot_mapping=batch_slots, context_lens=batch_ctxs, block_tables=batch_bt)
+            normed_out, _ = self.mtp_layer(batch_embeds, batch_hidden, batch_pos)
+            reset_context()
+            logits = self.compute_mtp_logits(normed_out)
+            draft_tokens = logits.argmax(dim=-1)
+
+            # Split back per seq
+            offset = 0
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                total = nv * fan
+                keys = torch.stack([batch_sids[offset:offset+total],
+                                     batch_acc_lens[offset:offset+total],
+                                     batch_cands[offset:offset+total]], dim=1)
+                self.tree_caches[sid] = (keys, draft_tokens[offset:offset+total].unsqueeze(1))
+                offset += total
 
     def handle_cache_lookup(self):
         """Chain lookup: receive (seq_id, accepted_len, recovery_token), do K chained lookups."""
@@ -739,6 +806,510 @@ class MTPDraftRunner:
                 break
 
 
+class EAGLEDraftModel(torch.nn.Module):
+    """EAGLE draft model for async SSD on separate GPU."""
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(self, config):
+        super().__init__()
+        from nanovllm.models.eagle import EAGLEAttention, EAGLEDecoderLayer
+        from nanovllm.layers.linear import ReplicatedLinear
+        hidden_size = config.hidden_size
+        # Use 'model' submodule for embed_tokens/norm to match target checkpoint names
+        # (target checkpoint has "model.embed_tokens", "model.norm")
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = VocabParallelEmbedding(config.vocab_size, hidden_size, tp_size=1)
+        self.model.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_size=1)
+        self.layers = torch.nn.ModuleList([EAGLEDecoderLayer(config, tp_size=1)])
+        self.lm_head = ParallelLMHead(config.vocab_size, hidden_size, tp_size=1)
+
+    def forward(self, input_ids, positions, target_hidden):
+        token_embeds = self.model.embed_tokens(input_ids)
+        hidden = self.fc(torch.cat([token_embeds, target_hidden], dim=-1))
+        hidden = self.layers[0](positions, hidden)
+        return hidden
+
+
+class EAGLEDraftRunner:
+    """Async EAGLE draft runner for SSD on separate GPU."""
+
+    _hit = 0
+    _miss = 0
+
+    def __init__(self, config: Config, rank: int, init_q=None):
+        self.config = config
+        hf_config = config.hf_config
+        self.hf_config = hf_config
+        self.block_size = config.kvcache_block_size
+        self.K = config.num_speculative_tokens
+        self.F = config.async_fan_out
+        self.rank = rank
+
+        self.device_backend = get_device_backend()
+        self.device_backend.set_device(config.draft_gpu)
+        self.device = f"cuda:{config.draft_gpu}"
+
+        print(f"[EAGLEDraft rank={rank}] calling init_process_group world={config.num_gpus}...", flush=True)
+        dist.init_process_group("nccl", "tcp://localhost:2333",
+                                world_size=config.num_gpus, rank=rank)
+        tp_ranks = list(range(config.tensor_parallel_size))
+        self.tp_group = dist.new_group(tp_ranks)
+        self.async_pg = dist.new_group([0, config.draft_rank])
+
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_device(self.device)
+
+        # Load EAGLE model
+        # Use draft_hf_config for EAGLE architecture (num_kv_heads=num_heads, etc)
+        eagle_config = config.draft_hf_config if config.draft_hf_config is not None else hf_config
+        self.draft_model = EAGLEDraftModel(eagle_config)
+        # Load target model weights first (embed_tokens, lm_head, norm)
+        _load_draft_model(self.draft_model, config.model)
+        # Then load EAGLE-specific weights (fc, decoder layer) — overwrites layers.0.* with EAGLE's
+        _load_draft_model(self.draft_model, config.draft_model)
+
+        self.embed_tokens = self.draft_model.model.embed_tokens
+        self.lm_head = self.draft_model.lm_head
+
+        self._warmup_and_allocate_kv_cache(eagle_config)
+        if init_q is not None:
+            init_q.put(config.num_kvcache_blocks)
+            init_q.close()
+
+        self._capture_eagle_graph(eagle_config)
+
+        torch.set_default_device("cpu")
+        torch.set_default_dtype(default_dtype)
+
+        self.tree_decode = config.ssd_tree_decode
+        self._reset_tree_cache()
+        self.last_hidden = {}
+        self._cmd_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+
+        print(f"[EAGLEDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}", flush=True)
+        print(f"[EAGLEDraftRunner] norm.weight norm={self.draft_model.model.norm.weight.data.norm().item():.4f}", flush=True)
+        print(f"[EAGLEDraftRunner] lm_head.weight norm={self.lm_head.weight.data.norm().item():.4f}", flush=True)
+        print(f"[EAGLEDraftRunner] fc.weight norm={self.draft_model.fc.weight.data.norm().item():.4f}", flush=True)
+
+    def _warmup_and_allocate_kv_cache(self, eagle_config):
+        hf_config = self.hf_config
+        config = self.config
+        torch.cuda.empty_cache()
+        # EAGLE uses full MHA: num_kv_heads = num_attention_heads
+        num_kv_heads = eagle_config.num_attention_heads
+        head_dim = getattr(eagle_config, "head_dim", eagle_config.hidden_size // eagle_config.num_attention_heads)
+        free, total = torch.cuda.mem_get_info()
+        used = total - free
+        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        block_bytes = 2 * 1 * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        max_tokens = config.max_num_seqs * (config.max_model_len // self.block_size + 1)
+        avail_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // max(block_bytes, 1)
+        num_blocks = min(max(avail_blocks, 1), max_tokens)
+        config.num_kvcache_blocks = num_blocks
+        self.eagle_kv_cache = torch.empty(
+            2, 1, num_blocks, self.block_size, num_kv_heads, head_dim,
+            device=self.device, dtype=hf_config.torch_dtype,
+        )
+        for module in self.draft_model.layers[0].modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.k_cache = self.eagle_kv_cache[0, 0]
+                module.v_cache = self.eagle_kv_cache[1, 0]
+
+    @torch.inference_mode()
+    def _capture_eagle_graph(self, eagle_config):
+        hf = self.hf_config
+        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size + 10
+        d = self.device
+        g = {}
+        g["input_id"] = torch.zeros(1, dtype=torch.int64, device=d)
+        g["pos"] = torch.zeros(1, dtype=torch.int64, device=d)
+        g["hidden"] = torch.zeros(1, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+        g["slot"] = torch.zeros(1, dtype=torch.int32, device=d)
+        g["ctx_len"] = torch.zeros(1, dtype=torch.int32, device=d)
+        g["bt"] = torch.zeros(1, max_num_blocks, dtype=torch.int32, device=d)
+        g["out"] = torch.zeros(1, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+
+        # Warmup
+        set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
+        out = self.draft_model(g["input_id"], g["pos"], g["hidden"])
+        g["out"].copy_(out)
+        reset_context()
+
+        # Capture
+        self._eagle_graph = torch.cuda.CUDAGraph()
+        set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
+        with torch.cuda.graph(self._eagle_graph):
+            out = self.draft_model(g["input_id"], g["pos"], g["hidden"])
+            g["out"].copy_(out)
+        reset_context()
+        torch.cuda.synchronize()
+        self._g = g
+
+    @torch.inference_mode()
+    def _eagle_step(self, token_id, hidden_state, cur_pos, block_table_t):
+        """Single EAGLE forward step using CUDA graph."""
+        block_idx = cur_pos // self.block_size
+        bt_len = block_table_t.shape[0]
+        block_offset = cur_pos % self.block_size
+        slot = block_table_t[min(block_idx, bt_len - 1)] * self.block_size + block_offset
+
+        g = self._g
+        g["input_id"][0] = token_id
+        g["pos"][0] = cur_pos
+        if hidden_state.dim() == 1:
+            g["hidden"][0].copy_(hidden_state)
+        else:
+            g["hidden"].copy_(hidden_state)
+        g["slot"][0] = slot
+        g["ctx_len"][0] = cur_pos + 1
+        g["bt"][0, :bt_len] = block_table_t
+
+        set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
+        self._eagle_graph.replay()
+        reset_context()
+
+        logits = F.linear(g["out"], self.lm_head.weight)
+        next_token = logits.argmax(dim=-1).item()
+        return g["out"][0].clone(), logits.squeeze(0), next_token
+
+    def _reset_tree_cache(self, seq_id=None):
+        if seq_id is None:
+            self.tree_caches = {}
+        elif seq_id in self.tree_caches:
+            del self.tree_caches[seq_id]
+
+    def jit_speculate(self, recovery_token, hidden_state, num_tokens, block_table_t):
+        K = self.K
+        draft_tokens = []
+        cur_token = recovery_token
+        cur_pos = num_tokens - 1
+        cur_hidden = hidden_state
+        for i in range(K):
+            out, logits, d_token = self._eagle_step(cur_token, cur_hidden, cur_pos, block_table_t)
+            draft_tokens.append(d_token)
+            cur_hidden = out
+            cur_token = d_token
+            cur_pos += 1
+        return draft_tokens
+
+    def hit_cache_and_respond(self, seq_id, accepted_len, recovery_token, hidden_state, num_tokens, block_table_t):
+        if seq_id in self.tree_caches:
+            cache_keys, cache_tokens = self.tree_caches[seq_id]
+            request_key = torch.tensor([[seq_id, accepted_len, recovery_token]], dtype=torch.int64, device=self.device)
+            match = torch.all(request_key.unsqueeze(1) == cache_keys.unsqueeze(0), dim=2).squeeze(0)
+            if match.any():
+                idx = match.float().argmax().item()
+                EAGLEDraftRunner._hit += 1
+                return cache_tokens[idx].tolist(), True
+        EAGLEDraftRunner._miss += 1
+        tokens = self.jit_speculate(recovery_token, hidden_state, num_tokens, block_table_t)
+        return tokens, False
+
+    def handle_prefill(self):
+        """Receive prefill data and populate EAGLE KV cache."""
+        meta = torch.zeros(3, dtype=torch.int64, device=self.device)
+        dist.recv(meta, src=0, group=self.async_pg)
+        seq_id, n, bt_len = meta.tolist()
+        n, bt_len = int(n), int(bt_len)
+
+        token_ids = torch.zeros(n, dtype=torch.int64, device=self.device)
+        hidden_states = torch.zeros(n, self.hf_config.hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+        positions = torch.zeros(n, dtype=torch.int64, device=self.device)
+        block_table = torch.zeros(bt_len, dtype=torch.int32, device=self.device)
+
+        dist.recv(token_ids, src=0, group=self.async_pg)
+        dist.recv(hidden_states, src=0, group=self.async_pg)
+        dist.recv(positions, src=0, group=self.async_pg)
+        dist.recv(block_table, src=0, group=self.async_pg)
+
+        slot_mapping = []
+        for pos in positions.tolist():
+            bidx = int(pos) // self.block_size
+            boff = int(pos) % self.block_size
+            slot = int(block_table[bidx]) * self.block_size + boff
+            slot_mapping.append(slot)
+
+        total_seqlen = int(positions[-1].item()) + 1
+        cu_q = torch.tensor([0, n], dtype=torch.int32, device=self.device)
+        cu_k = torch.tensor([0, total_seqlen], dtype=torch.int32, device=self.device)
+        slot_t = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
+
+        # Run EAGLE prefill (populates KV cache)
+        set_context(True, cu_q, cu_k, n, total_seqlen, slot_t, None, None)
+        eagle_out = self.draft_model(token_ids, positions, hidden_states)
+        reset_context()
+
+        self.last_hidden[int(seq_id)] = eagle_out[-1:].clone()
+        ack = torch.ones(1, dtype=torch.int64, device=self.device)
+        dist.send(ack, dst=0, group=self.async_pg)
+
+    def handle_early_speculate(self):
+        """Receive early hidden from target, build tree cache with EAGLE."""
+        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+        dist.recv(ns_buf, src=0, group=self.async_pg)
+        num_seqs = int(ns_buf[0].item())
+
+        meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
+        dist.recv(meta, src=0, group=self.async_pg)
+
+        seq_infos = []
+        total_nv = 0
+        total_bt = 0
+        for i in range(num_seqs):
+            b = i * 5
+            sid, nv, ntok, btlen, spos = (int(meta[b+j].item()) for j in range(5))
+            seq_infos.append((sid, nv, ntok, btlen, spos))
+            total_nv += nv
+            total_bt += btlen
+
+        early_hidden_all = torch.zeros(total_nv, self.hf_config.hidden_size,
+                                        dtype=self.hf_config.torch_dtype, device=self.device)
+        dist.recv(early_hidden_all, src=0, group=self.async_pg)
+        all_bt = torch.zeros(total_bt, dtype=torch.int32, device=self.device)
+        dist.recv(all_bt, src=0, group=self.async_pg)
+        all_pos = torch.zeros(total_nv, dtype=torch.int64, device=self.device)
+        dist.recv(all_pos, src=0, group=self.async_pg)
+
+        # === Batched processing: all seqs' candidates in one EAGLE forward ===
+        fan = self.F
+        d = self.device
+
+        # 1. Batch norm + lm_head + topk
+        normed_all = self.draft_model.model.norm(early_hidden_all)
+        early_logits_all = F.linear(normed_all, self.lm_head.weight)
+        _, cands_all = torch.topk(early_logits_all, fan, dim=-1)
+
+        # 2. Build per-seq expanded tensors, then concatenate
+        all_flat_cands = []
+        all_flat_hidden = []
+        all_flat_acc_lens = []
+        all_flat_pos = []
+        all_flat_sids = []
+        all_slot_list = []
+        all_ctx_lens = []
+        all_bt_rows = []
+        per_seq_meta = []
+
+        h_off = 0
+        bt_off = 0
+        grand_total = 0
+        for sid, nv, ntok, btlen, spos in seq_infos:
+            cands = cands_all[h_off:h_off+nv]
+            normed_h = normed_all[h_off:h_off+nv]
+            block_table = all_bt[bt_off:bt_off+btlen]
+            verify_pos = all_pos[h_off:h_off+nv]
+
+            total = nv * fan
+            all_flat_cands.append(cands.reshape(-1))
+            all_flat_hidden.append(normed_h.repeat_interleave(fan, dim=0))
+            all_flat_acc_lens.append(torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan))
+            all_flat_pos.append(verify_pos.repeat_interleave(fan))
+            all_flat_sids.append(torch.full((total,), sid, dtype=torch.int64, device=d))
+
+            if self.tree_decode and self.K > 1:
+                per_seq_meta.append((total, spos + nv, block_table.shape[0] - 1, block_table, grand_total))
+            else:
+                for p in verify_pos.repeat_interleave(fan).tolist():
+                    p = int(p)
+                    all_slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
+                all_ctx_lens.append((verify_pos.repeat_interleave(fan) + 1).to(torch.int32))
+                all_bt_rows.append(block_table.unsqueeze(0).expand(total, -1))
+
+            grand_total += total
+            h_off += nv
+            bt_off += btlen
+
+        batch_cands = torch.cat(all_flat_cands)
+        batch_hidden = torch.cat(all_flat_hidden)
+        batch_acc_lens = torch.cat(all_flat_acc_lens)
+        batch_pos = torch.cat(all_flat_pos)
+        batch_sids = torch.cat(all_flat_sids)
+
+        if self.tree_decode and self.K > 1:
+            # 3a. Batched tree decode
+            all_draft = []
+            current_hidden = batch_hidden
+            current_ids = batch_cands
+            for depth in range(self.K):
+                all_slots = []
+                all_ctxs = []
+                all_ropes = []
+                all_bts = []
+                for total_s, base_vpos, max_bi, block_table, offset in per_seq_meta:
+                    vpos = torch.arange(total_s, device=d, dtype=torch.int64) + base_vpos + depth * total_s
+                    all_ropes.append(batch_pos[offset:offset+total_s] + depth)
+                    bi = (vpos // self.block_size).long().clamp(0, max_bi)
+                    bo = (vpos % self.block_size).int()
+                    all_slots.append((block_table[bi] * self.block_size + bo).int())
+                    all_ctxs.append((vpos + 1).to(torch.int32))
+                    all_bts.append(block_table.unsqueeze(0).expand(total_s, -1))
+                b_slots = torch.cat(all_slots)
+                b_ctxs = torch.cat(all_ctxs)
+                b_ropes = torch.cat(all_ropes)
+                max_btl = max(bt.shape[1] for bt in all_bts)
+                b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bts]).contiguous()
+
+                set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
+                eagle_out = self.draft_model(current_ids, b_ropes, current_hidden)
+                reset_context()
+                logits = F.linear(eagle_out, self.lm_head.weight)
+                next_tokens = logits.argmax(dim=-1)
+                all_draft.append(next_tokens)
+                current_hidden = eagle_out
+                current_ids = next_tokens
+
+            spec_tokens = torch.stack(all_draft, dim=1)
+            offset = 0
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                total = nv * fan
+                keys = torch.stack([batch_sids[offset:offset+total], batch_acc_lens[offset:offset+total],
+                                     batch_cands[offset:offset+total]], dim=1)
+                self.tree_caches[sid] = (keys, spec_tokens[offset:offset+total])
+                offset += total
+        else:
+            # 3b. Batched chain: single EAGLE step
+            b_slots = torch.tensor(all_slot_list, dtype=torch.int32, device=d)
+            b_ctxs = torch.cat(all_ctx_lens)
+            max_btl = max(bt.shape[1] for bt in all_bt_rows)
+            b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bt_rows]).contiguous()
+
+            set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
+            eagle_out = self.draft_model(batch_cands, batch_pos, batch_hidden)
+            reset_context()
+            logits = F.linear(eagle_out, self.lm_head.weight)
+            draft_tokens = logits.argmax(dim=-1)
+
+            offset = 0
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                total = nv * fan
+                keys = torch.stack([batch_sids[offset:offset+total], batch_acc_lens[offset:offset+total],
+                                     batch_cands[offset:offset+total]], dim=1)
+                self.tree_caches[sid] = (keys, draft_tokens[offset:offset+total].unsqueeze(1))
+                offset += total
+
+        # Push tree cache results to target in ONE NCCL send
+        # Format: flat tensor [num_seqs, (sid, n_entries, K, keys_flat, tokens_flat) × num_seqs]
+        parts = [torch.tensor([num_seqs], dtype=torch.int64, device=self.device)]
+        for sid, nv, ntok, btlen, spos in seq_infos:
+            if sid in self.tree_caches:
+                keys, tokens = self.tree_caches[sid]
+                n = keys.shape[0]
+                K_a = tokens.shape[1] if tokens.dim() > 1 else 1
+                parts.append(torch.tensor([sid, n, K_a], dtype=torch.int64, device=self.device))
+                parts.append(keys.reshape(-1).to(torch.int64))
+                parts.append(tokens.reshape(-1).to(torch.int64))
+            else:
+                parts.append(torch.tensor([sid, 0, 0], dtype=torch.int64, device=self.device))
+        push_buf = torch.cat(parts)
+        # Send size first, then data
+        dist.send(torch.tensor([push_buf.shape[0]], dtype=torch.int64, device=self.device), dst=0, group=self.async_pg)
+        dist.send(push_buf, dst=0, group=self.async_pg)
+
+    def handle_cache_lookup(self):
+        """Batched cache lookup: receive [n_seqs, sid0, al0, rt0, ...], return N*K tokens."""
+        # First receive n_seqs
+        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+        dist.recv(ns_buf, src=0, group=self.async_pg)
+        n_seqs = int(ns_buf[0].item())
+        # Then receive lookup data
+        lookup_data = torch.zeros(n_seqs * 3, dtype=torch.int64, device=self.device)
+        if n_seqs > 0:
+            dist.recv(lookup_data, src=0, group=self.async_pg)
+        result = torch.zeros(n_seqs * self.K, dtype=torch.int64, device=self.device)
+
+        for i in range(n_seqs):
+            seq_id = int(lookup_data[i*3].item())
+            accepted_len = int(lookup_data[i*3 + 1].item())
+            recovery_token = int(lookup_data[i*3 + 2].item())
+
+            hit = False
+            if seq_id in self.tree_caches:
+                cache_keys, cache_tokens = self.tree_caches[seq_id]
+                if self.tree_decode:
+                    request_key = torch.tensor([[seq_id, accepted_len, recovery_token]],
+                                                dtype=torch.int64, device=self.device)
+                    match = torch.all(request_key == cache_keys, dim=1)
+                    if match.any():
+                        idx = match.float().argmax().item()
+                        k = min(self.K, cache_tokens.shape[1])
+                        result[i*self.K:i*self.K+k] = cache_tokens[idx, :k]
+                        hit = True
+                else:
+                    cur_token = recovery_token
+                    for step in range(self.K):
+                        request_key = torch.tensor([[seq_id, accepted_len + step, cur_token]],
+                                                    dtype=torch.int64, device=self.device)
+                        match = torch.all(request_key == cache_keys, dim=1)
+                        if match.any():
+                            idx = match.float().argmax().item()
+                            d = cache_tokens[idx, 0].item()
+                            result[i*self.K + step] = d
+                            cur_token = d
+                            if step == 0:
+                                hit = True
+                        else:
+                            break
+            if hit:
+                EAGLEDraftRunner._hit += 1
+            else:
+                EAGLEDraftRunner._miss += 1
+
+        dist.send(result, dst=0, group=self.async_pg)
+
+    def handle_speculate(self):
+        meta = torch.zeros(5, dtype=torch.int64, device=self.device)
+        dist.recv(meta, src=0, group=self.async_pg)
+        seq_id, accepted_len, recovery_token, num_tokens, bt_len = (int(x) for x in meta.tolist())
+        hidden_state = torch.zeros(self.hf_config.hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+        dist.recv(hidden_state, src=0, group=self.async_pg)
+        block_table_t = torch.zeros(bt_len, dtype=torch.int32, device=self.device)
+        dist.recv(block_table_t, src=0, group=self.async_pg)
+        self.last_hidden[seq_id] = hidden_state.unsqueeze(0)
+        draft_tokens, _ = self.hit_cache_and_respond(seq_id, accepted_len, recovery_token, hidden_state, num_tokens, block_table_t)
+        resp = torch.tensor(draft_tokens, dtype=torch.int64, device=self.device)
+        dist.send(resp, dst=0, group=self.async_pg)
+
+    def handle_cleanup(self):
+        meta = torch.zeros(1, dtype=torch.int64, device=self.device)
+        dist.recv(meta, src=0, group=self.async_pg)
+        seq_id = int(meta[0].item())
+        if seq_id in self.last_hidden:
+            del self.last_hidden[seq_id]
+        self._reset_tree_cache(seq_id)
+        ack = torch.ones(1, dtype=torch.int64, device=self.device)
+        dist.send(ack, dst=0, group=self.async_pg)
+
+    def draft_loop(self):
+        print("[EAGLEDraftRunner] Starting draft loop", flush=True)
+        while True:
+            dist.recv(self._cmd_buf, src=0, group=self.async_pg)
+            cmd = int(self._cmd_buf[0].item())
+            if cmd == 0:
+                self.handle_speculate()
+            elif cmd == 1:
+                self.handle_prefill()
+            elif cmd == 3:
+                self.handle_cleanup()
+            elif cmd == 5:
+                self.handle_early_speculate()
+            elif cmd == 6:
+                self.handle_cache_lookup()
+            elif cmd == 2:
+                total = EAGLEDraftRunner._hit + EAGLEDraftRunner._miss
+                rate = EAGLEDraftRunner._hit / total * 100 if total else 0
+                print(f"[EAGLEDraftRunner] Exiting. Cache hit: {EAGLEDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                break
+
+
 def launch_draft_runner(config, rank, init_q=None):
     import sys
     print(f"[Draft rank={rank}] launch_draft_runner starting", flush=True)
@@ -747,7 +1318,10 @@ def launch_draft_runner(config, rank, init_q=None):
         from nanovllm.utils.device import DeviceBackend
         DeviceBackend.initialize()
         print(f"[Draft rank={rank}] DeviceBackend initialized, creating runner...", flush=True)
-        runner = MTPDraftRunner(config, rank, init_q=init_q)
+        if config.eagle_async:
+            runner = EAGLEDraftRunner(config, rank, init_q=init_q)
+        else:
+            runner = MTPDraftRunner(config, rank, init_q=init_q)
         runner.draft_loop()
         dist.destroy_process_group()
     except Exception as e:

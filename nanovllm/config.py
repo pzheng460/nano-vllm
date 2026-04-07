@@ -54,8 +54,10 @@ class Config:
             self.draft_hf_config = None
         # SSD: compute world size and draft rank
         self.num_gpus = self.tensor_parallel_size + (1 if self.draft_async else 0)
+        self.eagle_async = self.draft_async and self.draft_model is not None and not self.use_mtp
         if self.draft_async:
-            assert self.use_mtp, "SSD async draft requires MTP model"
+            assert self.use_mtp or self.draft_model is not None, \
+                "SSD async draft requires MTP model or EAGLE draft_model"
             self.draft_rank = self.tensor_parallel_size
             if self.draft_gpu == -1:
                 self.draft_gpu = self.draft_rank
