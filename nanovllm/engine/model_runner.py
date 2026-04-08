@@ -174,10 +174,12 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        # During warmup, skip SSD communication (draft not ready yet)
+        # During warmup, skip SSD communication and EAGLE KV prefill
         saved_async = self.draft_async
         self.draft_async = False
+        self._warmup = True
         self.run(seqs, True)
+        self._warmup = False
         self.draft_async = saved_async
         self.device.empty_cache()
 
@@ -487,7 +489,7 @@ class ModelRunner:
         # MiMo MTP uses unnormed (model returns it directly)
         save_hidden = hidden
         # Populate EAGLE KV cache during prefill so draft attention has valid context
-        if hasattr(self, 'draft_model'):
+        if hasattr(self, 'draft_model') and not getattr(self, '_warmup', False):
             ctx = get_context()
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, None, None)

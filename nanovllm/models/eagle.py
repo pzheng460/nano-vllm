@@ -230,16 +230,26 @@ class Eagle3Model(nn.Module):
 
     def forward(self, input_ids, positions, target_hidden, aux_hiddens=None):
         token_embeds = self.embed_tokens(input_ids)
-        # fc input: concatenated aux hidden states from multiple target layers (3*H)
+        # Step 0: fc(aux_hiddens) → hidden, then midlayer(hidden, embeds)
+        # Step 1+: no fc, midlayer(previous_output, embeds) directly
         if aux_hiddens is not None:
             fc_hidden = self.fc(aux_hiddens)
         else:
-            # Fallback: use target_hidden tripled
-            fc_hidden = self.fc(torch.cat([target_hidden, target_hidden, target_hidden], dim=-1))
+            fc_hidden = target_hidden
         hidden_states, residual = self.midlayer(positions, fc_hidden, token_embeds)
-        # Final: hidden_states + residual (unnormed output, like vLLM's hidden_prenorm)
         hidden = hidden_states + residual
+        # DEBUG: also compute fc-only logits for comparison
+        if not hasattr(self, '_fwd_dbg2'): self._fwd_dbg2 = 0
+        self._fwd_dbg2 += 1
+        if self._fwd_dbg2 <= 3 and aux_hiddens is not None:
+            import torch.nn.functional as F
+            fc_logits = F.linear(self.norm(fc_hidden), self.lm_head.weight)
+            full_logits = F.linear(self.norm(hidden), self.lm_head.weight)
+            fc_pred = self.d2t[fc_logits.argmax(dim=-1)].tolist()
+            full_pred = self.d2t[full_logits.argmax(dim=-1)].tolist()
+            print(f'[E3-CMP] fc_pred={fc_pred} full_pred={full_pred} fc_h={fc_hidden.norm():.0f} full_h={hidden.norm():.0f}', flush=True)
         return hidden
+
 
     def compute_logits(self, hidden_states):
         """Compute draft logits in reduced vocab space."""
@@ -262,20 +272,34 @@ class Eagle3Model(nn.Module):
         from safetensors import safe_open
         from nanovllm.utils.loader import _load_weight
         packed = self.packed_modules_mapping
+
+        def _load_tensor(name, tensor):
+            if name == 'd2t':
+                self.d2t.copy_(tensor.to(self.d2t.dtype))
+            elif name == 't2d':
+                self.t2d_mask.copy_(tensor.to(torch.bool))
+            else:
+                try:
+                    _load_weight(self, packed, name, tensor)
+                except (AttributeError, KeyError):
+                    pass
+
         safetensor_files = glob(os.path.join(path, "*.safetensors"))
-        for file in safetensor_files:
-            with safe_open(file, "pt", "cpu") as f:
-                for name in f.keys():
-                    tensor = f.get_tensor(name)
-                    if name == 'd2t':
-                        self.d2t.copy_(tensor.to(self.d2t.dtype))
-                    elif name == 't2d':
-                        self.t2d_mask.copy_(tensor.to(torch.bool))
-                    else:
-                        try:
-                            _load_weight(self, packed, name, tensor)
-                        except (AttributeError, KeyError):
-                            pass
+        if safetensor_files:
+            for file in safetensor_files:
+                with safe_open(file, "pt", "cpu") as f:
+                    for name in f.keys():
+                        _load_tensor(name, f.get_tensor(name))
+        else:
+            import torch
+            bin_files = glob(os.path.join(path, "pytorch_model*.bin"))
+            for file in bin_files:
+                state_dict = torch.load(file, map_location="cpu", weights_only=True)
+                for name, tensor in state_dict.items():
+                    _load_tensor(name, tensor)
+                del state_dict
+
+        print(f'[Eagle3] load_weights done: d2t[124]={self.d2t[124].item()}, fc_norm={self.fc.weight.data.norm():.1f}', flush=True)
         # Build reverse mapping: target_id → draft_id (from d2t)
         for draft_id in range(self.d2t.shape[0]):
             target_id = self.d2t[draft_id].item()
