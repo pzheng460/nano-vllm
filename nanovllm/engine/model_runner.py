@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.nn.functional as F
@@ -48,7 +49,7 @@ class ModelRunner:
         self.device = get_device_backend()
 
         # Unified process group: all ranks (target TP + draft) join one world
-        dist.init_process_group(self.device.get_dist_backend(), "tcp://localhost:2333",
+        dist.init_process_group(self.device.get_dist_backend(), f"tcp://localhost:{os.environ.get('NCCL_PORT', '2333')}",
                                 world_size=self.world_size, rank=rank)
         # Sub-groups IMMEDIATELY after init (collective, all ranks must participate)
         tp_ranks = list(range(self.tp_size))
@@ -89,8 +90,9 @@ class ModelRunner:
                     tp_group=self.tp_group, tp_size=self.tp_size,
                 )
             else:
+                eagle_cfg = draft_hf if draft_hf is not None else hf_config
                 self.draft_model = EAGLEModel(
-                    hf_config,
+                    eagle_cfg,
                     embed_tokens=self.model.model.embed_tokens,
                     lm_head=self.model.lm_head,
                     tp_group=self.tp_group, tp_size=self.tp_size,
@@ -909,6 +911,8 @@ class ModelRunner:
                 # Use locally pushed tree cache (received in llm_engine.step() after previous step)
                 if not hasattr(self, '_local_tree_cache'):
                     self._local_tree_cache = {}
+                    self._cache_hit = 0
+                    self._cache_miss = 0
                 for seq in seqs:
                     local_cache = self._local_tree_cache.get(seq.seq_id)
                     if local_cache is not None:
@@ -922,6 +926,7 @@ class ModelRunner:
                             if match.any():
                                 idx = match.float().argmax().item()
                                 all_draft_tokens.append(tokens[idx, :k].tolist())
+                                self._cache_hit += 1
                                 continue
                         else:
                             # Chain mode: K chained lookups
@@ -943,8 +948,10 @@ class ModelRunner:
                                     break
                             if hit:
                                 all_draft_tokens.append(draft_tokens)
+                                self._cache_hit += 1
                                 continue
                     # Cache miss: JIT on draft (only happens on first step or rare miss)
+                    self._cache_miss += 1
                     self._send_cmd(0)
                     meta = torch.tensor([seq.seq_id, getattr(seq, 'last_accepted_len', 0),
                                           seq.last_token, len(seq), len(seq.block_table)],

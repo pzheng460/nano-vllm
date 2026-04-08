@@ -25,15 +25,29 @@ Results (H100, 10 prompts, max_tokens=256):
 | Speedup                     | +69%     |        |        |        |        |
 +-----------------------------+----------+--------+--------+--------+--------+
 
-Tree cache hit rate (async SSD, F=5 for EAGLE, F=3 for MTP):
-+-----------------------------+------------+
-| Config                      | Cache Hit  |
-+-----------------------------+------------+
-| Llama3.1 Async EAGLE SSD   | ~98%       |
-| Qwen2.5 Async EAGLE SSD    | ~98%       |
-| Qwen2 Async EAGLE SSD      | ~98%       |
-| MiMo Async MTP SSD         | 99.9%      |
-+-----------------------------+------------+
+Tree cache hit rate sweep (GPQA Diamond, 10 prompts, max_tokens=64):
+
+Llama 3.1 + EAGLE:
+  early\F |    1    |    2    |    3    |    4    |    5
+  --------+---------+---------+---------+---------+--------
+     1    |   ERR   |  97.1%  |   ERR   |  97.4%  |  97.4%
+     2    |  75.8%  |  86.5%  |  90.7%  |  92.7%  |  94.7%
+     3    |  61.3%  |  75.6%  |  80.4%  |  84.3%  |  86.2%
+     4    |  52.6%  |  64.7%  |  72.2%  |  74.5%  |  75.7%
+
+Qwen2 + EAGLE:
+  early\F |    1    |    2    |    3    |    4    |    5
+  --------+---------+---------+---------+---------+--------
+     1    |   ERR   |  97.4%  |   ERR   |  97.4%  |  97.4%
+     2    |  72.5%  |  85.1%  |  91.3%  |  92.9%  |  93.8%
+     3    |  57.0%  |  70.6%  |  75.1%  |  78.6%  |  80.5%
+     4    |  46.0%  |  58.4%  |  64.8%  |  67.0%  |  71.1%
+
+Key findings:
+  - early=1 saturates at ~97% for F>=2 (draft has max compute time)
+  - early=2,F=5 is the sweet spot: 94% hit with good acceptance
+  - Each +1 early layer costs ~10-15pp hit rate
+  - F has diminishing returns: 1→3 gains ~15pp, 3→5 gains ~5pp
 
 Speedup breakdown (Llama 3.1, 10 prompts):
   Sync:  8.3 ms/step = EAGLE draft(3.4ms, 41%) + Verify(4.9ms, 59%)

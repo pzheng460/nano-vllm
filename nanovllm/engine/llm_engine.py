@@ -139,6 +139,10 @@ class LLMEngine:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        # Reset cache hit counters
+        if hasattr(self.model_runner, '_cache_hit'):
+            self.model_runner._cache_hit = 0
+            self.model_runner._cache_miss = 0
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
@@ -185,4 +189,8 @@ class LLMEngine:
                 for j in range(k)
             )
             print(f"Per-position acceptance: {per_pos_str}")
+            if hasattr(self.model_runner, '_cache_hit'):
+                ch, cm = self.model_runner._cache_hit, self.model_runner._cache_miss
+                total_c = ch + cm
+                print(f"Cache hit: {ch}/{total_c} ({ch/total_c:.1%})" if total_c > 0 else "Cache hit: N/A")
         return outputs

@@ -92,11 +92,15 @@ class EAGLEDecoderLayer(nn.Module):
     def __init__(self, config, tp_group=None, tp_size=None) -> None:
         super().__init__()
         hidden_size = config.hidden_size
-        # Detect bias: Qwen2 EAGLE uses qkv_bias=True, Llama EAGLE uses bias=False
-        qkv_bias = getattr(config, 'qkv_bias', False) or getattr(config, 'attention_bias', False)
-        if not hasattr(config, 'qkv_bias') and not hasattr(config, 'attention_bias'):
-            qkv_bias = not getattr(config, 'bias', True)  # Llama config: "bias": false → no bias
-            qkv_bias = getattr(config, 'qkv_bias', qkv_bias)
+        # Detect bias: Qwen2 has QKV bias, Llama/Qwen3 don't
+        model_type = getattr(config, 'model_type', '')
+        if hasattr(config, 'attention_bias'):
+            qkv_bias = config.attention_bias
+        elif hasattr(config, 'qkv_bias'):
+            qkv_bias = config.qkv_bias
+        else:
+            # Fallback by model type: qwen2 has bias, llama/qwen3 don't
+            qkv_bias = model_type in ('qwen2',)
         self.self_attn = EAGLEAttention(
             hidden_size=hidden_size,
             num_heads=config.num_attention_heads,
@@ -316,7 +320,8 @@ class EAGLEModel(nn.Module):
         hidden_size = config.hidden_size
         self.embed_tokens = embed_tokens   # shared, frozen
         self.lm_head = lm_head             # shared, frozen
-        fc_bias = getattr(config, 'qkv_bias', False)  # Qwen2 EAGLE has bias, Llama EAGLE doesn't
+        model_type = getattr(config, 'model_type', '')
+        fc_bias = model_type in ('qwen2',)  # Qwen2 EAGLE has fc bias, Llama/Qwen3 don't
         self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=fc_bias, tp_group=tp_group, tp_size=tp_size)
         self.layers = nn.ModuleList([EAGLEDecoderLayer(config, tp_group=tp_group, tp_size=tp_size)])
 

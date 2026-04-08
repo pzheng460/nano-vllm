@@ -194,7 +194,7 @@ class MTPDraftRunner:
 
         # Join unified world (same as target + TP workers)
         print(f"[Draft rank={rank}] calling init_process_group world={config.num_gpus}...", flush=True)
-        dist.init_process_group("nccl", "tcp://localhost:2333",
+        dist.init_process_group("nccl", f"tcp://localhost:{os.environ.get('NCCL_PORT', '2333')}",
                                 world_size=config.num_gpus, rank=rank)
         print(f"[Draft rank={rank}] init_process_group done, creating groups...", flush=True)
         # Must participate in new_group calls (collective)
@@ -826,7 +826,9 @@ class EAGLEDraftModel(torch.nn.Module):
         self.model = torch.nn.Module()
         self.model.embed_tokens = VocabParallelEmbedding(config.vocab_size, hidden_size, tp_size=1)
         self.model.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_size=1)
+        model_type = getattr(config, 'model_type', '')
+        fc_bias = model_type in ('qwen2',)
+        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=fc_bias, tp_size=1)
         self.layers = torch.nn.ModuleList([EAGLEDecoderLayer(config, tp_size=1)])
         self.lm_head = ParallelLMHead(config.vocab_size, hidden_size, tp_size=1)
 
@@ -857,7 +859,7 @@ class EAGLEDraftRunner:
         self.device = f"cuda:{config.draft_gpu}"
 
         print(f"[EAGLEDraft rank={rank}] calling init_process_group world={config.num_gpus}...", flush=True)
-        dist.init_process_group("nccl", "tcp://localhost:2333",
+        dist.init_process_group("nccl", f"tcp://localhost:{os.environ.get('NCCL_PORT', '2333')}",
                                 world_size=config.num_gpus, rank=rank)
         tp_ranks = list(range(config.tensor_parallel_size))
         self.tp_group = dist.new_group(tp_ranks)
