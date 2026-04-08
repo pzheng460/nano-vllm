@@ -23,6 +23,7 @@ class EAGLEAttention(nn.Module):
         rms_norm_eps: float = 1e-06,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        bias: bool = True,
         tp_group: dist.ProcessGroup | None = None,
         tp_size: int | None = None,
     ) -> None:
@@ -44,7 +45,7 @@ class EAGLEAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=True,
+            bias=bias,
             tp_group=tp_group,
             tp_size=tp_size,
         )
@@ -91,15 +92,21 @@ class EAGLEDecoderLayer(nn.Module):
     def __init__(self, config, tp_group=None, tp_size=None) -> None:
         super().__init__()
         hidden_size = config.hidden_size
+        # Detect bias: Qwen2 EAGLE uses qkv_bias=True, Llama EAGLE uses bias=False
+        qkv_bias = getattr(config, 'qkv_bias', False) or getattr(config, 'attention_bias', False)
+        if not hasattr(config, 'qkv_bias') and not hasattr(config, 'attention_bias'):
+            qkv_bias = not getattr(config, 'bias', True)  # Llama config: "bias": false → no bias
+            qkv_bias = getattr(config, 'qkv_bias', qkv_bias)
         self.self_attn = EAGLEAttention(
             hidden_size=hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_attention_heads,  # full MHA
+            num_kv_heads=getattr(config, 'num_key_value_heads', config.num_attention_heads),
             max_position=config.max_position_embeddings,
             head_dim=getattr(config, 'head_dim', None),
             rms_norm_eps=config.rms_norm_eps,
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            bias=qkv_bias,
             tp_group=tp_group,
             tp_size=tp_size,
         )
@@ -309,7 +316,8 @@ class EAGLEModel(nn.Module):
         hidden_size = config.hidden_size
         self.embed_tokens = embed_tokens   # shared, frozen
         self.lm_head = lm_head             # shared, frozen
-        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_group=tp_group, tp_size=tp_size)
+        fc_bias = getattr(config, 'qkv_bias', False)  # Qwen2 EAGLE has bias, Llama EAGLE doesn't
+        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=fc_bias, tp_group=tp_group, tp_size=tp_size)
         self.layers = nn.ModuleList([EAGLEDecoderLayer(config, tp_group=tp_group, tp_size=tp_size)])
 
     def forward(

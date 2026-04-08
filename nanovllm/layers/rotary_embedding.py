@@ -82,6 +82,27 @@ def _apply_partial(x, cos, sin, rotary_dim, apply_fn):
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
+def _compute_llama3_inv_freq(base, rotary_dim, rope_scaling):
+    """Compute inv_freq for llama3 rope type with frequency scaling."""
+    factor = rope_scaling.get("factor", 8.0)
+    low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+    high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
+    old_context_len = rope_scaling.get("original_max_position_embeddings", 8192)
+
+    inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+    wavelens = 2 * torch.pi / inv_freq
+    # Scale frequencies based on wavelength
+    inv_freq_scaled = inv_freq / factor
+    smooth = (old_context_len / wavelens - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smooth = smooth.clamp(0, 1)
+    inv_freq = torch.where(wavelens > low_freq_wavelen, inv_freq_scaled,
+                torch.where(wavelens < high_freq_wavelen, inv_freq,
+                             (1 - smooth) * inv_freq_scaled + smooth * inv_freq))
+    return inv_freq
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -92,8 +113,25 @@ def get_rope(
 ):
     if rope_scaling is not None:
         rope_type = rope_scaling.get("rope_type", "default")
-        assert rope_type == "default", f"Unsupported rope_type: {rope_type}"
+        if rope_type == "llama3":
+            inv_freq = _compute_llama3_inv_freq(base, rotary_dim, rope_scaling)
+            return _get_rope_with_inv_freq(head_size, rotary_dim, max_position, inv_freq, is_neox_style)
+        elif rope_type != "default":
+            raise ValueError(f"Unsupported rope_type: {rope_type}")
     return _get_rope_cached(head_size, rotary_dim, max_position, base, is_neox_style)
+
+
+def _get_rope_with_inv_freq(head_size, rotary_dim, max_position, inv_freq, is_neox_style):
+    """Create RotaryEmbedding with precomputed inv_freq (for llama3 scaling)."""
+    rope = RotaryEmbedding(head_size, rotary_dim, max_position, 10000.0, is_neox_style)
+    # Override cos_sin_cache with scaled frequencies
+    t = torch.arange(max_position, dtype=torch.float)
+    freqs = torch.einsum("i,j -> ij", t, inv_freq)
+    cos = freqs.cos()
+    sin = freqs.sin()
+    cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
+    rope.cos_sin_cache = cache
+    return rope
 
 
 @lru_cache(8)

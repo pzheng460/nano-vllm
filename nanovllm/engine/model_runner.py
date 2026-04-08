@@ -26,7 +26,7 @@ def _get_model_cls(hf_config):
     if model_type in pangu_types or getattr(hf_config, 'param_sink_number', 0) > 0:
         from nanovllm.models.pangu import PanguForCausalLM
         return PanguForCausalLM
-    # Qwen2 and Qwen3 share the same architecture (bias/no-bias handled by attention_bias flag)
+    # Qwen2/Qwen3/Llama share same architecture (bias/QK-norm handled by config flags)
     return Qwen3ForCausalLM
 
 
@@ -206,10 +206,10 @@ class ModelRunner:
         # Account for draft model KV cache (1 layer)
         if self.speculative and config.draft_model is not None:
             draft_hf = config.draft_hf_config
-            if draft_hf is not None and getattr(draft_hf, 'draft_vocab_size', None) is not None:
-                num_attn_heads = draft_hf.num_key_value_heads // self.tp_size  # EAGLE3: GQA
+            if draft_hf is not None:
+                num_attn_heads = getattr(draft_hf, 'num_key_value_heads', draft_hf.num_attention_heads) // self.tp_size
             else:
-                num_attn_heads = hf_config.num_attention_heads // self.tp_size  # EAGLE1: full MHA
+                num_attn_heads = hf_config.num_attention_heads // self.tp_size
             draft_block_bytes = 2 * 1 * self.block_size * num_attn_heads * head_dim * hf_config.torch_dtype.itemsize
             block_bytes += draft_block_bytes
         # Account for MTP KV cache (GQA, same kv_heads as main model)
@@ -240,10 +240,10 @@ class ModelRunner:
         hf_config = config.hf_config
         # EAGLE3 uses GQA (num_kv_heads from draft config), EAGLE1 uses full MHA
         draft_hf = config.draft_hf_config
-        if draft_hf is not None and getattr(draft_hf, 'draft_vocab_size', None) is not None:
-            num_attn_heads = draft_hf.num_key_value_heads // self.tp_size  # EAGLE3: GQA
+        if draft_hf is not None:
+            num_attn_heads = getattr(draft_hf, 'num_key_value_heads', draft_hf.num_attention_heads) // self.tp_size
         else:
-            num_attn_heads = hf_config.num_attention_heads // self.tp_size  # EAGLE1: full MHA
+            num_attn_heads = hf_config.num_attention_heads // self.tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         self.draft_kv_cache = torch.empty(
             2, 1, config.num_kvcache_blocks, self.block_size,

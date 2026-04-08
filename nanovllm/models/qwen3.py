@@ -23,6 +23,7 @@ class Qwen3Attention(nn.Module):
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
+        qk_norm: bool = True,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
         tp_group: dist.ProcessGroup | None = None,
@@ -71,7 +72,9 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        if not self.qkv_bias:
+        # QK norm: Qwen3 uses it when qkv_bias=False; Llama doesn't
+        self.use_qk_norm = not self.qkv_bias and qk_norm
+        if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
@@ -85,7 +88,7 @@ class Qwen3Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
+        if self.use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
@@ -138,13 +141,17 @@ class Qwen3DecoderLayer(nn.Module):
         tp_size: int | None = None,
     ) -> None:
         super().__init__()
+        qkv_bias = getattr(config, 'attention_bias', True)
+        # Qwen3 uses QK norm when attention_bias=False; Llama/Qwen2 don't
+        qk_norm = getattr(config, 'model_type', 'qwen3') == 'qwen3' and not qkv_bias
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=getattr(config, 'attention_bias', True),
+            qkv_bias=qkv_bias,
+            qk_norm=qk_norm,
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
