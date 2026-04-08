@@ -238,18 +238,6 @@ class Eagle3Model(nn.Module):
             fc_hidden = target_hidden
         hidden_states, residual = self.midlayer(positions, fc_hidden, token_embeds)
         hidden = hidden_states + residual
-        # DEBUG: bypass midlayer to test fc-only prediction
-        # hidden = fc_hidden
-        # DEBUG: also compute fc-only logits for comparison
-        if not hasattr(self, '_fwd_dbg2'): self._fwd_dbg2 = 0
-        self._fwd_dbg2 += 1
-        if self._fwd_dbg2 <= 3 and aux_hiddens is not None:
-            import torch.nn.functional as F
-            fc_logits = F.linear(self.norm(fc_hidden), self.lm_head.weight)
-            full_logits = F.linear(self.norm(hidden), self.lm_head.weight)
-            fc_pred = self.d2t[fc_logits.argmax(dim=-1)].tolist()
-            full_pred = self.d2t[full_logits.argmax(dim=-1)].tolist()
-            print(f'[E3-CMP] fc_pred={fc_pred} full_pred={full_pred} fc_h={fc_hidden.norm():.0f} full_h={hidden.norm():.0f}', flush=True)
         return hidden
 
 
@@ -301,7 +289,6 @@ class Eagle3Model(nn.Module):
                     _load_tensor(name, tensor)
                 del state_dict
 
-        print(f'[Eagle3] load_weights done: d2t[124]={self.d2t[124].item()}, fc_norm={self.fc.weight.data.norm():.1f}', flush=True)
         # Build reverse mapping: target_id → draft_id (from d2t)
         for draft_id in range(self.d2t.shape[0]):
             target_id = self.d2t[draft_id].item()

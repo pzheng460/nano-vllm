@@ -443,7 +443,6 @@ class ModelRunner:
         for i, layer in enumerate(model_inner.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
             if i in aux_layers:
-                # Full post-residual layer output = mlp_out + residual
                 aux_hiddens[i] = (hidden_states + residual).detach().clone()
         hidden_states, _ = model_inner.norm(hidden_states, residual)
         # Concatenate aux hiddens in order
