@@ -903,8 +903,8 @@ class EAGLEDraftRunner:
         hf_config = self.hf_config
         config = self.config
         torch.cuda.empty_cache()
-        # EAGLE uses full MHA: num_kv_heads = num_attention_heads
-        num_kv_heads = eagle_config.num_attention_heads
+        # EAGLE KV heads: Qwen2 uses full MHA, Llama uses GQA
+        num_kv_heads = getattr(eagle_config, 'num_key_value_heads', eagle_config.num_attention_heads)
         head_dim = getattr(eagle_config, "head_dim", eagle_config.hidden_size // eagle_config.num_attention_heads)
         free, total = torch.cuda.mem_get_info()
         used = total - free
