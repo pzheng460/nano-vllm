@@ -238,6 +238,8 @@ class Eagle3Model(nn.Module):
             fc_hidden = target_hidden
         hidden_states, residual = self.midlayer(positions, fc_hidden, token_embeds)
         hidden = hidden_states + residual
+        # DEBUG: bypass midlayer to test fc-only prediction
+        # hidden = fc_hidden
         # DEBUG: also compute fc-only logits for comparison
         if not hasattr(self, '_fwd_dbg2'): self._fwd_dbg2 = 0
         self._fwd_dbg2 += 1

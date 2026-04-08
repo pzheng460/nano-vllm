@@ -443,7 +443,8 @@ class ModelRunner:
         for i, layer in enumerate(model_inner.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
             if i in aux_layers:
-                aux_hiddens[i] = (hidden_states + residual).clone()
+                # Full post-residual layer output = mlp_out + residual
+                aux_hiddens[i] = (hidden_states + residual).detach().clone()
         hidden_states, _ = model_inner.norm(hidden_states, residual)
         # Concatenate aux hiddens in order
         aux_concat = torch.cat([aux_hiddens[l] for l in aux_layers], dim=-1)
