@@ -26,7 +26,10 @@ def _get_model_cls(hf_config):
     if model_type in pangu_types or getattr(hf_config, 'param_sink_number', 0) > 0:
         from nanovllm.models.pangu import PanguForCausalLM
         return PanguForCausalLM
-    # Qwen2/Qwen3/Llama share same architecture (bias/QK-norm handled by config flags)
+    if model_type == 'llama':
+        from nanovllm.models.llama import LlamaForCausalLM
+        return LlamaForCausalLM
+    # Qwen2/Qwen3 (bias/QK-norm handled by config flags)
     return Qwen3ForCausalLM
 
 
