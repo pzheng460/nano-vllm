@@ -25,6 +25,22 @@ Results (H100, 10 prompts, max_tokens=256):
 | Speedup                     | +69%     |        |        |        |        |
 +-----------------------------+----------+--------+--------+--------+--------+
 
+Tree cache hit rate (async SSD, F=5 for EAGLE, F=3 for MTP):
++-----------------------------+------------+
+| Config                      | Cache Hit  |
++-----------------------------+------------+
+| Llama3.1 Async EAGLE SSD   | ~98%       |
+| Qwen2.5 Async EAGLE SSD    | ~98%       |
+| Qwen2 Async EAGLE SSD      | ~98%       |
+| MiMo Async MTP SSD         | 99.9%      |
++-----------------------------+------------+
+
+Speedup breakdown (Llama 3.1, 10 prompts):
+  Sync:  8.3 ms/step = EAGLE draft(3.4ms, 41%) + Verify(4.9ms, 59%)
+  Async: 4.8 ms/step = Verify(4.8ms) + NCCL(<0.1ms, overlapped)
+  Draft time saved: 3.4ms/step (30 EAGLE forwards × 0.11ms each)
+  Net speedup: 1.71x step time × 0.94x tok/step = 1.61x throughput
+
 Acceptance rate alignment with vLLM (K=5, 10 prompts):
 +-----------------------------+--------+--------+--------+--------+--------+
 | Config                      | pos0   | pos1   | pos2   | pos3   | pos4   |
