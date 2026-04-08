@@ -5,21 +5,40 @@ Best configurations found through extensive tuning:
 - MTP SSD: tree decode, F=3, early_layers=2, K=3, batched tree build
 
 Results (H100, 10 prompts, max_tokens=256):
-+---------------------------+----------+--------+--------+--------+--------+
-| Config                    | tok/s    | Accept | pos0   | pos1   | pos2   |
-+---------------------------+----------+--------+--------+--------+--------+
-| Qwen2.5 Sync EAGLE K=3   | 255.8    | 29.9%  | 55.2%  | 24.0%  | 10.6%  |
-| Qwen2.5 Async EAGLE SSD  | 407.6    | 23.1%  | 44.8%  | 17.9%  | 6.7%   |
-| Speedup                   | +59%     |        |        |        |        |
-+---------------------------+----------+--------+--------+--------+--------+
-| Qwen2 Sync EAGLE K=3     | 208.3    | 34.5%  | 58.2%  | 30.4%  | 14.8%  |
-| Qwen2 Async EAGLE SSD    | 264.5    | 24.7%  | 47.8%  | 20.4%  | 6.1%   |
-| Speedup                   | +27%     |        |        |        |        |
-+---------------------------+----------+--------+--------+--------+--------+
-| MiMo Sync MTP K=3        | 188.5    | 36.3%  | 86.0%  | 18.4%  | 4.4%   |
-| MiMo Async MTP SSD       | 317.8    | 29.1%  | 75.4%  | 10.3%  | 1.6%   |
-| Speedup                   | +69%     |        |        |        |        |
-+---------------------------+----------+--------+--------+--------+--------+
++-----------------------------+----------+--------+--------+--------+--------+
+| Config                      | tok/s    | Accept | pos0   | pos1   | pos2   |
++-----------------------------+----------+--------+--------+--------+--------+
+| Llama3.1 Sync EAGLE K=3    | 252.6    | 36.3%  | 67.9%  | 32.1%  | 8.9%   |
+| Llama3.1 Async EAGLE SSD   | 406.2    | 32.3%  | 60.9%  | 26.3%  | 9.5%   |
+| Speedup                     | +61%     |        |        |        |        |
++-----------------------------+----------+--------+--------+--------+--------+
+| Qwen2.5 Sync EAGLE K=3     | 255.8    | 29.9%  | 55.2%  | 24.0%  | 10.6%  |
+| Qwen2.5 Async EAGLE SSD    | 407.6    | 23.1%  | 44.8%  | 17.9%  | 6.7%   |
+| Speedup                     | +59%     |        |        |        |        |
++-----------------------------+----------+--------+--------+--------+--------+
+| Qwen2 Sync EAGLE K=3       | 208.3    | 34.5%  | 58.2%  | 30.4%  | 14.8%  |
+| Qwen2 Async EAGLE SSD      | 264.5    | 24.7%  | 47.8%  | 20.4%  | 6.1%   |
+| Speedup                     | +27%     |        |        |        |        |
++-----------------------------+----------+--------+--------+--------+--------+
+| MiMo Sync MTP K=3          | 188.5    | 36.3%  | 86.0%  | 18.4%  | 4.4%   |
+| MiMo Async MTP SSD         | 317.8    | 29.1%  | 75.4%  | 10.3%  | 1.6%   |
+| Speedup                     | +69%     |        |        |        |        |
++-----------------------------+----------+--------+--------+--------+--------+
+
+Acceptance rate alignment with vLLM (K=5, 10 prompts):
++-----------------------------+--------+--------+--------+--------+--------+
+| Config                      | pos0   | pos1   | pos2   | pos3   | pos4   |
++-----------------------------+--------+--------+--------+--------+--------+
+| Llama3.1 nano-vllm          | 73.4%  | 35.7%  | 8.1%   | 2.6%   | 0.2%   |
+| Llama3.1 vLLM               | 74.9%  | 50.4%  | 14.7%  | 8.1%   | 5.5%   |
+| Gap                          | -1.5pp | -14.7  | -6.6   | -5.5   | -5.3   |
++-----------------------------+--------+--------+--------+--------+--------+
+| Qwen2 nano-vllm             | 57.8%  | 28.9%  | 10.9%  | 5.5%   | 2.0%   |
+| Qwen2 vLLM                  | 63.9%  | 40.0%  | 17.2%  | 8.3%   | 3.9%   |
+| Gap                          | -6.1pp | -11.1  | -6.3   | -2.8   | -1.9   |
++-----------------------------+--------+--------+--------+--------+--------+
+Note: pos0 gap ~1-6pp is due to flash_attn vs flashinfer backend difference.
+pos1+ gap amplifies through EAGLE draft chaining.
 """
 from nanovllm import LLM, SamplingParams
 from time import perf_counter
@@ -67,6 +86,21 @@ CONFIGS = {
     "qwen25_async": dict(
         model="/mnt/data/peizhen/Qwen2.5-7B-Instruct",
         draft_model="/mnt/data/peizhen/EAGLE-Qwen2.5-7B-Instruct",
+        enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
+        num_speculative_tokens=3,
+        draft_async=True, draft_gpu=1,
+        async_fan_out=5, ssd_early_layers=2, ssd_tree_decode=True,
+    ),
+    # Llama-3.1-8B + EAGLE
+    "llama31_sync": dict(
+        model="/mnt/data/peizhen/Llama-3.1-8B-Instruct",
+        draft_model="/mnt/data/peizhen/EAGLE-LLaMA3.1-Instruct-8B",
+        enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
+        num_speculative_tokens=3,
+    ),
+    "llama31_async": dict(
+        model="/mnt/data/peizhen/Llama-3.1-8B-Instruct",
+        draft_model="/mnt/data/peizhen/EAGLE-LLaMA3.1-Instruct-8B",
         enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
         num_speculative_tokens=3,
         draft_async=True, draft_gpu=1,
