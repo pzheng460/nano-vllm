@@ -166,7 +166,7 @@ class Eagle3Attention(nn.Module):
 
 
 class Eagle3DecoderLayer(nn.Module):
-    """EAGLE3 decoder layer: input_layernorm + attn(2*H input) + post_attn_ln + mlp + hidden_norm."""
+    """EAGLE3 decoder layer: input_layernorm(embeds) + hidden_norm(fc_out) → cat → attn → post_attn_ln → mlp."""
 
     def __init__(self, config, tp_group=None, tp_size=None):
         super().__init__()
@@ -187,19 +187,16 @@ class Eagle3DecoderLayer(nn.Module):
         self.hidden_norm = RMSNorm(H, eps=config.rms_norm_eps)
 
     def forward(self, positions, hidden_states, embeds):
-        # Attention input: cat([norm(embeds), norm(fc_out)]) = 2*H
-        # input_layernorm norms embeds; hidden_norm norms fc_output (matching vLLM)
+        # vLLM EAGLE3 layer 0: norm embeds + norm hidden → cat → attn → fused residual
         normed_embeds = self.input_layernorm(embeds)
         normed_hidden = self.hidden_norm(hidden_states)
+        residual = hidden_states  # pre-norm hidden as residual
         attn_input = torch.cat([normed_embeds, normed_hidden], dim=-1)
-        residual = hidden_states
         hidden_states = self.self_attn(positions, attn_input)
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fused post_attention_layernorm: norm(attn_out + residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
+        return hidden_states, residual
 
 
 class Eagle3Model(nn.Module):
@@ -234,13 +231,14 @@ class Eagle3Model(nn.Module):
     def forward(self, input_ids, positions, target_hidden, aux_hiddens=None):
         token_embeds = self.embed_tokens(input_ids)
         # fc input: concatenated aux hidden states from multiple target layers (3*H)
-        # aux_hiddens should be pre-concatenated [layer2_h, layer14_h, layer25_h]
         if aux_hiddens is not None:
             fc_hidden = self.fc(aux_hiddens)
         else:
             # Fallback: use target_hidden tripled
             fc_hidden = self.fc(torch.cat([target_hidden, target_hidden, target_hidden], dim=-1))
-        hidden = self.midlayer(positions, fc_hidden, token_embeds)
+        hidden_states, residual = self.midlayer(positions, fc_hidden, token_embeds)
+        # Final: hidden_states + residual (unnormed output, like vLLM's hidden_prenorm)
+        hidden = hidden_states + residual
         return hidden
 
     def compute_logits(self, hidden_states):
