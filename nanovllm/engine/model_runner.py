@@ -75,13 +75,23 @@ class ModelRunner:
         # MTP uses its own shared_head (norm + head trained together, NOT shared with target lm_head)
         self.num_speculative_tokens = config.num_speculative_tokens
         if config.draft_model is not None:
-            self.draft_model = EAGLEModel(
-                hf_config,
-                embed_tokens=self.model.model.embed_tokens,
-                lm_head=self.model.lm_head,
-                tp_group=self.tp_group,
-                tp_size=self.tp_size,
-            )
+            draft_hf = config.draft_hf_config
+            is_eagle3 = draft_hf is not None and getattr(draft_hf, 'draft_vocab_size', None) is not None
+            self._is_eagle3 = is_eagle3
+            if is_eagle3:
+                from nanovllm.models.eagle import Eagle3Model
+                self.draft_model = Eagle3Model(
+                    hf_config, draft_hf,
+                    embed_tokens=self.model.model.embed_tokens,
+                    tp_group=self.tp_group, tp_size=self.tp_size,
+                )
+            else:
+                self.draft_model = EAGLEModel(
+                    hf_config,
+                    embed_tokens=self.model.model.embed_tokens,
+                    lm_head=self.model.lm_head,
+                    tp_group=self.tp_group, tp_size=self.tp_size,
+                )
             load_model(self.draft_model, config.draft_model)
         if self.speculative:
             self.last_hidden = {}
@@ -191,9 +201,13 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.tp_size
         head_dim = self._get_kv_head_dim()
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        # Account for draft model KV cache (1 layer, full MHA)
+        # Account for draft model KV cache (1 layer)
         if self.speculative and config.draft_model is not None:
-            num_attn_heads = hf_config.num_attention_heads // self.tp_size
+            draft_hf = config.draft_hf_config
+            if draft_hf is not None and getattr(draft_hf, 'draft_vocab_size', None) is not None:
+                num_attn_heads = draft_hf.num_key_value_heads // self.tp_size  # EAGLE3: GQA
+            else:
+                num_attn_heads = hf_config.num_attention_heads // self.tp_size  # EAGLE1: full MHA
             draft_block_bytes = 2 * 1 * self.block_size * num_attn_heads * head_dim * hf_config.torch_dtype.itemsize
             block_bytes += draft_block_bytes
         # Account for MTP KV cache (GQA, same kv_heads as main model)
@@ -222,7 +236,12 @@ class ModelRunner:
     def allocate_draft_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        num_attn_heads = hf_config.num_attention_heads // self.tp_size
+        # EAGLE3 uses GQA (num_kv_heads from draft config), EAGLE1 uses full MHA
+        draft_hf = config.draft_hf_config
+        if draft_hf is not None and getattr(draft_hf, 'draft_vocab_size', None) is not None:
+            num_attn_heads = draft_hf.num_key_value_heads // self.tp_size  # EAGLE3: GQA
+        else:
+            num_attn_heads = hf_config.num_attention_heads // self.tp_size  # EAGLE1: full MHA
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         self.draft_kv_cache = torch.empty(
             2, 1, config.num_kvcache_blocks, self.block_size,
@@ -407,13 +426,38 @@ class ModelRunner:
         reset_context()
         return token_ids
 
+    def _get_eagle3_aux_layers(self):
+        """Get auxiliary layer indices for EAGLE3: (2, N//2, N-3)."""
+        N = self.config.hf_config.num_hidden_layers
+        return (2, N // 2, N - 3)
+
+    def _run_target_with_aux(self, input_ids, positions):
+        """Run target model layer-by-layer, extracting aux hidden states for EAGLE3."""
+        model_inner = self.model.model
+        hidden_states = model_inner.embed_tokens(input_ids)
+        residual = None
+        aux_layers = self._get_eagle3_aux_layers()
+        aux_hiddens = {}
+        for i, layer in enumerate(model_inner.layers):
+            hidden_states, residual = layer(positions, hidden_states, residual)
+            if i in aux_layers:
+                aux_hiddens[i] = (hidden_states + residual).clone()
+        hidden_states, _ = model_inner.norm(hidden_states, residual)
+        # Concatenate aux hiddens in order
+        aux_concat = torch.cat([aux_hiddens[l] for l in aux_layers], dim=-1)
+        return hidden_states, aux_concat
+
     @torch.inference_mode()
     def _run_prefill_with_hidden(self, seqs: list[Sequence]) -> list[int]:
         """Prefill that also saves last hidden states for speculative draft."""
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         context = get_context()
-        model_out = self.model(input_ids, positions)
+        is_eagle3 = getattr(self, '_is_eagle3', False)
+        if is_eagle3:
+            model_out, aux_concat = self._run_target_with_aux(input_ids, positions)
+        else:
+            model_out = self.model(input_ids, positions)
         # MiMo returns unnormed residual; Qwen3 returns normed hidden
         if self._mtp_uses_unnormed:
             # MiMo: model returns unnormed, need to norm for logits
@@ -447,11 +491,18 @@ class ModelRunner:
             ctx = get_context()
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, None, None)
-            self.draft_model(input_ids, positions, hidden_normed)
+            if is_eagle3:
+                self.draft_model(input_ids, positions, hidden_normed, aux_hiddens=aux_concat)
+            else:
+                self.draft_model(input_ids, positions, hidden_normed)
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
+            if is_eagle3:
+                if not hasattr(self, '_last_aux_hidden'):
+                    self._last_aux_hidden = {}
+                self._last_aux_hidden[seq.seq_id] = aux_concat[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
 
@@ -521,13 +572,25 @@ class ModelRunner:
                 context_lens = self.device.to_device(
                     torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
                 set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
-                draft_hidden = self.draft_model(input_id, pos, target_hidden)
-                reset_context()
-                # Get draft logits (use lm_head directly for single token)
-                draft_logits = self.model.compute_logits_all(draft_hidden)
-                if self.rank == 0:
-                    d_token = draft_logits.argmax(dim=-1).item()
+                if getattr(self, '_is_eagle3', False):
+                    # EAGLE3: aux_hiddens only for step 0 (from target); step 1+ uses None (fc uses tripled hidden)
+                    aux_h = self._last_aux_hidden.get(seq.seq_id) if (step == 0 and hasattr(self, '_last_aux_hidden')) else None
+                    draft_hidden = self.draft_model(input_id, pos, target_hidden, aux_hiddens=aux_h)
                 else:
+                    draft_hidden = self.draft_model(input_id, pos, target_hidden)
+                reset_context()
+                # Get draft logits
+                if getattr(self, '_is_eagle3', False):
+                    # EAGLE3: draft logits in reduced vocab → map to target vocab
+                    draft_logits = self.draft_model.compute_logits(draft_hidden)
+                    if self.rank == 0:
+                        draft_id = draft_logits.argmax(dim=-1).item()
+                        d_token = self.draft_model.d2t[draft_id].item()
+                else:
+                    draft_logits = self.model.compute_logits_all(draft_hidden)
+                if self.rank == 0 and not getattr(self, '_is_eagle3', False):
+                    d_token = draft_logits.argmax(dim=-1).item()
+                elif self.rank != 0:
                     d_token = 0
                 # Broadcast draft token in TP
                 if self.tp_size > 1:
@@ -542,7 +605,11 @@ class ModelRunner:
 
         # === Verify phase (target model, prefill-like) ===
         input_ids, positions = self._prepare_verify(seqs, all_draft_tokens)
-        hidden = self.model(input_ids, positions)  # normed for Qwen2/3, unnormed for MiMo
+        is_eagle3 = getattr(self, '_is_eagle3', False)
+        if is_eagle3:
+            hidden, aux_concat = self._run_target_with_aux(input_ids, positions)
+        else:
+            hidden = self.model(input_ids, positions)  # normed for Qwen2/3, unnormed for MiMo
         # MiMo returns unnormed → norm for logits; Qwen2/3 returns normed → use directly
         if self._mtp_uses_unnormed:
             target_logits = self.model.compute_logits_all(self.model.model.norm(hidden))
@@ -571,6 +638,10 @@ class ModelRunner:
                 # Save normed hidden at accepted position (EAGLE trained with normed hidden)
                 accepted_idx = offset + len(accepted) - 1
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
+                if is_eagle3:
+                    if not hasattr(self, '_last_aux_hidden'):
+                        self._last_aux_hidden = {}
+                    self._last_aux_hidden[seq.seq_id] = aux_concat[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
 
