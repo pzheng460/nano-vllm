@@ -198,4 +198,4 @@ cython_debug/
 .torchair_cache/
 extra-info/
 fusion_result.json
-ge_check_op.json
+ge_check_op.json*.json
