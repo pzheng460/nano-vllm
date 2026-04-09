@@ -672,12 +672,13 @@ class MTPDraftRunner:
                 b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bts]).contiguous()
 
                 set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
-                eagle_out = self.draft_model(current_ids, b_ropes, current_hidden)
+                cur_embeds = self.embed_tokens(current_ids)
+                normed_out, _ = self.mtp_layer(cur_embeds, current_hidden, b_ropes)
                 reset_context()
-                logits = F.linear(eagle_out, self.lm_head.weight)
+                logits = self.compute_mtp_logits(normed_out)
                 next_tokens = logits.argmax(dim=-1)
                 all_draft.append(next_tokens)
-                current_hidden = eagle_out
+                current_hidden = normed_out
                 current_ids = next_tokens
 
             spec_tokens = torch.stack(all_draft, dim=1)
@@ -720,46 +721,49 @@ class MTPDraftRunner:
                 offset += total
 
     def handle_cache_lookup(self):
-        """Chain lookup: receive (seq_id, accepted_len, recovery_token), do K chained lookups."""
-        lookup = torch.zeros(3, dtype=torch.int64, device=self.device)
-        dist.recv(lookup, src=0, group=self.async_pg)
-        seq_id, accepted_len, recovery_token = int(lookup[0].item()), int(lookup[1].item()), int(lookup[2].item())
-
-        result = torch.zeros(self.K, dtype=torch.int64, device=self.device)
-        hit = False
-        if seq_id in self.tree_caches:
-            cache_keys, cache_tokens = self.tree_caches[seq_id]
-            if self.tree_decode:
-                # Direct lookup: single match returns all K tokens
-                request_key = torch.tensor([[seq_id, accepted_len, recovery_token]],
-                                           dtype=torch.int64, device=self.device)
-                match = torch.all(request_key == cache_keys, dim=1)
-                if match.any():
-                    idx = match.float().argmax().item()
-                    k = min(self.K, cache_tokens.shape[1])
-                    result[:k] = cache_tokens[idx, :k]
-                    hit = True
-            else:
-                # Chain lookup (original path)
-                cur_token = recovery_token
-                for step in range(self.K):
-                    request_key = torch.tensor([[seq_id, accepted_len + step, cur_token]],
-                                               dtype=torch.int64, device=self.device)
-                    match = torch.all(request_key == cache_keys, dim=1)
+        """Batched cache lookup: receive all seqs' queries in one message, respond in one message."""
+        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+        dist.recv(ns_buf, src=0, group=self.async_pg)
+        n_seqs = int(ns_buf[0].item())
+        lookup = torch.zeros(n_seqs * 3, dtype=torch.int64, device=self.device)
+        if n_seqs > 0:
+            dist.recv(lookup, src=0, group=self.async_pg)
+        result = torch.zeros(n_seqs * self.K, dtype=torch.int64, device=self.device)
+        for i in range(n_seqs):
+            seq_id = int(lookup[i*3].item())
+            accepted_len = int(lookup[i*3+1].item())
+            recovery_token = int(lookup[i*3+2].item())
+            hit = False
+            if seq_id in self.tree_caches:
+                cache_keys, cache_tokens = self.tree_caches[seq_id]
+                if self.tree_decode:
+                    rk = torch.tensor([[seq_id, accepted_len, recovery_token]],
+                                       dtype=torch.int64, device=self.device)
+                    match = torch.all(rk == cache_keys, dim=1)
                     if match.any():
-                        idx = match.float().argmax().item()
-                        d = cache_tokens[idx, 0].item()
-                        result[step] = d
-                        cur_token = d
-                        if step == 0:
-                            hit = True
-                    else:
-                        # Chain broken — fill remaining with 0
-                        break
-        if hit:
-            MTPDraftRunner._hit += 1
-        else:
-            MTPDraftRunner._miss += 1
+                        mi = match.float().argmax().item()
+                        k = min(self.K, cache_tokens.shape[1])
+                        result[i*self.K:i*self.K+k] = cache_tokens[mi, :k]
+                        hit = True
+                else:
+                    cur_token = recovery_token
+                    for step in range(self.K):
+                        rk = torch.tensor([[seq_id, accepted_len + step, cur_token]],
+                                           dtype=torch.int64, device=self.device)
+                        match = torch.all(rk == cache_keys, dim=1)
+                        if match.any():
+                            mi = match.float().argmax().item()
+                            d_tok = cache_tokens[mi, 0].item()
+                            result[i*self.K + step] = d_tok
+                            cur_token = d_tok
+                            if step == 0:
+                                hit = True
+                        else:
+                            break
+            if hit:
+                MTPDraftRunner._hit += 1
+            else:
+                MTPDraftRunner._miss += 1
         dist.send(result, dst=0, group=self.async_pg)
 
     def handle_cache_update(self):
