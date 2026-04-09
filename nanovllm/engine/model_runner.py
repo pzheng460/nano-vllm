@@ -690,71 +690,71 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _run_mtp_decode(self, seqs: list[Sequence]) -> list[list[int]]:
-        """Draft k tokens with MTP layers, then verify with target model."""
+        """Draft k tokens with MTP layers, then verify with target model.
+        Batched: all seqs processed together per draft step.
+        """
         k = self.num_speculative_tokens
-        all_draft_tokens = []
-
+        d = self.device.device_name
+        n_seqs = len(seqs)
+        all_draft_tokens = [[] for _ in seqs]
         mtp_layer = self.model.model.mtp_layers[0]
         embed_tokens = self.model.model.embed_tokens
 
-        # === Draft phase (per-seq, eager) ===
-        for seq in seqs:
-            target_hidden = self.last_hidden[seq.seq_id]
-            draft_tokens = []
-            cur_token_id = seq.last_token
-            cur_pos = len(seq) - 1
-            for step in range(k):
-                input_id = self.device.to_device(
-                    torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
-                pos = self.device.to_device(
-                    torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
-                block_idx = cur_pos // self.block_size
-                block_offset = cur_pos % self.block_size
-                slot = seq.block_table[block_idx] * self.block_size + block_offset
-                slot_map = self.device.to_device(
-                    torch.tensor([slot], dtype=torch.int32, pin_memory=True))
-                block_table = self.device.to_device(
-                    torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
-                context_lens = self.device.to_device(
-                    torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
-                set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
-                token_embeds = embed_tokens(input_id)
-                mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, pos)
-                reset_context()
-                # MTP draft logits: use shared_head if available (PanGu), else lm_head (MiMo)
-                if hasattr(mtp_layer, 'shared_head'):
-                    draft_logits = F.linear(mtp_normed, mtp_layer.shared_head.head.weight)
-                else:
-                    draft_logits = F.linear(mtp_normed, self.model.lm_head.weight)
-                if self.tp_size > 1:
-                    all_logits = [torch.empty_like(draft_logits) for _ in range(self.tp_size)] if self.rank == 0 else None
-                    dist.gather(draft_logits, all_logits, 0, group=self.tp_group)
-                    draft_logits = torch.cat(all_logits, -1) if self.rank == 0 else None
-                if self.rank == 0:
-                    d_token = draft_logits.argmax(dim=-1).item()
-                    pass
-                else:
-                    d_token = 0
-                if self.tp_size > 1:
-                    d_tensor = torch.tensor([d_token], dtype=torch.int64, device=self.device.device_name)
-                    dist.broadcast(d_tensor, 0, group=self.tp_group)
-                    d_token = d_tensor.item()
-                draft_tokens.append(d_token)
-                # Chain: use normed output (final_layernorm) for next step, matching vLLM
-                target_hidden = mtp_normed
-                cur_token_id = d_token
-                cur_pos += 1
-            all_draft_tokens.append(draft_tokens)
+        # === Draft phase (batched) ===
+        block_tables = self.prepare_block_tables(seqs)
+        cur_tokens = [seq.last_token for seq in seqs]
+        cur_positions = [len(seq) - 1 for seq in seqs]
+        cur_hiddens = torch.cat([self.last_hidden[seq.seq_id] for seq in seqs], dim=0)
 
-        # === Verify phase (target model, prefill-like) ===
+        def _compute_mtp_logits(normed):
+            if hasattr(mtp_layer, 'shared_head'):
+                return F.linear(normed, mtp_layer.shared_head.head.weight)
+            return F.linear(normed, self.model.lm_head.weight)
+
+        for step in range(k):
+            input_ids = self.device.to_device(torch.tensor(cur_tokens, dtype=torch.int64, pin_memory=True))
+            positions = self.device.to_device(torch.tensor(cur_positions, dtype=torch.int64, pin_memory=True))
+            slot_mapping = []
+            context_lens = []
+            for i, seq in enumerate(seqs):
+                pos = cur_positions[i]
+                bi = pos // self.block_size
+                bo = pos % self.block_size
+                slot_mapping.append(seq.block_table[bi] * self.block_size + bo)
+                context_lens.append(pos + 1)
+            slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
+            context_lens_t = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens_t, block_tables=block_tables)
+            token_embeds = embed_tokens(input_ids)
+            mtp_normed, _ = mtp_layer(token_embeds, cur_hiddens, positions)
+            reset_context()
+            draft_logits = _compute_mtp_logits(mtp_normed)
+            if self.tp_size > 1:
+                all_l = [torch.empty_like(draft_logits) for _ in range(self.tp_size)] if self.rank == 0 else None
+                dist.gather(draft_logits, all_l, 0, group=self.tp_group)
+                draft_logits = torch.cat(all_l, -1) if self.rank == 0 else None
+            if self.rank == 0:
+                tokens = draft_logits.argmax(dim=-1).tolist()
+            else:
+                tokens = [0] * n_seqs
+            if self.tp_size > 1:
+                t = torch.tensor(tokens, dtype=torch.int64, device=d)
+                dist.broadcast(t, 0, group=self.tp_group)
+                tokens = t.tolist()
+            for i in range(n_seqs):
+                all_draft_tokens[i].append(tokens[i])
+            cur_tokens = tokens
+            cur_positions = [p + 1 for p in cur_positions]
+            cur_hiddens = mtp_normed
+
+        # === Verify ===
         verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
-        hidden = self.model(verify_ids, verify_pos)  # unnormed residual
+        hidden = self.model(verify_ids, verify_pos)
         hidden_normed = self.model.model.norm(hidden)
         target_logits = self.model.compute_logits_all(hidden_normed)
         reset_context()
 
-        # === Accept phase (greedy, rank 0 only) ===
-        d = self.device.device_name
+        # === Accept ===
         if self.rank == 0:
             all_accepted = []
             offset = 0
@@ -776,44 +776,49 @@ class ModelRunner:
         else:
             all_accepted = [[] for _ in seqs]
 
-        # === Update MTP KV cache in DECODE mode ===
+        # === Batched MTP KV update ===
+        if self.tp_size > 1:
+            n_acc = torch.tensor([len(a) for a in all_accepted], dtype=torch.int64, device=d)
+            dist.broadcast(n_acc, 0, group=self.tp_group)
+            if self.rank != 0:
+                all_accepted = [[0] * int(n_acc[i].item()) for i in range(n_seqs)]
+            for i in range(n_seqs):
+                if len(all_accepted[i]) > 0:
+                    acc_t = torch.tensor(all_accepted[i], dtype=torch.int64, device=d)
+                    dist.broadcast(acc_t, 0, group=self.tp_group)
+                    if self.rank != 0:
+                        all_accepted[i] = acc_t.tolist()
+
+        upd_ids, upd_pos, upd_hidden, upd_slots, upd_ctx, upd_bt_idx = [], [], [], [], [], []
         offset = 0
         for seq_idx, seq in enumerate(seqs):
-            num_accepted = len(all_accepted[seq_idx]) if self.rank == 0 else 0
-            if self.tp_size > 1:
-                na_t = torch.tensor([num_accepted], dtype=torch.int64, device=d)
-                dist.broadcast(na_t, 0, group=self.tp_group)
-                num_accepted = na_t.item()
-            num_verify = len(all_draft_tokens[seq_idx]) + 1
+            num_accepted = len(all_accepted[seq_idx])
             base_pos = len(seq) - 1
             for j in range(num_accepted):
                 cur_pos = base_pos + j
-                if self.rank == 0:
-                    tok_id = all_accepted[seq_idx][j]
-                else:
-                    tok_id = 0
-                if self.tp_size > 1:
-                    tt = torch.tensor([tok_id], dtype=torch.int64, device=d)
-                    dist.broadcast(tt, 0, group=self.tp_group)
-                    tok_id = tt.item()
-                input_id = self.device.to_device(torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
-                pos = self.device.to_device(torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
-                block_idx = cur_pos // self.block_size
-                block_offset = cur_pos % self.block_size
-                slot = seq.block_table[block_idx] * self.block_size + block_offset
-                slot_map = self.device.to_device(torch.tensor([slot], dtype=torch.int32, pin_memory=True))
-                block_table = self.device.to_device(torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
-                context_lens = self.device.to_device(torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
-                set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
-                token_embeds = embed_tokens(input_id)
-                mtp_h = hidden[offset + j:offset + j + 1]
-                mtp_layer(token_embeds, mtp_h, pos)
-                reset_context()
-            # Save last accepted hidden for next round
+                upd_ids.append(all_accepted[seq_idx][j])
+                upd_pos.append(cur_pos)
+                upd_hidden.append(hidden[offset + j:offset + j + 1])
+                bi = cur_pos // self.block_size
+                bo = cur_pos % self.block_size
+                upd_slots.append(seq.block_table[bi] * self.block_size + bo)
+                upd_ctx.append(cur_pos + 1)
+                upd_bt_idx.append(seq_idx)
             if self.rank == 0:
-                accepted_idx = offset + len(all_accepted[seq_idx]) - 1
+                accepted_idx = offset + num_accepted - 1 if num_accepted > 0 else offset
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx + 1].clone()
-            offset += num_verify
+            offset += len(all_draft_tokens[seq_idx]) + 1
+        if upd_ids:
+            inp = self.device.to_device(torch.tensor(upd_ids, dtype=torch.int64, pin_memory=True))
+            pos_t = self.device.to_device(torch.tensor(upd_pos, dtype=torch.int64, pin_memory=True))
+            h = torch.cat(upd_hidden, dim=0)
+            sm = self.device.to_device(torch.tensor(upd_slots, dtype=torch.int32, pin_memory=True))
+            cl = self.device.to_device(torch.tensor(upd_ctx, dtype=torch.int32, pin_memory=True))
+            bt = block_tables[torch.tensor(upd_bt_idx, dtype=torch.long)]
+            set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt)
+            embeds = embed_tokens(inp)
+            mtp_layer(embeds, h, pos_t)
+            reset_context()
 
         if self.rank == 0:
             return all_accepted
