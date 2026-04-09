@@ -1,15 +1,15 @@
-# SSD Tree Cache Hit Rate Sweep: early_layers x fan_out
+# SSD Tree Cache 命中率扫描：early_layers x fan_out
 
-## Experiment Setup
+## 实验设置
 
-- **Models**: Llama-3.1-8B-Instruct + EAGLE, Qwen2-7B-Instruct + EAGLE
-- **Dataset**: GPQA Diamond (10 prompts, scientific questions)
-- **Generation**: greedy, max_tokens=64, K=3 speculative tokens
-- **Hardware**: H100 80GB, 2 GPUs per run (target + draft)
-- **Variables**: `ssd_early_layers` (1-4), `async_fan_out` (1-5)
-- **Metric**: Tree cache hit rate (% of decode steps where draft tokens come from pre-computed cache vs JIT NCCL fallback)
+- **模型**：Llama-3.1-8B-Instruct + EAGLE、Qwen2-7B-Instruct + EAGLE
+- **数据集**：GPQA Diamond（10条prompt，科学类问题）
+- **生成配置**：贪心解码，max_tokens=64，K=3 投机token
+- **硬件**：H100 80GB，每次运行使用2张GPU（目标模型 + 草稿模型）
+- **变量**：`ssd_early_layers`（1-4）、`async_fan_out`（1-5）
+- **指标**：Tree cache命中率（decode步骤中draft token来自预计算缓存 vs JIT NCCL回退的比例）
 
-## Results
+## 结果
 
 ### Llama 3.1 + EAGLE
 
@@ -29,90 +29,90 @@
 |   **3**   | 57.0%  | 70.6%  | 75.1%  | 78.6%  | 80.5%  |
 |   **4**   | 46.0%  | 58.4%  | 64.8%  | 67.0%  | 71.1%  |
 
-## Analysis
+## 分析
 
-### Effect of `ssd_early_layers`
+### `ssd_early_layers` 的影响
 
-`ssd_early_layers=N` means the target model extracts hidden states at layer `L-N` (N layers before the final layer) and sends them to the draft GPU via NCCL. A larger N gives the draft GPU more compute time to pre-build the tree cache before the target finishes its forward pass.
+`ssd_early_layers=N` 表示目标模型在第 `L-N` 层（倒数第N层）提取隐藏状态，通过NCCL发送给草稿GPU。N越大，草稿GPU在目标模型完成前向传播之前就有更多的计算时间来预构建tree cache。
 
-| early_layers | Llama hit (F=5) | Qwen2 hit (F=5) | Interpretation |
+| early_layers | Llama 命中率 (F=5) | Qwen2 命中率 (F=5) | 解读 |
 |:---:|:---:|:---:|:---|
-| 1 | 97.4% | 97.4% | Draft has max time, saturated |
-| 2 | 94.7% | 93.8% | Sweet spot: high hit + good acceptance |
-| 3 | 86.2% | 80.5% | Diminishing returns |
-| 4 | 75.7% | 71.1% | Draft often can't finish in time |
+| 1 | 97.4% | 97.4% | 草稿模型计算时间最充裕，已饱和 |
+| 2 | 94.7% | 93.8% | 最佳平衡点：高命中率 + 良好接受率 |
+| 3 | 86.2% | 80.5% | 收益递减 |
+| 4 | 75.7% | 71.1% | 草稿模型经常来不及完成计算 |
 
-**Each additional layer costs ~10-15pp hit rate.** At early=1, the draft has the longest window (target still computing 1 final layer), so cache hit saturates at ~97% regardless of F.
+**每多提前一层，命中率约下降10-15pp。** 当 early=1 时，草稿模型有最长的计算窗口（目标模型还需计算最后1层），因此无论F取何值，缓存命中率都饱和在~97%。
 
-### Effect of `async_fan_out` (F)
+### `async_fan_out`（F）的影响
 
-F controls how many top-F candidate tokens the draft pre-computes at each verify position. Higher F increases the chance that the actual accepted token is among the pre-computed candidates.
+F 控制草稿模型在每个验证位置预计算多少个top-F候选token。F越大，实际被接受的token落在预计算候选中的概率越高。
 
-| F | Llama hit (e=2) | Qwen2 hit (e=2) | Delta from F=1 |
+| F | Llama 命中率 (e=2) | Qwen2 命中率 (e=2) | 相对F=1的提升 |
 |:---:|:---:|:---:|:---:|
-| 1 | 75.8% | 72.5% | baseline |
+| 1 | 75.8% | 72.5% | 基准 |
 | 2 | 86.5% | 85.1% | +11-13pp |
 | 3 | 90.7% | 91.3% | +15-19pp |
 | 4 | 92.7% | 92.9% | +17-20pp |
 | 5 | 94.7% | 93.8% | +19-21pp |
 
-**F=1->3 gives the biggest gain (~+15pp), F=3->5 has diminishing returns (~+4pp).** This makes sense: top-3 candidates cover ~90% of the probability mass for greedy decoding.
+**F从1到3提升最大（约+15pp），F从3到5收益递减（约+4pp）。** 这是合理的：在贪心解码下，top-3候选已覆盖约90%的概率质量。
 
-### Diminishing returns at early=1
+### early=1 时的收益饱和
 
-At early=1, even F=1 achieves 96-97% hit. This means with 1 extra layer of compute time, the draft can almost always finish even with just 1 candidate. F has no effect because time, not coverage, is the bottleneck at early=2+.
+当 early=1 时，即使 F=1 也能达到96-97%的命中率。这意味着只要多出1层的计算时间，草稿模型几乎总能完成预计算，即使只有1个候选。在 early>=2 时，F才产生影响，因为此时瓶颈从时间变成了覆盖率。
 
-### Model comparison
+### 模型对比
 
-Llama and Qwen2 show nearly identical trends. Llama is slightly better at early=3,4 (e.g., 86.2% vs 80.5% at e=3,F=5), possibly because:
-- Llama EAGLE uses GQA (8 kv_heads) vs Qwen2 EAGLE full MHA (28 kv_heads), making draft forward faster
-- Faster draft = more time to finish before target completes
+Llama 和 Qwen2 表现出几乎相同的趋势。Llama 在 early=3,4 时略优（如 e=3,F=5 时 86.2% vs 80.5%），可能原因：
+- Llama EAGLE 使用 GQA（8个KV头）vs Qwen2 EAGLE 全MHA（28个KV头），草稿模型前向更快
+- 草稿模型更快 = 在目标模型完成前有更多时间完成计算
 
-## Throughput Summary (H100, 10 prompts, max_tokens=256)
+## 吞吐量汇总（H100，10条prompt，max_tokens=256）
 
-| Config | tok/s | Accept | pos0 | pos1 | pos2 | Speedup |
+| 配置 | tok/s | 接受率 | pos0 | pos1 | pos2 | 加速比 |
 |:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| Llama3.1 Sync EAGLE K=3 | 252.6 | 36.3% | 67.9% | 32.1% | 8.9% | - |
-| Llama3.1 Async SSD (e=2,F=5) | 406.2 | 32.3% | 60.9% | 26.3% | 9.5% | **+61%** |
-| Qwen2.5 Sync EAGLE K=3 | 255.8 | 29.9% | 55.2% | 24.0% | 10.6% | - |
-| Qwen2.5 Async SSD (e=2,F=5) | 407.6 | 23.1% | 44.8% | 17.9% | 6.7% | **+59%** |
-| Qwen2 Sync EAGLE K=3 | 208.3 | 34.5% | 58.2% | 30.4% | 14.8% | - |
-| Qwen2 Async SSD (e=2,F=5) | 264.5 | 24.7% | 47.8% | 20.4% | 6.1% | **+27%** |
-| MiMo Sync MTP K=3 | 188.5 | 36.3% | 86.0% | 18.4% | 4.4% | - |
-| MiMo Async MTP SSD (e=2,F=3) | 317.8 | 29.1% | 75.4% | 10.3% | 1.6% | **+69%** |
+| Llama3.1 同步EAGLE K=3 | 252.6 | 36.3% | 67.9% | 32.1% | 8.9% | - |
+| Llama3.1 异步SSD (e=2,F=5) | 406.2 | 32.3% | 60.9% | 26.3% | 9.5% | **+61%** |
+| Qwen2.5 同步EAGLE K=3 | 255.8 | 29.9% | 55.2% | 24.0% | 10.6% | - |
+| Qwen2.5 异步SSD (e=2,F=5) | 407.6 | 23.1% | 44.8% | 17.9% | 6.7% | **+59%** |
+| Qwen2 同步EAGLE K=3 | 208.3 | 34.5% | 58.2% | 30.4% | 14.8% | - |
+| Qwen2 异步SSD (e=2,F=5) | 264.5 | 24.7% | 47.8% | 20.4% | 6.1% | **+27%** |
+| MiMo 同步MTP K=3 | 188.5 | 36.3% | 86.0% | 18.4% | 4.4% | - |
+| MiMo 异步MTP SSD (e=2,F=3) | 317.8 | 29.1% | 75.4% | 10.3% | 1.6% | **+69%** |
 
-## Speedup Breakdown (Llama 3.1, 10 prompts)
+## 加速分解（Llama 3.1，10条prompt）
 
 ```
-Sync:  8.3 ms/step = EAGLE draft (3.4ms, 41%) + Verify (4.9ms, 59%)
-Async: 4.8 ms/step = Verify (4.8ms) + NCCL (<0.1ms, overlapped)
+同步：8.3 ms/步 = EAGLE草稿 (3.4ms, 41%) + 验证 (4.9ms, 59%)
+异步：4.8 ms/步 = 验证 (4.8ms) + NCCL (<0.1ms, 重叠)
 
-Step time speedup:  1.71x (removed 41% draft overhead)
-Tokens/step ratio:  0.94x (async has slightly lower acceptance)
-Net throughput:     1.61x (+61%)
+单步耗时加速：1.71x（消除了41%的草稿开销）
+每步token数比值：0.94x（异步接受率略低）
+净吞吐量：1.61x（+61%）
 ```
 
-## Acceptance Rate Alignment with vLLM (K=5, 10 prompts)
+## 与vLLM的接受率对齐（K=5，10条prompt）
 
-| Config | pos0 | pos1 | pos2 | pos3 | pos4 |
+| 配置 | pos0 | pos1 | pos2 | pos3 | pos4 |
 |:---|:---:|:---:|:---:|:---:|:---:|
 | Llama3.1 nano-vllm | 73.4% | 35.7% | 8.1% | 2.6% | 0.2% |
 | Llama3.1 vLLM | 74.9% | 50.4% | 14.7% | 8.1% | 5.5% |
-| Gap | -1.5pp | -14.7pp | -6.6pp | -5.5pp | -5.3pp |
+| 差距 | -1.5pp | -14.7pp | -6.6pp | -5.5pp | -5.3pp |
 | | | | | | |
 | Qwen2 nano-vllm | 57.8% | 28.9% | 10.9% | 5.5% | 2.0% |
 | Qwen2 vLLM | 63.9% | 40.0% | 17.2% | 8.3% | 3.9% |
-| Gap | -6.1pp | -11.1pp | -6.3pp | -2.8pp | -1.9pp |
+| 差距 | -6.1pp | -11.1pp | -6.3pp | -2.8pp | -1.9pp |
 
-- **pos0 gap (~1-6pp)**: flash_attn vs flashinfer attention backend numerical difference
-- **pos1+ gap amplifies**: EAGLE draft chaining compounds the per-step error
-- **Greedy decode output**: token-for-token identical between nano-vllm and vLLM (target model aligned)
+- **pos0差距（约1-6pp）**：flash_attn 与 flashinfer 注意力后端的数值差异
+- **pos1+差距放大**：EAGLE草稿链式推理会累积逐步误差
+- **贪心解码输出**：nano-vllm 与 vLLM 的目标模型输出逐token一致
 
-## Recommended Configuration
+## 推荐配置
 
-| Parameter | Recommended | Rationale |
+| 参数 | 推荐值 | 理由 |
 |:---|:---:|:---|
-| `ssd_early_layers` | **2** | 94% hit, good acceptance (early=1 has higher hit but lower acceptance due to shallower hidden) |
-| `async_fan_out` | **3-5** | 91-95% hit; F>5 has diminishing returns |
-| `num_speculative_tokens` | **3** | Best throughput/acceptance tradeoff |
-| `ssd_tree_decode` | **True** | Batched tree decode for all K steps in one pass |
+| `ssd_early_layers` | **2** | 94%命中率，良好接受率（early=1命中率更高，但因隐藏状态较浅导致接受率较低） |
+| `async_fan_out` | **3-5** | 91-95%命中率；F>5收益递减 |
+| `num_speculative_tokens` | **3** | 吞吐量/接受率的最佳权衡 |
+| `ssd_tree_decode` | **True** | 批量tree decode，一次完成所有K步 |
