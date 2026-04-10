@@ -633,17 +633,16 @@ class ModelRunner:
             for seq, draft_tokens in zip(seqs, all_draft_tokens):
                 num_verify = len(draft_tokens) + 1
                 seq_logits = target_logits[offset:offset + num_verify]
-                target_predicted = seq_logits.argmax(dim=-1)  # [k+1]
+                predicted = seq_logits.argmax(dim=-1).tolist()
                 accepted = []
                 for j in range(k):
-                    if target_predicted[j].item() == draft_tokens[j]:
+                    if predicted[j] == draft_tokens[j]:
                         accepted.append(draft_tokens[j])
                     else:
-                        accepted.append(target_predicted[j].item())
+                        accepted.append(predicted[j])
                         break
                 else:
-                    # All draft tokens accepted, add bonus token
-                    accepted.append(target_predicted[k].item())
+                    accepted.append(predicted[k])
                 # Save normed hidden at accepted position (EAGLE trained with normed hidden)
                 accepted_idx = offset + len(accepted) - 1
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
@@ -763,16 +762,16 @@ class ModelRunner:
             for seq, draft_tokens in zip(seqs, all_draft_tokens):
                 num_verify = len(draft_tokens) + 1
                 seq_logits = target_logits[offset:offset + num_verify]
-                target_predicted = seq_logits.argmax(dim=-1)
+                predicted = seq_logits.argmax(dim=-1).tolist()
                 accepted = []
                 for j in range(k):
-                    if target_predicted[j].item() == draft_tokens[j]:
+                    if predicted[j] == draft_tokens[j]:
                         accepted.append(draft_tokens[j])
                     else:
-                        accepted.append(target_predicted[j].item())
+                        accepted.append(predicted[j])
                         break
                 else:
-                    accepted.append(target_predicted[k].item())
+                    accepted.append(predicted[k])
                 all_accepted.append(accepted)
                 offset += num_verify
         else:
@@ -1073,16 +1072,16 @@ class ModelRunner:
             for seq, draft_tokens in zip(seqs, all_draft_tokens):
                 num_verify = len(draft_tokens) + 1
                 seq_logits = target_logits[offset:offset + num_verify]
-                target_predicted = seq_logits.argmax(dim=-1)
+                predicted = seq_logits.argmax(dim=-1).tolist()
                 accepted = []
                 for j in range(k):
-                    if target_predicted[j].item() == draft_tokens[j]:
+                    if predicted[j] == draft_tokens[j]:
                         accepted.append(draft_tokens[j])
                     else:
-                        accepted.append(target_predicted[j].item())
+                        accepted.append(predicted[j])
                         break
                 else:
-                    accepted.append(target_predicted[k].item())
+                    accepted.append(predicted[k])
 
                 seq.last_accepted_len = len(accepted) - 1
                 seq.recovery_token_id = accepted[-1]
