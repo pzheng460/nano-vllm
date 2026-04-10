@@ -3,7 +3,7 @@ from nanovllm import LLM, SamplingParams
 
 
 def main():
-    path = "/root/huggingface/MiMo-7B-Base/"
+    path = "/mnt/data/peizhen/MiMo-7B-Base/"
 
     # MTP is auto-detected from model config (num_nextn_predict_layers > 0)
     llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, max_model_len=4096)

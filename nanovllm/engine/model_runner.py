@@ -776,7 +776,7 @@ class ModelRunner:
         else:
             all_accepted = [[] for _ in seqs]
 
-        # === Batched MTP KV update ===
+        # === Broadcast accepted tokens (TP) & update last_hidden ===
         if self.tp_size > 1:
             n_acc = torch.tensor([len(a) for a in all_accepted], dtype=torch.int64, device=d)
             dist.broadcast(n_acc, 0, group=self.tp_group)
@@ -789,36 +789,13 @@ class ModelRunner:
                     if self.rank != 0:
                         all_accepted[i] = acc_t.tolist()
 
-        upd_ids, upd_pos, upd_hidden, upd_slots, upd_ctx, upd_bt_idx = [], [], [], [], [], []
-        offset = 0
-        for seq_idx, seq in enumerate(seqs):
-            num_accepted = len(all_accepted[seq_idx])
-            base_pos = len(seq) - 1
-            for j in range(num_accepted):
-                cur_pos = base_pos + j
-                upd_ids.append(all_accepted[seq_idx][j])
-                upd_pos.append(cur_pos)
-                upd_hidden.append(hidden[offset + j:offset + j + 1])
-                bi = cur_pos // self.block_size
-                bo = cur_pos % self.block_size
-                upd_slots.append(seq.block_table[bi] * self.block_size + bo)
-                upd_ctx.append(cur_pos + 1)
-                upd_bt_idx.append(seq_idx)
-            if self.rank == 0:
+        if self.rank == 0:
+            offset = 0
+            for seq_idx, seq in enumerate(seqs):
+                num_accepted = len(all_accepted[seq_idx])
                 accepted_idx = offset + num_accepted - 1 if num_accepted > 0 else offset
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx + 1].clone()
-            offset += len(all_draft_tokens[seq_idx]) + 1
-        if upd_ids:
-            inp = self.device.to_device(torch.tensor(upd_ids, dtype=torch.int64, pin_memory=True))
-            pos_t = self.device.to_device(torch.tensor(upd_pos, dtype=torch.int64, pin_memory=True))
-            h = torch.cat(upd_hidden, dim=0)
-            sm = self.device.to_device(torch.tensor(upd_slots, dtype=torch.int32, pin_memory=True))
-            cl = self.device.to_device(torch.tensor(upd_ctx, dtype=torch.int32, pin_memory=True))
-            bt = block_tables[torch.tensor(upd_bt_idx, dtype=torch.long)]
-            set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt)
-            embeds = embed_tokens(inp)
-            mtp_layer(embeds, h, pos_t)
-            reset_context()
+                offset += len(all_draft_tokens[seq_idx]) + 1
 
         if self.rank == 0:
             return all_accepted
@@ -909,9 +886,6 @@ class ModelRunner:
         if not eagle_async:
             mtp_layer = self.model.model.mtp_layers[0]
         if self.rank == 0 and self.async_pg is not None:
-            if not hasattr(self, '_last_candidates'):
-                self._last_candidates = {}
-
             if eagle_async:
                 # Use locally pushed tree cache (received in llm_engine.step() after previous step)
                 if not hasattr(self, '_local_tree_cache'):
@@ -1047,12 +1021,10 @@ class ModelRunner:
         hidden_states = model_inner.embed_tokens(verify_ids)
         residual = None
         _async_send_handles = []
-        _early_hidden_for_cand = None
         for i, layer in enumerate(model_inner.layers):
             hidden_states, residual = layer(verify_pos, hidden_states, residual)
             if i == early_layer and self.rank == 0 and self.async_pg is not None:
                 early_hidden_all = (hidden_states + residual).clone()
-                _early_hidden_for_cand = early_hidden_all
                 # Non-blocking sends: overlap with remaining layers
                 num_seqs_batch = len(seqs)
                 cmd_t = torch.tensor([5], dtype=torch.int64, device=d)
@@ -1084,33 +1056,12 @@ class ModelRunner:
         # Wait for async sends to complete before proceeding
         for h in _async_send_handles:
             h.wait()
-        if _early_hidden_for_cand is not None:
-            if not hasattr(self, '_early_hiddens_for_candidates'):
-                self._early_hiddens_for_candidates = {}
-            offset_e = 0
-            for seq, dt in zip(seqs, all_draft_tokens):
-                nv = len(dt) + 1
-                self._early_hiddens_for_candidates[seq.seq_id] = _early_hidden_for_cand[offset_e:offset_e+nv].clone()
-                offset_e += nv
         hidden = residual  # unnormed, for MTP last_hidden
 
         target_logits = self.model.compute_logits_all(hidden_states)
         reset_context()
 
         # === Accept phase ===
-        # Compute candidates (off critical path) to predict hit/miss next step
-        if self.rank == 0 and self.async_pg is not None:
-            if not hasattr(self, '_last_candidates'):
-                self._last_candidates = {}
-            if hasattr(self, '_early_hiddens_for_candidates'):
-                fan = self.config.async_fan_out
-                for seq_id, eh_all in self._early_hiddens_for_candidates.items():
-                    en = model_inner.norm(eh_all)
-                    el = F.linear(en, self.model.lm_head.weight)
-                    _, topf = torch.topk(el, fan, dim=-1)
-                    self._last_candidates[seq_id] = set(topf.reshape(-1).tolist())
-                self._early_hiddens_for_candidates = {}
-
         if self.rank == 0:
             all_accepted = []
             offset = 0

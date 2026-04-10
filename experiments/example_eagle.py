@@ -5,8 +5,8 @@ from transformers import AutoTokenizer
 
 
 def main():
-    model_path = os.path.expanduser("/mnt/data/weights/Qwen2-7B-Instruct/")
-    draft_path = os.path.expanduser("/mnt/data/weights/EAGLE-Qwen2-7B-Instruct/")
+    model_path = os.path.expanduser("/mnt/data/peizhen/Qwen2-7B-Instruct/")
+    draft_path = os.path.expanduser("/mnt/data/peizhen/EAGLE-Qwen2-7B-Instruct/")
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     llm = LLM(
         model_path,
