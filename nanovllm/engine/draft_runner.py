@@ -556,12 +556,13 @@ class MTPDraftRunner:
         meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
 
+        meta_list = meta.tolist()
         seq_infos = []
         total_nv = 0
         total_bt = 0
         for i in range(num_seqs):
             b = i * 5
-            sid, nv, ntok, btlen, spos = (int(meta[b+j].item()) for j in range(5))
+            sid, nv, ntok, btlen, spos = meta_list[b], meta_list[b+1], meta_list[b+2], meta_list[b+3], meta_list[b+4]
             seq_infos.append((sid, nv, ntok, btlen, spos))
             total_nv += nv
             total_bt += btlen
@@ -702,10 +703,11 @@ class MTPDraftRunner:
         if n_seqs > 0:
             dist.recv(lookup, src=0, group=self.async_pg)
         result = torch.zeros(n_seqs * self.K, dtype=torch.int64, device=self.device)
+        lookup_list = lookup.tolist()
         for i in range(n_seqs):
-            seq_id = int(lookup[i*3].item())
-            accepted_len = int(lookup[i*3+1].item())
-            recovery_token = int(lookup[i*3+2].item())
+            seq_id = int(lookup_list[i*3])
+            accepted_len = int(lookup_list[i*3+1])
+            recovery_token = int(lookup_list[i*3+2])
             hit = False
             if seq_id in self.tree_caches:
                 cache_keys, cache_tokens = self.tree_caches[seq_id]
@@ -743,7 +745,8 @@ class MTPDraftRunner:
         """Receive pre-computed next draft token from target and store in cache."""
         meta = torch.zeros(3, dtype=torch.int64, device=self.device)  # [seq_id, accepted_len, recovery_token]
         dist.recv(meta, src=0, group=self.async_pg)
-        seq_id, acc_len, rec_tok = int(meta[0].item()), int(meta[1].item()), int(meta[2].item())
+        m = meta.tolist()
+        seq_id, acc_len, rec_tok = int(m[0]), int(m[1]), int(m[2])
         next_draft = torch.zeros(self.K, dtype=torch.int64, device=self.device)
         dist.recv(next_draft, src=0, group=self.async_pg)
         key = torch.tensor([[seq_id, acc_len, rec_tok]], dtype=torch.int64, device=self.device)
@@ -752,7 +755,7 @@ class MTPDraftRunner:
     def handle_cleanup(self):
         meta = torch.zeros(1, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
-        seq_id = int(meta[0].item())
+        seq_id = int(meta[0])
         if seq_id in self.last_hidden:
             del self.last_hidden[seq_id]
         self._reset_tree_cache(seq_id)
@@ -763,7 +766,7 @@ class MTPDraftRunner:
         print("[MTPDraftRunner] Starting draft loop", flush=True)
         while True:
             dist.recv(self._cmd_buf, src=0, group=self.async_pg)
-            cmd = int(self._cmd_buf[0].item())
+            cmd = self._cmd_buf[0].tolist()
             if cmd == 0:
                 self.handle_speculate()
             elif cmd == 1:
@@ -773,7 +776,7 @@ class MTPDraftRunner:
             elif cmd == 4:  # cache_update from target
                 self.handle_cache_update()
             elif cmd == 5:  # early_speculate: target sent [cmd, num_seqs] in _cmd_buf
-                num_seqs = int(self._cmd_buf[1].item())
+                num_seqs = self._cmd_buf[1].tolist()
                 self.handle_early_speculate(num_seqs)
             elif cmd == 6:  # cache_lookup: lightweight hit query
                 self.handle_cache_lookup()
@@ -781,7 +784,6 @@ class MTPDraftRunner:
                 total = MTPDraftRunner._hit + MTPDraftRunner._miss
                 rate = MTPDraftRunner._hit / total * 100 if total else 0
                 print(f"[MTPDraftRunner] Exiting. Cache hit: {MTPDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
-                break
 
 
 class EAGLEDraftModel(torch.nn.Module):
@@ -1047,7 +1049,7 @@ class EAGLEDraftRunner:
         total_bt = 0
         for i in range(num_seqs):
             b = i * 5
-            sid, nv, ntok, btlen, spos = (int(meta[b+j].item()) for j in range(5))
+            sid, nv, ntok, btlen, spos = meta_list[b], meta_list[b+1], meta_list[b+2], meta_list[b+3], meta_list[b+4]
             seq_infos.append((sid, nv, ntok, btlen, spos))
             total_nv += nv
             total_bt += btlen
@@ -1262,7 +1264,7 @@ class EAGLEDraftRunner:
     def handle_cleanup(self):
         meta = torch.zeros(1, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
-        seq_id = int(meta[0].item())
+        seq_id = int(meta[0])
         if seq_id in self.last_hidden:
             del self.last_hidden[seq_id]
         self._reset_tree_cache(seq_id)
@@ -1273,7 +1275,7 @@ class EAGLEDraftRunner:
         print("[EAGLEDraftRunner] Starting draft loop", flush=True)
         while True:
             dist.recv(self._cmd_buf, src=0, group=self.async_pg)
-            cmd = int(self._cmd_buf[0].item())
+            cmd = int(self._cmd_buf[0].tolist())
             if cmd == 0:
                 self.handle_speculate()
             elif cmd == 1:
@@ -1281,7 +1283,7 @@ class EAGLEDraftRunner:
             elif cmd == 3:
                 self.handle_cleanup()
             elif cmd == 5:
-                num_seqs = int(self._cmd_buf[1].item())
+                num_seqs = self._cmd_buf[1].tolist()
                 self.handle_early_speculate(num_seqs)
             elif cmd == 6:
                 self.handle_cache_lookup()
