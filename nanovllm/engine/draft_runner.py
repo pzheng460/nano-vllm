@@ -592,9 +592,9 @@ class MTPDraftRunner:
         batch_pos = all_pos.repeat_interleave(fan)                    # (total_nv * fan,)
         batch_embeds = self.embed_tokens(batch_cands)
 
-        # Build per-seq metadata for tree cache keys
-        all_flat_acc_lens = []
-        all_flat_sids = []
+        # Build per-seq metadata using Python lists to avoid per-seq GPU tensor creation
+        acc_lens_list = []
+        sids_list = []
         per_seq_meta = []
         bt_off = 0
         grand_total = 0
@@ -604,10 +604,10 @@ class MTPDraftRunner:
         for sid, nv, ntok, btlen, spos in seq_infos:
             total = nv * fan
             block_table = all_bt[bt_off:bt_off+btlen]
-            flat_acc_lens = torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan)
-            flat_sids = torch.full((total,), sid, dtype=torch.int64, device=d)
-            all_flat_acc_lens.append(flat_acc_lens)
-            all_flat_sids.append(flat_sids)
+            for j in range(nv):
+                for _ in range(fan):
+                    acc_lens_list.append(j)
+                    sids_list.append(sid)
 
             if self.tree_decode and self.K > 1:
                 max_bi = block_table.shape[0] - 1
@@ -625,8 +625,8 @@ class MTPDraftRunner:
             grand_total += total
             bt_off += btlen
 
-        batch_acc_lens = torch.cat(all_flat_acc_lens)
-        batch_sids = torch.cat(all_flat_sids)
+        batch_acc_lens = torch.tensor(acc_lens_list, dtype=torch.int64, device=d)
+        batch_sids = torch.tensor(sids_list, dtype=torch.int64, device=d)
 
         if self.tree_decode and self.K > 1:
             # 3a. Batched tree decode: K steps for ALL seqs' candidates at once
