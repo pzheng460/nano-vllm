@@ -85,6 +85,105 @@ GPU 0（目标）                      GPU 1（草稿）
 - 草稿 KV cache 上限为 `max_num_seqs * max_blocks_per_seq`（不填满 GPU）
 - `ssd_early_layers` 配置：在第 `N-X` 层提取 early hidden（默认 2）
 
+### SSD-MTP 算法详解
+
+#### 一、整体架构
+
+SSD-MTP 是一种**双 GPU 异步推测解码**方案：
+
+```
+GPU 0 (Target)                         GPU 1 (Draft)
+┌──────────────────────┐               ┌──────────────────────┐
+│  完整目标模型          │    NCCL      │  MTP Draft 模型       │
+│  - Prefill/Decode     │◄────────────►│  - embed + MTP layer  │
+│  - Early hidden 抽取  │              │  - Tree Cache         │
+│  - 投机验证           │              │  - 异步构建候选树      │
+└──────────────────────┘               └──────────────────────┘
+```
+
+核心思想：**在目标模型做 verify forward 的同时，利用中间层（early layer）的 hidden state 提前发送给 Draft GPU，让 Draft 异步预计算下一步的候选 token 树，从而在下一个 decode step 中实现接近零延迟的投机。**
+
+#### 关键配置参数
+
+| 参数 | 含义 |
+|------|------|
+| `draft_async=True` | 启用异步双 GPU 模式 |
+| `num_speculative_tokens (K)` | 每步投机 token 数 |
+| `ssd_early_layers` | 从第 `N-X` 层抽取 early hidden（默认 2） |
+| `async_fan_out (F)` | 树缓存扇出因子（默认 3），每个位置取 top-F 候选 |
+
+#### 二、算法流程（每个 Decode Step）
+
+**Step 1: 投机（Speculation）**
+
+Target 向 Draft 发送 **cache lookup 请求**（NCCL cmd=6），查询格式为 `(seq_id, accepted_len, last_token)`：
+
+- **Cache Hit（~99% 情况）**：Draft 直接从 Tree Cache 链式查找 K 个 token 返回，**几乎零延迟**
+- **Cache Miss**：回退到 Target GPU 本地用 MTP layer 链式生成 K 个 draft token（较慢）
+
+Tree Cache 查找逻辑：
+```
+lookup(sid, pos=0, recovery_token) → d₀
+lookup(sid, pos=1, d₀) → d₁
+lookup(sid, pos=2, d₁) → d₂
+...共 K 步链式查找
+```
+
+**Step 2: 验证（Verify）**
+
+Target 模型对 `[last_token, d₀, d₁, ..., d_{K-1}]` 做一次 **prefill-like forward**：
+
+- 逐层计算，到达第 `N - ssd_early_layers` 层时：
+  - **抽取 early hidden state**
+  - **非阻塞异步 NCCL 发送**（cmd=5）给 Draft，包含所有 seq 的 early hidden、block table、positions
+  - Target **继续计算剩余层**，与 Draft 的树构建**并行执行**
+
+**Step 3: Draft 异步构建 Tree Cache（与 Step 2 剩余层并行）**
+
+Draft 收到 early hidden 后：
+1. **Glue decode**：对 verify 的 K+1 个位置的 hidden state，通过 MTP layer 得到 prenorm hidden
+2. **Fork**：对每个位置取 **top-F 候选 token**（排除已选 token）
+3. **Tree decode**：每个候选 token embed 后，通过 MTP layer 链式展开 K 步
+4. **存入 Tree Cache**：key = `(seq_id, position, candidate_token)` → value = `K 个后续 draft tokens`
+
+每个 seq 存储 `(K+1) × F` 条缓存记录，覆盖下一步所有可能的 recovery token。
+
+**Step 4: 贪心接受（Accept）**
+
+Target 的 verify forward 完成后，得到 K+1 个位置的 logits：
+
+```
+logits[0] → 验证 d₀ 是否 = argmax(logits[0])
+logits[1] → 验证 d₁ 是否 = argmax(logits[1])
+...
+第一个不匹配处停止，取 argmax 作为 recovery token
+若全部匹配，额外获得 bonus token
+```
+
+接受后更新 `last_hidden`，将 recovery token 保存供下一轮 cache lookup 使用。
+
+#### 三、关键优化
+
+1. **Early hidden extraction**：倒数第 X 层就把 hidden 发出去，Draft 和 Target 最后几层**并行计算**
+2. **Skip MTP KV update on target**：SSD 模式下 Target 不维护 MTP 的 KV cache（hit rate ~99%，miss 时用 local MTP 兜底）
+3. **批量 NCCL**：所有 seq 的 early hidden 打包成一条消息发送，避免多次 NCCL 通信开销
+4. **Tree Cache 预计算**：Fan-out=3 意味着每个位置预计算 3 个分支，下一步几乎必然命中
+5. **非阻塞异步发送**：`dist.isend()` 不阻塞 Target 的后续层计算
+
+#### 四、时间线
+
+```
+Target:  [==== Verify Forward (layers 0..N-X) ====][send hidden][layers N-X+1..N][Accept]
+Draft:                                              [recv hidden][Build Tree Cache =========]
+                                                                  ↑ 与 Target 最后 X 层并行
+
+Next Step:
+Target:  [Cache Lookup (fast!)][==== Verify Forward ====] ...
+Draft:   [Respond K tokens    ][                        ] ...
+```
+
+核心优势在于：Draft 的树缓存构建与 Target 的最后几层计算**重叠执行**，使得下一步的投机查找几乎免费，从而实现比同步 MTP 更高的吞吐量（长序列场景下可达 2.6x 加速）。
+
 ### 3. EAGLE 投机解码
 
 外部草稿模型（`nanovllm/models/eagle.py`）。使用轻量单层 Transformer 作为草稿。
