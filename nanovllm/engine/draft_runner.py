@@ -239,7 +239,7 @@ class MTPDraftRunner:
         self._reset_tree_cache()
         self.last_hidden = {}
         # Pre-allocate recv buffers
-        self._cmd_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._cmd_buf = torch.zeros(2, dtype=torch.int64, device=self.device)
 
         print(f"[MTPDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}, tree_decode={self.tree_decode}", flush=True)
 
@@ -548,13 +548,9 @@ class MTPDraftRunner:
         dist.send(resp, dst=0, group=self.async_pg)
         # Cache is populated by early_speculate (cmd=5) during next verify
 
-    def handle_early_speculate(self):
+    def handle_early_speculate(self, num_seqs):
         """Receive batched early hidden for all seqs from target.
         For each seq: norm → lm_head → topF → embed → MTP → cache."""
-        # Receive num_seqs
-        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
-        dist.recv(ns_buf, src=0, group=self.async_pg)
-        num_seqs = int(ns_buf[0].item())
 
         # Receive per-seq metadata: [sid, nv, ntok, btlen, spos] * num_seqs
         meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
@@ -721,11 +717,11 @@ class MTPDraftRunner:
                 offset += total
 
     def handle_cache_lookup(self):
-        """Batched cache lookup: receive all seqs' queries in one message, respond in one message."""
-        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
-        dist.recv(ns_buf, src=0, group=self.async_pg)
-        n_seqs = int(ns_buf[0].item())
-        lookup = torch.zeros(n_seqs * 3, dtype=torch.int64, device=self.device)
+        """Batched cache lookup: n_seqs from _cmd_buf[1], then receive lookup data."""
+        n_seqs = int(self._cmd_buf[1].item())
+        if not hasattr(self, '_lookup_recv_buf'):
+            self._lookup_recv_buf = torch.zeros(512 * 3, dtype=torch.int64, device=self.device)
+        lookup = self._lookup_recv_buf[:n_seqs * 3]
         if n_seqs > 0:
             dist.recv(lookup, src=0, group=self.async_pg)
         result = torch.zeros(n_seqs * self.K, dtype=torch.int64, device=self.device)
@@ -799,8 +795,9 @@ class MTPDraftRunner:
                 self.handle_cleanup()
             elif cmd == 4:  # cache_update from target
                 self.handle_cache_update()
-            elif cmd == 5:  # early_speculate: target sent early hidden during verify
-                self.handle_early_speculate()
+            elif cmd == 5:  # early_speculate: target sent [cmd, num_seqs] in _cmd_buf
+                num_seqs = int(self._cmd_buf[1].item())
+                self.handle_early_speculate(num_seqs)
             elif cmd == 6:  # cache_lookup: lightweight hit query
                 self.handle_cache_lookup()
             elif cmd == 2:
@@ -898,7 +895,7 @@ class EAGLEDraftRunner:
         self.tree_decode = config.ssd_tree_decode
         self._reset_tree_cache()
         self.last_hidden = {}
-        self._cmd_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+        self._cmd_buf = torch.zeros(2, dtype=torch.int64, device=self.device)
 
         print(f"[EAGLEDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}", flush=True)
         print(f"[EAGLEDraftRunner] norm.weight norm={self.draft_model.model.norm.weight.data.norm().item():.4f}", flush=True)
@@ -1058,11 +1055,12 @@ class EAGLEDraftRunner:
         ack = torch.ones(1, dtype=torch.int64, device=self.device)
         dist.send(ack, dst=0, group=self.async_pg)
 
-    def handle_early_speculate(self):
+    def handle_early_speculate(self, num_seqs=None):
         """Receive early hidden from target, build tree cache with EAGLE."""
-        ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
-        dist.recv(ns_buf, src=0, group=self.async_pg)
-        num_seqs = int(ns_buf[0].item())
+        if num_seqs is None:
+            ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
+            dist.recv(ns_buf, src=0, group=self.async_pg)
+            num_seqs = int(ns_buf[0].item())
 
         meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
@@ -1306,7 +1304,8 @@ class EAGLEDraftRunner:
             elif cmd == 3:
                 self.handle_cleanup()
             elif cmd == 5:
-                self.handle_early_speculate()
+                num_seqs = int(self._cmd_buf[1].item())
+                self.handle_early_speculate(num_seqs)
             elif cmd == 6:
                 self.handle_cache_lookup()
             elif cmd == 2:

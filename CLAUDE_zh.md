@@ -219,6 +219,29 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync3
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python bench_ssd.py --mode async3 --early-layers 2 --fan-out 3
 ```
 
+## 性能分析与优化流程
+
+### 使用 torch.profiler 生成火焰图
+
+生成 Chrome trace JSON 文件，在 [Perfetto UI](https://ui.perfetto.dev/) 或 `chrome://tracing` 中查看 timeline 和火焰图：
+
+```bash
+# 分析同步 MTP
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python experiments/profile_ssd.py --mode sync1 --prompts 3
+
+# 分析异步 SSD（双卡）
+NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd.py --mode async1 --prompts 3
+```
+
+输出 `*.json.gz` trace 文件，拖入 Perfetto UI 查看 timeline 和火焰图。
+
+### 优化检查清单
+
+- 检查 GPU 利用率：若 Self CPU >> Self CUDA，瓶颈在 CPU 侧（tensor 创建、H2D 拷贝）
+- 检查 NCCL 开销：profiler 输出中 `ncclDevKernel_SendRecv` 和 `nccl:recv` 的占比
+- 排查 dead code：计算结果从未被读取的代码（如 `_last_candidates` 的 norm→lm_head→topk 预计算耗费 6ms/step 但从未使用）
+- 评估 MTP KV update 必要性：单层 MTP 的 KV cache 在 draft 阶段已写入，verify 后无需重跑
+
 ## 性能（MiMo-7B-Base, H100, 50 prompts, max_tokens=256）
 
 | 模式 | tok/s | pos0 接受率 | pos1 | pos2 |

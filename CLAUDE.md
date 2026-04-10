@@ -213,6 +213,29 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync3
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python bench_ssd.py --mode async3 --early-layers 2 --fan-out 3
 ```
 
+## Profiling & Optimization Workflow
+
+### Profiling with torch.profiler
+
+Generate Chrome trace JSON for viewing in [Perfetto UI](https://ui.perfetto.dev/) or `chrome://tracing`:
+
+```bash
+# Profile sync MTP
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python experiments/profile_ssd.py --mode sync1 --prompts 3
+
+# Profile async SSD (2 GPUs)
+NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd.py --mode async1 --prompts 3
+```
+
+Output: `*.json.gz` trace files. Open in Perfetto for timeline view and flame chart.
+
+### Optimization checklist
+
+- Check GPU utilization: if Self CPU >> Self CUDA, the bottleneck is CPU-side (tensor creation, H2D copies)
+- Check NCCL time: `ncclDevKernel_SendRecv` and `nccl:recv` in profiler output
+- Look for dead code: computations whose results are never read (e.g. `_last_candidates` was norm→lm_head→topk costing 6ms/step, never used)
+- Verify MTP KV update necessity: for single-layer MTP, draft phase already writes correct KV; post-verify update is redundant
+
 ## Performance (MiMo-7B-Base, H100, 50 prompts, max_tokens=256)
 
 | Mode | tok/s | pos0 accept | pos1 | pos2 |

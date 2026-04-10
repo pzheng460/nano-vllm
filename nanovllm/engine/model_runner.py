@@ -118,10 +118,12 @@ class ModelRunner:
         # Pre-allocate NCCL buffers for SSD communication
         if self.draft_async and rank == 0:
             d = self.device.device_name
-            self._cmd_buf = torch.zeros(1, dtype=torch.int64, device=d)
-            self._meta_buf = torch.zeros(8, dtype=torch.int64, device=d)
-            self._hidden_buf = torch.zeros(1, hf_config.hidden_size, dtype=hf_config.torch_dtype, device=d)
-            self._draft_tokens_buf = torch.zeros(config.num_speculative_tokens, dtype=torch.int64, device=d)
+            max_seqs = config.max_num_seqs
+            K = config.num_speculative_tokens
+            self._cmd_buf = torch.zeros(2, dtype=torch.int64, device=d)
+            # Spec phase pre-allocated buffers
+            self._lookup_buf = torch.zeros(1 + max_seqs * 3, dtype=torch.int64, device=d)
+            self._result_buf = torch.zeros(max_seqs * K, dtype=torch.int64, device=d)
 
         if self.tp_size > 1:
             if rank == 0:
@@ -801,11 +803,12 @@ class ModelRunner:
             return all_accepted
         return None
 
-    def _send_cmd(self, cmd: int):
-        """Send command to draft via NCCL."""
+    def _send_cmd(self, cmd: int, aux: int = 0):
+        """Send command to draft via NCCL. [cmd, aux] in one message."""
         if not hasattr(self, '_cmd_buf'):
             return
         self._cmd_buf[0] = cmd
+        self._cmd_buf[1] = aux
         dist.send(self._cmd_buf, dst=self.draft_rank, group=self.async_pg)
 
     @torch.inference_mode()
@@ -944,18 +947,21 @@ class ModelRunner:
                     dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
                     all_draft_tokens.append(jit_buf.tolist())
             else:
-                # MTP path: batched NCCL lookup (1 round-trip for all seqs)
+                # MTP path: batched NCCL lookup — merged cmd+ns+lookup into 1 send
                 if not hasattr(self, '_cache_hit'):
                     self._cache_hit = 0
                     self._cache_miss = 0
-                self._send_cmd(6)
-                ns_t = torch.tensor([len(seqs)], dtype=torch.int64, device=d)
-                lookup_data = torch.tensor(
-                    [v for seq in seqs for v in (seq.seq_id, seq.last_accepted_len, seq.last_token)],
-                    dtype=torch.int64, device=d)
-                dist.send(ns_t, dst=self.draft_rank, group=self.async_pg)
-                dist.send(lookup_data, dst=self.draft_rank, group=self.async_pg)
-                result_buf = torch.zeros(len(seqs) * k, dtype=torch.int64, device=d)
+                n = len(seqs)
+                self._send_cmd(6, n)
+                # Pack lookup data into pre-allocated buffer
+                buf = self._lookup_buf[:n * 3]
+                for i, seq in enumerate(seqs):
+                    buf[i*3] = seq.seq_id
+                    buf[i*3 + 1] = seq.last_accepted_len
+                    buf[i*3 + 2] = seq.last_token
+                dist.send(buf, dst=self.draft_rank, group=self.async_pg)
+                result_buf = self._result_buf[:n * k]
+                result_buf.zero_()
                 dist.recv(result_buf, src=self.draft_rank, group=self.async_pg)
                 result_list = result_buf.tolist()
                 for i in range(len(seqs)):
@@ -1027,8 +1033,8 @@ class ModelRunner:
                 early_hidden_all = (hidden_states + residual).clone()
                 # Non-blocking sends: overlap with remaining layers
                 num_seqs_batch = len(seqs)
-                cmd_t = torch.tensor([5], dtype=torch.int64, device=d)
-                ns_t = torch.tensor([num_seqs_batch], dtype=torch.int64, device=d)
+                self._cmd_buf[0] = 5
+                self._cmd_buf[1] = num_seqs_batch
                 meta_list = []
                 bt_list = []
                 pos_list = []
@@ -1043,8 +1049,7 @@ class ModelRunner:
                 bt_t = torch.tensor(bt_list, dtype=torch.int32, device=d)
                 pos_t = torch.tensor(pos_list, dtype=torch.int64, device=d)
                 _async_send_handles = [
-                    dist.isend(cmd_t, dst=self.draft_rank, group=self.async_pg),
-                    dist.isend(ns_t, dst=self.draft_rank, group=self.async_pg),
+                    dist.isend(self._cmd_buf, dst=self.draft_rank, group=self.async_pg),
                     dist.isend(meta_t, dst=self.draft_rank, group=self.async_pg),
                     dist.isend(early_hidden_all, dst=self.draft_rank, group=self.async_pg),
                     dist.isend(bt_t, dst=self.draft_rank, group=self.async_pg),
