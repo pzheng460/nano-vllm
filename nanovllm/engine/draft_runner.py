@@ -584,38 +584,28 @@ class MTPDraftRunner:
         early_logits_all = self.compute_logits_all(normed_all)
         _, cands_all = torch.topk(early_logits_all, fan, dim=-1)  # (total_nv, fan)
 
-        # 2. Build per-seq expanded tensors, then concatenate
-        all_flat_cands = []
-        all_flat_hidden = []
+        # 2. Batch expand: all positions x fan candidates (fully vectorized)
+        # cands_all: (total_nv, fan), early_hidden_all: (total_nv, hidden)
+        batch_cands = cands_all.reshape(-1)                           # (total_nv * fan,)
+        batch_hidden = early_hidden_all.repeat_interleave(fan, dim=0) # (total_nv * fan, hidden)
+        batch_pos = all_pos.repeat_interleave(fan)                    # (total_nv * fan,)
+        batch_embeds = self.embed_tokens(batch_cands)
+
+        # Build per-seq metadata for tree cache keys
         all_flat_acc_lens = []
-        all_flat_pos = []
         all_flat_sids = []
+        per_seq_meta = []
+        bt_off = 0
+        grand_total = 0
         all_slot_list = []
         all_ctx_lens = []
         all_bt_rows = []
-        # For tree decode: per-seq base_vpos and max_bi
-        per_seq_meta = []  # (total_per_seq, base_vpos, max_bi, block_table)
-
-        h_off = 0
-        bt_off = 0
-        grand_total = 0
         for sid, nv, ntok, btlen, spos in seq_infos:
-            cands = cands_all[h_off:h_off+nv]  # (nv, fan)
-            early_hidden = early_hidden_all[h_off:h_off+nv]
-            block_table = all_bt[bt_off:bt_off+btlen]
-            verify_pos = all_pos[h_off:h_off+nv]
-
             total = nv * fan
-            flat_cands = cands.reshape(-1)
-            flat_hidden = early_hidden.repeat_interleave(fan, dim=0)
+            block_table = all_bt[bt_off:bt_off+btlen]
             flat_acc_lens = torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan)
-            flat_pos = verify_pos.repeat_interleave(fan)
             flat_sids = torch.full((total,), sid, dtype=torch.int64, device=d)
-
-            all_flat_cands.append(flat_cands)
-            all_flat_hidden.append(flat_hidden)
             all_flat_acc_lens.append(flat_acc_lens)
-            all_flat_pos.append(flat_pos)
             all_flat_sids.append(flat_sids)
 
             if self.tree_decode and self.K > 1:
@@ -623,25 +613,19 @@ class MTPDraftRunner:
                 base_vpos = spos + nv
                 per_seq_meta.append((total, base_vpos, max_bi, block_table, grand_total))
             else:
-                # Chain: compute slots from flat_pos
-                for p in flat_pos.tolist():
-                    p = int(p)
-                    all_slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
+                # Vectorized slot computation (no Python loop)
+                flat_pos = batch_pos[grand_total:grand_total+total]
+                bi = (flat_pos // self.block_size).long()
+                bo = (flat_pos % self.block_size).int()
+                all_slot_list.append((block_table[bi] * self.block_size + bo).int())
                 all_ctx_lens.append((flat_pos + 1).to(torch.int32))
-                bt_exp = block_table.unsqueeze(0).expand(total, -1)
-                all_bt_rows.append(bt_exp)
+                all_bt_rows.append(block_table.unsqueeze(0).expand(total, -1))
 
             grand_total += total
-            h_off += nv
             bt_off += btlen
 
-        # Concatenate all seqs
-        batch_cands = torch.cat(all_flat_cands)
-        batch_hidden = torch.cat(all_flat_hidden)
         batch_acc_lens = torch.cat(all_flat_acc_lens)
-        batch_pos = torch.cat(all_flat_pos)
         batch_sids = torch.cat(all_flat_sids)
-        batch_embeds = self.embed_tokens(batch_cands)
 
         if self.tree_decode and self.K > 1:
             # 3a. Batched tree decode: K steps for ALL seqs' candidates at once
@@ -688,17 +672,10 @@ class MTPDraftRunner:
                 offset += total
         else:
             # 3b. Batched chain: single MTP step for ALL seqs' candidates
-            batch_slots = torch.tensor(all_slot_list, dtype=torch.int32, device=d)
+            batch_slots = torch.cat(all_slot_list)
             batch_ctxs = torch.cat(all_ctx_lens)
             max_bt_len = max(bt.shape[1] for bt in all_bt_rows)
-            padded = []
-            for bt in all_bt_rows:
-                if bt.shape[1] < max_bt_len:
-                    pad = torch.zeros(bt.shape[0], max_bt_len - bt.shape[1], dtype=torch.int32, device=d)
-                    padded.append(torch.cat([bt, pad], dim=1))
-                else:
-                    padded.append(bt)
-            batch_bt = torch.cat(padded).contiguous()
+            batch_bt = torch.cat([F.pad(bt, (0, max_bt_len - bt.shape[1])) for bt in all_bt_rows]).contiguous()
 
             set_context(False, slot_mapping=batch_slots, context_lens=batch_ctxs, block_tables=batch_bt)
             normed_out, _ = self.mtp_layer(batch_embeds, batch_hidden, batch_pos)
