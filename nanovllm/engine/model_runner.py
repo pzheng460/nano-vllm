@@ -905,7 +905,7 @@ class ModelRunner:
                                                 dtype=torch.int64, device=d)
                             match = torch.all(req == keys, dim=1)
                             if match.any():
-                                idx = match.float().argmax().item()
+                                idx = match.float().argmax().tolist()
                                 all_draft_tokens.append(tokens[idx, :k].tolist())
                                 self._cache_hit += 1
                                 continue
@@ -919,8 +919,8 @@ class ModelRunner:
                                                     dtype=torch.int64, device=d)
                                 match = torch.all(req == keys, dim=1)
                                 if match.any():
-                                    idx = match.float().argmax().item()
-                                    cur_token = tokens[idx, 0].item()
+                                    idx = match.float().argmax().tolist()
+                                    cur_token = tokens[idx, 0].tolist()
                                     draft_tokens.append(cur_token)
                                     if step == 0:
                                         hit = True
