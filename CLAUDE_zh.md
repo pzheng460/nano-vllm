@@ -259,8 +259,17 @@ NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd
 | 异步 EAGLE SSD K=3（tree） | 78.3 | 66% | 40% | 13% |
 | 异步 EAGLE SSD K=2（tree） | 75.3 | 65% | 32% | - |
 
+### 性能（Qwen2-7B + EAGLE, H100, bs=50, max_tokens=256）
+
+| 模式 | tok/s | pos0 | pos1 | pos2 |
+|------|-------|------|------|------|
+| 同步 EAGLE K=2（batched） | 1541 | 48% | 17% | - |
+| 同步 EAGLE K=3（batched） | 1493 | 46% | 18% | 9% |
+| 异步 EAGLE SSD K=3（tree） | 1079 | 48% | 21% | 7% |
+
 注意事项：
-- 异步 EAGLE K=2 达到 75.3 tok/s（比基线快 44%），draft 完全被掩盖
+- **bs=1 时异步 K=3（80.0）超过同步 K=3（78.4）** — draft 完全被掩盖，比基线快 53%
+- bs=50 时同步更快（batched EAGLE draft 在大 batch 下高效）
 - K>1 时必须使用 `ssd_tree_decode=True`（chain 模式只做 1 步 draft）
 - EAGLE 对 `ssd_early_layers=1` 最优（多层时接受率大幅下降）
 - 同步 EAGLE draft 已 batch 化（所有 seq 一起处理，非逐 seq 串行）

@@ -250,11 +250,21 @@ Output: `*.json.gz` trace files. Open in Perfetto for timeline view and flame ch
 |------|-------|------|------|------|
 | Baseline (no spec) | 52.4 | - | - | - |
 | Sync EAGLE K=3 (batched) | 78.4 | 63% | 37% | 10% |
-| Async EAGLE SSD K=3 (tree) | 78.3 | 66% | 40% | 13% |
+| **Async EAGLE SSD K=3 (tree)** | **80.0** | 66% | 40% | 13% |
 | Async EAGLE SSD K=2 (tree) | 75.3 | 65% | 32% | - |
 
+### Performance (Qwen2-7B + EAGLE, H100, bs=50, max_tokens=256)
+
+| Mode | tok/s | pos0 | pos1 | pos2 |
+|------|-------|------|------|------|
+| Sync EAGLE K=2 (batched) | 1541 | 48% | 17% | - |
+| Sync EAGLE K=3 (batched) | 1493 | 46% | 18% | 9% |
+| Async EAGLE SSD K=3 (tree) | 1079 | 48% | 21% | 7% |
+| Async EAGLE SSD K=2 (tree) | 1051 | 54% | 24% | - |
+
 Notes:
-- Async EAGLE K=2 achieves 75.3 tok/s (+44% over baseline) with draft fully hidden
+- **bs=1: Async K=3 (80.0) beats Sync K=3 (78.4)** — draft fully hidden, 53% faster than baseline
+- bs=50: Sync wins due to higher accept rate (batched EAGLE draft is efficient at large batch)
 - `ssd_tree_decode=True` is required for K>1 (chain mode only runs 1 draft step)
 - `ssd_early_layers=1` is optimal for EAGLE (more layers = worse accept rate)
 - Sync EAGLE draft is batched (all seqs together per step, not per-seq serial)
