@@ -103,13 +103,13 @@ class LLMEngine:
                     mr._local_tree_cache = {}
                 sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
                 dist.recv(sz_buf, src=mr.draft_rank, group=mr.async_pg)
-                buf_size = int(sz_buf[0].item())
+                buf_size = int(sz_buf[0].tolist())
                 push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
                 dist.recv(push_buf, src=mr.draft_rank, group=mr.async_pg)
                 idx = 0
-                n_push = int(push_buf[idx].item()); idx += 1
+                n_push = int(push_buf[idx].tolist()); idx += 1
                 for _ in range(n_push):
-                    sid = int(push_buf[idx].item()); n_e = int(push_buf[idx+1].item()); K_a = int(push_buf[idx+2].item()); idx += 3
+                    sid = int(push_buf[idx].tolist()); n_e = int(push_buf[idx+1].tolist()); K_a = int(push_buf[idx+2].tolist()); idx += 3
                     if n_e > 0:
                         keys = push_buf[idx:idx+n_e*3].reshape(n_e, 3).clone(); idx += n_e*3
                         tokens = push_buf[idx:idx+n_e*K_a].reshape(n_e, K_a).clone(); idx += n_e*K_a
