@@ -1044,6 +1044,7 @@ class EAGLEDraftRunner:
         meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
 
+        meta_list = meta.tolist()
         seq_infos = []
         total_nv = 0
         total_bt = 0
