@@ -243,3 +243,18 @@ Output: `*.json.gz` trace files. Open in Perfetto for timeline view and flame ch
 | Sync MTP K=1 | 381.9 | 86.5% | - | - |
 | Sync MTP K=3 | 257.6 | 84.0% | 22.7% | 5.9% |
 | Async SSD K=3 | 406.5 | 72.0% | 8.2% | 0.2% |
+
+## Performance (Qwen2-7B + EAGLE, H100, bs=1, max_tokens=256)
+
+| Mode | tok/s | pos0 | pos1 | pos2 |
+|------|-------|------|------|------|
+| Baseline (no spec) | 52.4 | - | - | - |
+| Sync EAGLE K=3 (batched) | 78.4 | 63% | 37% | 10% |
+| Async EAGLE SSD K=3 (tree) | 78.3 | 66% | 40% | 13% |
+| Async EAGLE SSD K=2 (tree) | 75.3 | 65% | 32% | - |
+
+Notes:
+- Async EAGLE K=2 achieves 75.3 tok/s (+44% over baseline) with draft fully hidden
+- `ssd_tree_decode=True` is required for K>1 (chain mode only runs 1 draft step)
+- `ssd_early_layers=1` is optimal for EAGLE (more layers = worse accept rate)
+- Sync EAGLE draft is batched (all seqs together per step, not per-seq serial)
