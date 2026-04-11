@@ -955,83 +955,66 @@ class ModelRunner:
                     dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
                     all_draft_tokens.append(jit_buf.tolist())
             else:
-                # MTP path: local tree cache lookup (same as EAGLE, push mode)
-                if not hasattr(self, '_local_tree_cache'):
-                    self._local_tree_cache = {}
+                # MTP path: batched NCCL lookup — merged cmd+ns+lookup into 1 send
                 if not hasattr(self, '_cache_hit'):
                     self._cache_hit = 0
                     self._cache_miss = 0
-                for seq in seqs:
-                    local_cache = self._local_tree_cache.get(seq.seq_id)
-                    if local_cache is not None:
-                        keys, tokens = local_cache
-                        acc_len = seq.last_accepted_len
-                        if tokens.shape[1] >= k:
-                            req = torch.tensor([[seq.seq_id, acc_len, seq.last_token]],
-                                                dtype=torch.int64, device=d)
-                            match = torch.all(req == keys, dim=1)
-                            if match.any():
-                                idx = match.float().argmax().tolist()
-                                all_draft_tokens.append(tokens[idx, :k].tolist())
-                                self._cache_hit += 1
-                                continue
-                        else:
-                            draft_tokens = []
-                            cur_token = seq.last_token
-                            hit = False
-                            for step in range(k):
-                                req = torch.tensor([[seq.seq_id, acc_len + step, cur_token]],
-                                                    dtype=torch.int64, device=d)
-                                match = torch.all(req == keys, dim=1)
-                                if match.any():
-                                    idx = match.float().argmax().tolist()
-                                    cur_token = tokens[idx, 0].tolist()
-                                    draft_tokens.append(cur_token)
-                                    if step == 0:
-                                        hit = True
-                                else:
-                                    draft_tokens.extend([0] * (k - step))
-                                    break
-                            if hit:
-                                all_draft_tokens.append(draft_tokens)
-                                self._cache_hit += 1
-                                continue
-                    # Cache miss: local MTP fallback
-                    self._cache_miss += 1
-                    embed_tokens = self.model.model.embed_tokens
-                    target_hidden = self.last_hidden[seq.seq_id]
-                    draft_tokens = []
-                    cur_token_id = seq.last_token
-                    cur_pos = len(seq) - 1
-                    for step in range(k):
-                        input_id = self.device.to_device(
-                            torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
-                        p = self.device.to_device(
-                            torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
-                        bi = cur_pos // self.block_size
-                        bo = cur_pos % self.block_size
-                        slot = seq.block_table[bi] * self.block_size + bo
-                        slot_map = self.device.to_device(
-                            torch.tensor([slot], dtype=torch.int32, pin_memory=True))
-                        bt = seq.block_table
-                        if self.config.num_sink_blocks > 0:
-                            bt = list(range(self.config.num_sink_blocks)) + bt
-                        sink_ctx_ssd = self.config.num_sink_blocks * self.block_size
-                        block_table_t = self.device.to_device(
-                            torch.tensor([bt], dtype=torch.int32, pin_memory=True))
-                        context_lens = self.device.to_device(
-                            torch.tensor([cur_pos + 1 + sink_ctx_ssd], dtype=torch.int32, pin_memory=True))
-                        set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table_t)
-                        token_embeds = embed_tokens(input_id)
-                        mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, p)
-                        reset_context()
-                        draft_logits = self.model.compute_logits_all(mtp_normed)
-                        d_token = draft_logits.argmax(dim=-1).item()
-                        draft_tokens.append(d_token)
-                        target_hidden = mtp_normed
-                        cur_token_id = d_token
-                        cur_pos += 1
-                    all_draft_tokens.append(draft_tokens)
+                n = len(seqs)
+                self._send_cmd(6, n)
+                # Pack lookup data into pre-allocated buffer
+                buf = self._lookup_buf[:n * 3]
+                for i, seq in enumerate(seqs):
+                    buf[i*3] = seq.seq_id
+                    buf[i*3 + 1] = seq.last_accepted_len
+                    buf[i*3 + 2] = seq.last_token
+                dist.send(buf, dst=self.draft_rank, group=self.async_pg)
+                result_buf = self._result_buf[:n * k]
+                result_buf.zero_()
+                dist.recv(result_buf, src=self.draft_rank, group=self.async_pg)
+                result_list = result_buf.tolist()
+                for i in range(len(seqs)):
+                    tokens = result_list[i*k:(i+1)*k]
+                    if tokens[0] != 0:
+                        all_draft_tokens.append(tokens)
+                        self._cache_hit += 1
+                    else:
+                        # Cache miss: local MTP fallback
+                        self._cache_miss += 1
+                        seq = seqs[i]
+                        embed_tokens = self.model.model.embed_tokens
+                        target_hidden = self.last_hidden[seq.seq_id]
+                        draft_tokens = []
+                        cur_token_id = seq.last_token
+                        cur_pos = len(seq) - 1
+                        for step in range(k):
+                            input_id = self.device.to_device(
+                                torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
+                            p = self.device.to_device(
+                                torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
+                            bi = cur_pos // self.block_size
+                            bo = cur_pos % self.block_size
+                            slot = seq.block_table[bi] * self.block_size + bo
+                            slot_map = self.device.to_device(
+                                torch.tensor([slot], dtype=torch.int32, pin_memory=True))
+                            bt = seq.block_table
+                            if self.config.num_sink_blocks > 0:
+                                bt = list(range(self.config.num_sink_blocks)) + bt
+                            sink_ctx_ssd = self.config.num_sink_blocks * self.block_size
+                            block_table_t = self.device.to_device(
+                                torch.tensor([bt], dtype=torch.int32, pin_memory=True))
+                            context_lens = self.device.to_device(
+                                torch.tensor([cur_pos + 1 + sink_ctx_ssd], dtype=torch.int32, pin_memory=True))
+                            set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table_t)
+                            token_embeds = embed_tokens(input_id)
+                            mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, p)
+                            reset_context()
+                            draft_logits = self.model.compute_logits_all(mtp_normed)
+                            d_token = draft_logits.argmax(dim=-1).item()
+                            draft_tokens.append(d_token)
+                            target_hidden = mtp_normed
+                            cur_token_id = d_token
+                            cur_pos += 1
+                        all_draft_tokens.append(draft_tokens)
 
         # Broadcast draft tokens to TP workers
         if self.tp_size > 1:
@@ -1124,7 +1107,7 @@ class ModelRunner:
         # (MTP KV only needed for cache miss local fallback, which is rare)
 
         # Mark push as pending — will be received at the beginning of next step
-        if self.rank == 0 and self.async_pg is not None and len(_async_send_handles) > 0:
+        if eagle_async and self.rank == 0 and self.async_pg is not None:
             self._push_pending = True
 
         if self.rank == 0:

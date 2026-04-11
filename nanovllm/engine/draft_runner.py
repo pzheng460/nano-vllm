@@ -694,23 +694,6 @@ class MTPDraftRunner:
                 self.tree_caches[sid] = (keys, draft_tokens[offset:offset+total].unsqueeze(1))
                 offset += total
 
-        # Push tree cache to target (same protocol as EAGLE)
-        d = self.device
-        parts = [torch.tensor([num_seqs], dtype=torch.int64, device=d)]
-        for sid, nv, ntok, btlen, spos in seq_infos:
-            if sid in self.tree_caches:
-                keys, tokens = self.tree_caches[sid]
-                n = keys.shape[0]
-                K_a = tokens.shape[1] if tokens.dim() > 1 else 1
-                parts.append(torch.tensor([sid, n, K_a], dtype=torch.int64, device=d))
-                parts.append(keys.reshape(-1).to(torch.int64))
-                parts.append(tokens.reshape(-1).to(torch.int64))
-            else:
-                parts.append(torch.tensor([sid, 0, 0], dtype=torch.int64, device=d))
-        push_buf = torch.cat(parts)
-        dist.send(torch.tensor([push_buf.shape[0]], dtype=torch.int64, device=d), dst=0, group=self.async_pg)
-        dist.send(push_buf, dst=0, group=self.async_pg)
-
     def handle_cache_lookup(self):
         """Batched cache lookup: n_seqs from _cmd_buf[1], then receive lookup data."""
         n_seqs = int(self._cmd_buf[1].item())
