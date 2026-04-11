@@ -559,58 +559,67 @@ class ModelRunner:
         k = self.num_speculative_tokens
         all_draft_tokens = []  # per-seq draft token lists
 
-        # === Draft phase (per-seq, eager) ===
-        for seq in seqs:
-            target_hidden = self.last_hidden[seq.seq_id]
-            draft_tokens = []
-            cur_token_id = seq.last_token
-            cur_pos = len(seq) - 1
-            for step in range(k):
-                input_id = self.device.to_device(
-                    torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
-                pos = self.device.to_device(
-                    torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
-                # Slot mapping for draft KV cache
-                block_idx = cur_pos // self.block_size
-                block_offset = cur_pos % self.block_size
-                slot = seq.block_table[block_idx] * self.block_size + block_offset
-                slot_map = self.device.to_device(
-                    torch.tensor([slot], dtype=torch.int32, pin_memory=True))
-                block_table = self.device.to_device(
-                    torch.tensor([seq.block_table], dtype=torch.int32, pin_memory=True))
-                context_lens = self.device.to_device(
-                    torch.tensor([cur_pos + 1], dtype=torch.int32, pin_memory=True))
-                set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table)
-                if getattr(self, '_is_eagle3', False):
-                    # EAGLE3: aux_hiddens only for step 0 (from target); step 1+ uses None (fc uses tripled hidden)
-                    aux_h = self._last_aux_hidden.get(seq.seq_id) if (step == 0 and hasattr(self, '_last_aux_hidden')) else None
-                    draft_hidden = self.draft_model(input_id, pos, target_hidden, aux_hiddens=aux_h)
+        # === Draft phase (batched: all seqs together per step) ===
+        d = self.device.device_name
+        n_seqs = len(seqs)
+        block_tables = self.prepare_block_tables(seqs)
+        cur_tokens = [seq.last_token for seq in seqs]
+        cur_positions = [len(seq) - 1 for seq in seqs]
+        cur_hiddens = torch.cat([self.last_hidden[seq.seq_id] for seq in seqs], dim=0)
+        is_eagle3 = getattr(self, '_is_eagle3', False)
+        all_draft_tokens = [[] for _ in seqs]
+
+        for step in range(k):
+            input_ids = self.device.to_device(torch.tensor(cur_tokens, dtype=torch.int64, pin_memory=True))
+            positions = self.device.to_device(torch.tensor([p for p in [len(seq) - 1 + step for seq in seqs]], dtype=torch.int64, pin_memory=True))
+            # Compute slot mapping for all seqs
+            slots = []
+            ctx_lens = []
+            for i, seq in enumerate(seqs):
+                p = len(seq) - 1 + step
+                bi = p // self.block_size
+                bo = p % self.block_size
+                slots.append(seq.block_table[bi] * self.block_size + bo)
+                ctx_lens.append(p + 1)
+            slot_map = self.device.to_device(torch.tensor(slots, dtype=torch.int32, pin_memory=True))
+            ctx_lens_t = self.device.to_device(torch.tensor(ctx_lens, dtype=torch.int32, pin_memory=True))
+            set_context(False, slot_mapping=slot_map, context_lens=ctx_lens_t, block_tables=self.prepare_block_tables(seqs))
+
+            if is_eagle3:
+                aux_h = None
+                if step == 0 and hasattr(self, '_last_aux_hidden'):
+                    aux_list = [self._last_aux_hidden.get(seq.seq_id) for seq in seqs]
+                    if all(a is not None for a in aux_list):
+                        aux_h = torch.cat(aux_list, dim=0)
+                draft_hidden = self.draft_model(input_ids, positions, cur_hiddens, aux_hiddens=aux_h)
+            else:
+                draft_hidden = self.draft_model(input_ids, positions, cur_hiddens)
+            reset_context()
+
+            # Get draft logits
+            if getattr(self, '_is_eagle3', False):
+                draft_logits = self.draft_model.compute_logits(draft_hidden)
+                if self.rank == 0:
+                    draft_ids = draft_logits.argmax(dim=-1)
+                    tokens = self.draft_model.d2t[draft_ids].tolist()
                 else:
-                    draft_hidden = self.draft_model(input_id, pos, target_hidden)
-                reset_context()
-                # Get draft logits
-                if getattr(self, '_is_eagle3', False):
-                    # EAGLE3: draft logits in reduced vocab → map to target vocab
-                    draft_logits = self.draft_model.compute_logits(draft_hidden)
-                    if self.rank == 0:
-                        draft_id = draft_logits.argmax(dim=-1).item()
-                        d_token = self.draft_model.d2t[draft_id].item()
+                    tokens = [0] * n_seqs
+            else:
+                draft_logits = self.model.compute_logits_all(draft_hidden)
+                if self.rank == 0:
+                    tokens = draft_logits.argmax(dim=-1).tolist()
                 else:
-                    draft_logits = self.model.compute_logits_all(draft_hidden)
-                if self.rank == 0 and not getattr(self, '_is_eagle3', False):
-                    d_token = draft_logits.argmax(dim=-1).item()
-                elif self.rank != 0:
-                    d_token = 0
-                # Broadcast draft token in TP
-                if self.tp_size > 1:
-                    d_tensor = torch.tensor([d_token], dtype=torch.int64, device=self.device.device_name)
-                    dist.broadcast(d_tensor, 0, group=self.tp_group)
-                    d_token = d_tensor.item()
-                draft_tokens.append(d_token)
-                target_hidden = draft_hidden
-                cur_token_id = d_token
-                cur_pos += 1
-            all_draft_tokens.append(draft_tokens)
+                    tokens = [0] * n_seqs
+
+            if self.tp_size > 1:
+                t = torch.tensor(tokens, dtype=torch.int64, device=d)
+                dist.broadcast(t, 0, group=self.tp_group)
+                tokens = t.tolist()
+
+            for i in range(n_seqs):
+                all_draft_tokens[i].append(tokens[i])
+            cur_tokens = tokens
+            cur_hiddens = draft_hidden
 
         # === Verify phase (target model, prefill-like) ===
         input_ids, positions = self._prepare_verify(seqs, all_draft_tokens)
