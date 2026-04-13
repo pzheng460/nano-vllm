@@ -442,9 +442,11 @@ class ModelRunner:
         return token_ids
 
     def _get_eagle3_aux_layers(self):
-        """Get auxiliary layer indices for EAGLE3: (2, N//2, N-3)."""
+        """Get auxiliary layer indices for EAGLE3.
+        vLLM captures the INPUT to layer i, which equals the OUTPUT of layer i-1.
+        So we extract after layers (1, N//2-1, N-4)."""
         N = self.config.hf_config.num_hidden_layers
-        return (2, N // 2, N - 3)
+        return (1, N // 2 - 1, N - 4)
 
     def _run_target_with_aux(self, input_ids, positions):
         """Run target model layer-by-layer, extracting aux hidden states for EAGLE3."""
@@ -1057,7 +1059,7 @@ class ModelRunner:
         eagle3 = getattr(self.config, 'eagle3', False) and self.config.eagle_async
         if eagle3:
             # EAGLE-3: extract at 3 layers, send after the last one (N-3)
-            eagle3_layers = (2, n_layers // 2, n_layers - 3)
+            eagle3_layers = (1, n_layers // 2 - 1, n_layers - 4)
             early_layer = n_layers - 3
         else:
             early_layer = n_layers - self.config.ssd_early_layers - 1
