@@ -301,10 +301,15 @@ class Eagle3Model(nn.Module):
                     _load_tensor(name, tensor)
                 del state_dict
 
-        # Build reverse mapping: target_id → draft_id (from d2t)
+        # d2t stores OFFSETS: actual_target_id = draft_id + d2t[draft_id]
+        # Convert to direct mapping
+        base = _torch.arange(self.d2t.shape[0], device=self.d2t.device, dtype=self.d2t.dtype)
+        self.d2t.add_(base)  # now d2t[draft_id] = target_id directly
+        # Build reverse mapping: target_id → draft_id
         for draft_id in range(self.d2t.shape[0]):
             target_id = self.d2t[draft_id].item()
-            self.t2d_map[target_id] = draft_id
+            if target_id < self.t2d_map.shape[0]:
+                self.t2d_map[target_id] = draft_id
 
 
 class EAGLEModel(nn.Module):
