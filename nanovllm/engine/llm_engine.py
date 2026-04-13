@@ -1,8 +1,10 @@
 import atexit
+import os
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 
@@ -21,6 +23,9 @@ class LLMEngine:
         self.ps = []
         self.events = []
         self.draft_async = config.draft_async
+        # Set env var before spawning draft so it picks up profiling
+        if config.profile and config.draft_async:
+            os.environ["DRAFT_PROFILE_PATH"] = "draft_trace.json"
         ctx = mp.get_context("spawn")
 
         # Spawn TP workers (ranks 1..tp_size-1)
@@ -66,6 +71,40 @@ class LLMEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
+        # Merge target + draft traces if profiling was enabled
+        self._merge_traces()
+
+    def _merge_traces(self):
+        """Merge target + draft profiler traces into a single file."""
+        target_path = "target_trace.json"
+        draft_path = os.environ.get("DRAFT_PROFILE_PATH", "")
+        if not os.path.exists(target_path):
+            return
+        import json, gzip
+        with open(target_path) as f:
+            target = json.load(f)
+        # Tag target process names
+        for ev in target.get("traceEvents", []):
+            if ev.get("ph") == "M" and ev.get("name") == "process_name":
+                ev["args"]["name"] = "Target_GPU0 " + str(ev["args"].get("name", ""))
+        if draft_path and os.path.exists(draft_path):
+            with open(draft_path) as f:
+                draft = json.load(f)
+            for ev in draft.get("traceEvents", []):
+                pid = ev.get("pid")
+                if isinstance(pid, int):
+                    ev["pid"] = pid + 10000
+                if ev.get("ph") == "M" and ev.get("name") == "process_name":
+                    ev["args"]["name"] = "Draft_GPU1 " + str(ev["args"].get("name", ""))
+            target["traceEvents"].extend(draft["traceEvents"])
+            os.remove(draft_path)
+            merged_path = "profile_merged.json.gz"
+        else:
+            merged_path = "profile_target.json.gz"
+        with gzip.open(merged_path, "wt") as f:
+            json.dump(target, f)
+        os.remove(target_path)
+        print(f"Profile trace saved to: {merged_path}")
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -135,6 +174,14 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        config = get_config()
+        prof = None
+        if config.profile:
+            prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=False, with_stack=True,
+            )
+            prof.__enter__()
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
@@ -193,4 +240,13 @@ class LLMEngine:
                 ch, cm = self.model_runner._cache_hit, self.model_runner._cache_miss
                 total_c = ch + cm
                 print(f"Cache hit: {ch}/{total_c} ({ch/total_c:.1%})" if total_c > 0 else "Cache hit: N/A")
+        if prof:
+            prof.__exit__(None, None, None)
+            target_path = "target_trace.json"
+            prof.export_chrome_trace(target_path)
+            print(f"Target trace saved to: {target_path}")
+            # Merge target + draft traces if draft trace exists
+            draft_path = os.environ.get("DRAFT_PROFILE_PATH", "")
+            # Note: draft trace is written by draft process on exit,
+            # merge must happen after draft exits (in LLM.cleanup or manually)
         return outputs

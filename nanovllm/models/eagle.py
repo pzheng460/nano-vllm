@@ -269,6 +269,7 @@ class Eagle3Model(nn.Module):
     def load_weights(self, path):
         """Custom weight loader handling d2t/t2d buffers and packed modules."""
         import os
+        import torch as _torch
         from glob import glob
         from safetensors import safe_open
         from nanovllm.utils.loader import _load_weight
@@ -278,7 +279,7 @@ class Eagle3Model(nn.Module):
             if name == 'd2t':
                 self.d2t.copy_(tensor.to(self.d2t.dtype))
             elif name == 't2d':
-                self.t2d_mask.copy_(tensor.to(torch.bool))
+                self.t2d_mask.copy_(tensor.to(_torch.bool))
             else:
                 try:
                     _load_weight(self, packed, name, tensor)

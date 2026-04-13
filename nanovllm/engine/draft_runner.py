@@ -239,7 +239,7 @@ class MTPDraftRunner:
         self._reset_tree_cache()
         self.last_hidden = {}
         # Pre-allocate recv buffers
-        self._cmd_buf = torch.zeros(2, dtype=torch.int64, device=self.device)
+        self._cmd_buf = torch.zeros(4, dtype=torch.int64, device=self.device)
 
         print(f"[MTPDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}, tree_decode={self.tree_decode}", flush=True)
 
@@ -781,6 +781,14 @@ class MTPDraftRunner:
 
     def draft_loop(self):
         print("[MTPDraftRunner] Starting draft loop", flush=True)
+        profile_path = os.environ.get("DRAFT_PROFILE_PATH")
+        prof = None
+        if profile_path:
+            prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=False, with_stack=True,
+            )
+            prof.__enter__()
         while True:
             dist.recv(self._cmd_buf, src=0, group=self.async_pg)
             cmd = self._cmd_buf[0].tolist()
@@ -801,6 +809,11 @@ class MTPDraftRunner:
                 total = MTPDraftRunner._hit + MTPDraftRunner._miss
                 rate = MTPDraftRunner._hit / total * 100 if total else 0
                 print(f"[MTPDraftRunner] Exiting. Cache hit: {MTPDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                if prof:
+                    prof.__exit__(None, None, None)
+                    prof.export_chrome_trace(profile_path)
+                    print(f"[MTPDraftRunner] Draft trace saved to: {profile_path}", flush=True)
+                break
 
 
 class EAGLEDraftModel(torch.nn.Module):
@@ -836,6 +849,57 @@ class EAGLEDraftModel(torch.nn.Module):
         return hidden
 
 
+class Eagle3DraftModel(torch.nn.Module):
+    """EAGLE-3 draft model for async SSD. FC(3H→H) + Eagle3DecoderLayer + own lm_head (reduced vocab)."""
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    def __init__(self, target_config, draft_config):
+        super().__init__()
+        from nanovllm.models.eagle import Eagle3Attention, Eagle3DecoderLayer
+        H = target_config.hidden_size
+        draft_vocab = getattr(draft_config, 'draft_vocab_size', target_config.vocab_size)
+        self.draft_vocab_size = draft_vocab
+
+        # Shared embed_tokens loaded from target checkpoint
+        self.model = torch.nn.Module()
+        self.model.embed_tokens = VocabParallelEmbedding(target_config.vocab_size, H, tp_size=1)
+        # FC: 3*H → H (tri-layer fusion)
+        from nanovllm.layers.linear import ReplicatedLinear
+        self.fc = ReplicatedLinear(H * 3, H, bias=False, tp_size=1)
+        # Eagle3 decoder layer (2H attention input)
+        self.midlayer = Eagle3DecoderLayer(draft_config, tp_size=1)
+        # Own norm and lm_head (reduced vocab)
+        self.norm = RMSNorm(H, eps=target_config.rms_norm_eps)
+        self.lm_head = ParallelLMHead(draft_vocab, H, tp_size=1)
+        # d2t / t2d mapping buffers
+        self.register_buffer('d2t', torch.zeros(draft_vocab, dtype=torch.int64))
+        self.register_buffer('t2d', torch.zeros(target_config.vocab_size, dtype=torch.int64))
+
+    def forward(self, input_ids, positions, hidden_states, aux_hiddens=None):
+        """
+        Args:
+            input_ids: target vocab token ids
+            positions: rope positions
+            hidden_states: previous output (for chain steps) or fc output
+            aux_hiddens: [N, 3*H] tri-layer concat (only for first step)
+        Returns:
+            hidden output [N, H]
+        """
+        token_embeds = self.model.embed_tokens(input_ids)
+        if aux_hiddens is not None:
+            fc_out = self.fc(aux_hiddens)
+        else:
+            fc_out = hidden_states
+        hidden, residual = self.midlayer(positions, fc_out, token_embeds)
+        return hidden + residual
+
+
 class EAGLEDraftRunner:
     """Async EAGLE draft runner for SSD on separate GPU."""
 
@@ -867,23 +931,40 @@ class EAGLEDraftRunner:
         torch.set_default_device(self.device)
 
         # Load EAGLE model
-        # Use draft_hf_config for EAGLE architecture (num_kv_heads=num_heads, etc)
         eagle_config = config.draft_hf_config if config.draft_hf_config is not None else hf_config
-        self.draft_model = EAGLEDraftModel(eagle_config)
-        # Load target model weights first (embed_tokens, lm_head, norm)
-        _load_draft_model(self.draft_model, config.model)
-        # Then load EAGLE-specific weights (fc, decoder layer) — overwrites layers.0.* with EAGLE's
-        _load_draft_model(self.draft_model, config.draft_model)
+        self.eagle3 = getattr(config, 'eagle3', False)
+        if self.eagle3:
+            self.draft_model = Eagle3DraftModel(hf_config, eagle_config)
+            # Load target embed_tokens
+            _load_draft_model(self.draft_model, config.model)
+            # Load EAGLE-3 weights (fc, midlayer, norm, lm_head, d2t, t2d)
+            _load_draft_model(self.draft_model, config.draft_model)
+            # Build t2d reverse mapping from d2t
+            d2t = self.draft_model.d2t
+            t2d_map = torch.full((hf_config.vocab_size,), 0, dtype=torch.int64, device=d2t.device)
+            for draft_id in range(d2t.shape[0]):
+                t2d_map[d2t[draft_id]] = draft_id
+            self.draft_model.t2d = t2d_map
+            self.d2t = d2t
+        else:
+            self.draft_model = EAGLEDraftModel(eagle_config)
+            _load_draft_model(self.draft_model, config.model)
+            _load_draft_model(self.draft_model, config.draft_model)
 
         self.embed_tokens = self.draft_model.model.embed_tokens
-        self.lm_head = self.draft_model.lm_head
+        self.lm_head = self.draft_model.lm_head if not self.eagle3 else self.draft_model.lm_head
 
         self._warmup_and_allocate_kv_cache(eagle_config)
         if init_q is not None:
             init_q.put(config.num_kvcache_blocks)
             init_q.close()
 
-        self._capture_eagle_graph(eagle_config)
+        if not self.eagle3:
+            self._capture_eagle_graph(eagle_config)
+            self._capture_batched_eagle_graph()
+        else:
+            self._batched_eagle_graphs = {}
+            self._eagle_graph = None
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -891,7 +972,39 @@ class EAGLEDraftRunner:
         self.tree_decode = config.ssd_tree_decode
         self._reset_tree_cache()
         self.last_hidden = {}
-        self._cmd_buf = torch.zeros(2, dtype=torch.int64, device=self.device)
+        self._cmd_buf = torch.zeros(4, dtype=torch.int64, device=self.device)
+
+        # Pre-allocate recv buffers to avoid per-call torch.zeros
+        max_seqs = config.max_num_seqs
+        max_nv = (self.K + 1) * max_seqs
+        max_bt = (config.max_model_len // self.block_size + 2) * max_seqs
+        d = self.device
+        # Payload buf: header(1) + meta(5*seqs + bt + pos) + hidden_as_int64
+        hidden_mult = 3 if self.eagle3 else 1
+        hidden_i64_size = max_nv * hf_config.hidden_size * hidden_mult * hf_config.torch_dtype.itemsize // 8
+        self._meta_buf = torch.zeros(1 + max_seqs * 5 + max_bt + max_nv + hidden_i64_size, dtype=torch.int64, device=d)
+        self._bt_buf = torch.zeros(max_bt, dtype=torch.int32, device=d)
+        self._pos_buf = torch.zeros(max_nv, dtype=torch.int64, device=d)
+        # Precompute repeat index for fan-out expand (avoids repeat_interleave kernel)
+        max_total = max_nv * self.F
+        self._fan_idx = torch.arange(max_nv, device=d).repeat_interleave(self.F)[:max_total]
+        # Tree decode constants for bs=1 fast path (no per-call torch.arange)
+        nv1 = self.K + 1              # num verify positions for single seq
+        ts1 = nv1 * self.F            # total entries = nv * fan
+        K = self.K
+        self._ts1 = ts1
+        self._base_arange = torch.arange(ts1, device=d, dtype=torch.int64)       # [0..ts1-1]
+        self._depth_offsets = torch.arange(K, device=d, dtype=torch.int64) * ts1  # [0, ts1, ...]
+        self._depth_range = torch.arange(K, device=d, dtype=torch.int64)          # [0, 1, ..., K-1]
+        # Pre-allocated [K, ts1] buffers for tree decode (filled in-place)
+        self._vpos_buf = torch.zeros(K, ts1, dtype=torch.int64, device=d)
+        self._ropes_buf = torch.zeros(K, ts1, dtype=torch.int64, device=d)
+        self._slots_buf = torch.zeros(K, ts1, dtype=torch.int32, device=d)
+        self._ctxs_buf = torch.zeros(K, ts1, dtype=torch.int32, device=d)
+        # Pre-computed tree cache key template for bs=1: acc_lens = [0,0,0,1,1,1,...,nv-1,nv-1,nv-1]
+        self._acc_lens_t = torch.arange(nv1, device=d, dtype=torch.int64).repeat_interleave(self.F)
+        # Pre-allocated sid tensor for bs=1
+        self._sid_buf = torch.zeros(ts1, dtype=torch.int64, device=d)
 
         print(f"[EAGLEDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}", flush=True)
         print(f"[EAGLEDraftRunner] norm.weight norm={self.draft_model.model.norm.weight.data.norm().item():.4f}", flush=True)
@@ -922,6 +1035,52 @@ class EAGLEDraftRunner:
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.eagle_kv_cache[0, 0]
                 module.v_cache = self.eagle_kv_cache[1, 0]
+
+    def _capture_batched_eagle_graph(self):
+        """Capture CUDA graph for batched EAGLE forward (used in tree decode)."""
+        hf = self.hf_config
+        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size + 10
+        d = self.device
+        self._batched_eagle_graphs = {}
+        pool = None
+
+        # Capture for the most common batch size: nv * fan for bs=1
+        nv = self.K + 1
+        common_bs = nv * self.F
+        for bs in [common_bs]:
+            # Create static buffers OUTSIDE inference_mode so they are regular tensors
+            g = {}
+            g["ids"] = torch.zeros(bs, dtype=torch.int64, device=d)
+            g["pos"] = torch.zeros(bs, dtype=torch.int64, device=d)
+            g["hidden"] = torch.zeros(bs, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+            g["slot"] = torch.zeros(bs, dtype=torch.int32, device=d)
+            g["ctx"] = torch.zeros(bs, dtype=torch.int32, device=d)
+            g["bt"] = torch.zeros(bs, max_num_blocks, dtype=torch.int32, device=d)
+            g["out"] = torch.zeros(bs, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+            g["tokens"] = torch.zeros(bs, dtype=torch.int64, device=d)
+
+            # Warmup + Capture under inference_mode
+            with torch.inference_mode():
+                set_context(False, slot_mapping=g["slot"], context_lens=g["ctx"], block_tables=g["bt"])
+                out = self.draft_model(g["ids"], g["pos"], g["hidden"])
+                logits = F.linear(out, self.lm_head.weight)
+                g["out"].copy_(out)
+                g["tokens"].copy_(logits.argmax(dim=-1))
+                reset_context()
+
+                # Capture
+                graph = torch.cuda.CUDAGraph()
+                set_context(False, slot_mapping=g["slot"], context_lens=g["ctx"], block_tables=g["bt"])
+                with torch.cuda.graph(graph, pool):
+                    out = self.draft_model(g["ids"], g["pos"], g["hidden"])
+                    logits = F.linear(out, self.lm_head.weight)
+                    g["out"].copy_(out)
+                    g["tokens"].copy_(logits.argmax(dim=-1))
+                reset_context()
+            if pool is None:
+                pool = graph.pool()
+            self._batched_eagle_graphs[bs] = (graph, g)
+            torch.cuda.synchronize()
 
     @torch.inference_mode()
     def _capture_eagle_graph(self, eagle_config):
@@ -1051,137 +1210,259 @@ class EAGLEDraftRunner:
         ack = torch.ones(1, dtype=torch.int64, device=self.device)
         dist.send(ack, dst=0, group=self.async_pg)
 
-    def handle_early_speculate(self, num_seqs=None):
-        """Receive early hidden from target, build tree cache with EAGLE."""
+    def handle_early_speculate(self, num_seqs=None, packed_len=None, meta_len=None):
+        """Receive early hidden from target, build tree cache with EAGLE.
+        Uses preallocated buffers + merged payload to minimize NCCL ops."""
         if num_seqs is None:
             ns_buf = torch.zeros(1, dtype=torch.int64, device=self.device)
             dist.recv(ns_buf, src=0, group=self.async_pg)
             num_seqs = int(ns_buf[0].item())
+            packed_len = None
+            meta_len = None
 
-        meta = torch.zeros(num_seqs * 5, dtype=torch.int64, device=self.device)
-        dist.recv(meta, src=0, group=self.async_pg)
+        # Recv single payload: [meta_len_header, packed_meta..., hidden_as_int64...]
+        payload_len = packed_len
+        if payload_len is None:
+            max_nv = (self.K + 1) * num_seqs
+            hmult = 3 if self.eagle3 else 1
+            hbytes = max_nv * self.hf_config.hidden_size * hmult * self.hf_config.torch_dtype.itemsize // 8
+            payload_len = 1 + num_seqs * 5 + (self.config.max_model_len // self.block_size + 2) * num_seqs + max_nv + hbytes
+        payload = self._meta_buf[:payload_len]
+        dist.recv(payload, src=0, group=self.async_pg)
 
-        meta_list = meta.tolist()
-        seq_infos = []
-        total_nv = 0
-        total_bt = 0
-        for i in range(num_seqs):
-            b = i * 5
-            sid, nv, ntok, btlen, spos = meta_list[b], meta_list[b+1], meta_list[b+2], meta_list[b+3], meta_list[b+4]
-            seq_infos.append((sid, nv, ntok, btlen, spos))
-            total_nv += nv
-            total_bt += btlen
+        # Split payload: meta from cmd_buf, no .item() on GPU tensors
+        if meta_len is None:
+            meta_len = int(payload[0].item())
+        meta_part = payload[1:1 + meta_len]
+        hidden_i64 = payload[1 + meta_len:]
 
-        early_hidden_all = torch.zeros(total_nv, self.hf_config.hidden_size,
-                                        dtype=self.hf_config.torch_dtype, device=self.device)
-        dist.recv(early_hidden_all, src=0, group=self.async_pg)
-        all_bt = torch.zeros(total_bt, dtype=torch.int32, device=self.device)
-        dist.recv(all_bt, src=0, group=self.async_pg)
-        all_pos = torch.zeros(total_nv, dtype=torch.int64, device=self.device)
-        dist.recv(all_pos, src=0, group=self.async_pg)
+        if num_seqs == 1:
+            # === Fast path: read header NOW while GPU idle after recv ===
+            nv = self.K + 1
+            btlen = meta_len - 5 - nv
+            total_nv = nv
+            total_bt = btlen
+            hdr = meta_part[:5].tolist()  # free: GPU idle right after recv
+            _sid = int(hdr[0])
+            _spos = int(hdr[4])
+            seq_infos = [(_sid, nv, int(hdr[2]), btlen, _spos)]
+            # GPU slicing
+            all_bt = meta_part[5:5 + btlen].to(torch.int32)
+            all_pos = meta_part[5 + btlen:5 + btlen + nv]
+        else:
+            # Multi-seq: parse with tolist
+            packed = meta_part.tolist()
+            seq_infos = []
+            total_nv = 0
+            total_bt = 0
+            off = 0
+            bt_ranges = []
+            pos_ranges = []
+            for _ in range(num_seqs):
+                sid, nv, ntok, btlen, spos = int(packed[off]), int(packed[off+1]), int(packed[off+2]), int(packed[off+3]), int(packed[off+4])
+                off += 5
+                seq_infos.append((sid, nv, ntok, btlen, spos))
+                bt_ranges.append((off, btlen))
+                off += btlen
+                pos_ranges.append((off, nv))
+                off += nv
+                total_nv += nv
+                total_bt += btlen
+            all_bt = self._bt_buf[:total_bt]
+            all_pos = self._pos_buf[:total_nv]
+            bt_off = 0
+            pos_off = 0
+            for (bstart, blen), (pstart, plen) in zip(bt_ranges, pos_ranges):
+                all_bt[bt_off:bt_off+blen] = meta_part[bstart:bstart+blen].to(torch.int32)
+                all_pos[pos_off:pos_off+plen] = meta_part[pstart:pstart+plen]
+                bt_off += blen
+                pos_off += plen
+
+        # Reinterpret hidden from int64 back to original dtype
+        total_nv_val = total_nv
+        H = self.hf_config.hidden_size
+        hidden_cols = H * 3 if self.eagle3 else H  # EAGLE-3: 3*H, EAGLE-1: H
+        n_i64 = total_nv_val * hidden_cols * self.hf_config.torch_dtype.itemsize // 8
+        early_hidden_all = hidden_i64[:n_i64].view(self.hf_config.torch_dtype).reshape(total_nv_val, hidden_cols)
 
         # === Batched processing: all seqs' candidates in one EAGLE forward ===
         fan = self.F
         d = self.device
 
-        # 1. Batch norm + lm_head + topk
-        normed_all = self.draft_model.model.norm(early_hidden_all)
-        early_logits_all = F.linear(normed_all, self.lm_head.weight)
-        _, cands_all = torch.topk(early_logits_all, fan, dim=-1)
+        # 1. Compute candidate tokens via topk
+        if self.eagle3:
+            # EAGLE-3: FC(3H→H) first, then norm+own_lm_head for topk
+            fc_hidden = self.draft_model.fc(early_hidden_all)  # [nv, H]
+            normed_fc = self.draft_model.norm(fc_hidden)
+            early_logits_all = F.linear(normed_fc, self.draft_model.lm_head.weight)
+            _, cands_draft = torch.topk(early_logits_all, fan, dim=-1)  # draft vocab ids
+            # Map draft→target token ids for embedding
+            cands_all = self.d2t[cands_draft]  # target vocab ids
+            normed_all = fc_hidden  # fc output used as hidden for tree decode
+        else:
+            # EAGLE-1: shared norm+lm_head
+            normed_all = self.draft_model.model.norm(early_hidden_all)
+            early_logits_all = F.linear(normed_all, self.lm_head.weight)
+            _, cands_all = torch.topk(early_logits_all, fan, dim=-1)
 
-        # 2. Build per-seq expanded tensors, then concatenate
-        all_flat_cands = []
-        all_flat_hidden = []
-        all_flat_acc_lens = []
-        all_flat_pos = []
-        all_flat_sids = []
-        all_slot_list = []
-        all_ctx_lens = []
-        all_bt_rows = []
+        # 2. Expand via pre-computed fan index
+        batch_cands = cands_all.reshape(-1)
+        fan_idx = self._fan_idx[:total_nv * fan]
+        batch_hidden = normed_all[fan_idx]
+        batch_pos = all_pos[fan_idx]
+
+        # Per-seq metadata for tree decode
         per_seq_meta = []
-
-        h_off = 0
-        bt_off = 0
         grand_total = 0
-        for sid, nv, ntok, btlen, spos in seq_infos:
-            cands = cands_all[h_off:h_off+nv]
-            normed_h = normed_all[h_off:h_off+nv]
-            block_table = all_bt[bt_off:bt_off+btlen]
-            verify_pos = all_pos[h_off:h_off+nv]
-
-            total = nv * fan
-            all_flat_cands.append(cands.reshape(-1))
-            all_flat_hidden.append(normed_h.repeat_interleave(fan, dim=0))
-            all_flat_acc_lens.append(torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan))
-            all_flat_pos.append(verify_pos.repeat_interleave(fan))
-            all_flat_sids.append(torch.full((total,), sid, dtype=torch.int64, device=d))
-
+        if num_seqs == 1:
+            nv = self.K + 1
+            total_s = nv * fan
             if self.tree_decode and self.K > 1:
-                per_seq_meta.append((total, spos + nv, block_table.shape[0] - 1, block_table, grand_total))
-            else:
-                for p in verify_pos.repeat_interleave(fan).tolist():
-                    p = int(p)
-                    all_slot_list.append(int(block_table[p // self.block_size]) * self.block_size + p % self.block_size)
-                all_ctx_lens.append((verify_pos.repeat_interleave(fan) + 1).to(torch.int32))
-                all_bt_rows.append(block_table.unsqueeze(0).expand(total, -1))
-
-            grand_total += total
-            h_off += nv
-            bt_off += btlen
-
-        batch_cands = torch.cat(all_flat_cands)
-        batch_hidden = torch.cat(all_flat_hidden)
-        batch_acc_lens = torch.cat(all_flat_acc_lens)
-        batch_pos = torch.cat(all_flat_pos)
-        batch_sids = torch.cat(all_flat_sids)
+                # base_vpos = spos + nv, keep as GPU tensor for vpos arithmetic
+                per_seq_meta.append((total_s, _spos + nv, all_bt.shape[0] - 1, all_bt, 0))
+            grand_total = total_s
+        else:
+            bt_off = 0
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                block_table = all_bt[bt_off:bt_off+btlen]
+                if self.tree_decode and self.K > 1:
+                    per_seq_meta.append((nv * fan, spos + nv, block_table.shape[0] - 1, block_table, grand_total))
+                grand_total += nv * fan
+                bt_off += btlen
 
         if self.tree_decode and self.K > 1:
-            # 3a. Batched tree decode
+            # 3a. Batched tree decode — precompute block table for all depths
+            # For single-seq (common case), avoid per-depth per-seq loop
             all_draft = []
             current_hidden = batch_hidden
             current_ids = batch_cands
-            for depth in range(self.K):
-                all_slots = []
-                all_ctxs = []
-                all_ropes = []
-                all_bts = []
-                for total_s, base_vpos, max_bi, block_table, offset in per_seq_meta:
-                    vpos = torch.arange(total_s, device=d, dtype=torch.int64) + base_vpos + depth * total_s
-                    all_ropes.append(batch_pos[offset:offset+total_s] + depth)
-                    bi = (vpos // self.block_size).long().clamp(0, max_bi)
-                    bo = (vpos % self.block_size).int()
-                    all_slots.append((block_table[bi] * self.block_size + bo).int())
-                    all_ctxs.append((vpos + 1).to(torch.int32))
-                    all_bts.append(block_table.unsqueeze(0).expand(total_s, -1))
-                b_slots = torch.cat(all_slots)
-                b_ctxs = torch.cat(all_ctxs)
-                b_ropes = torch.cat(all_ropes)
-                max_btl = max(bt.shape[1] for bt in all_bts)
-                b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bts]).contiguous()
+            N = grand_total  # total entries across all seqs
 
-                set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
-                eagle_out = self.draft_model(current_ids, b_ropes, current_hidden)
-                reset_context()
-                logits = F.linear(eagle_out, self.lm_head.weight)
-                next_tokens = logits.argmax(dim=-1)
-                all_draft.append(next_tokens)
-                current_hidden = eagle_out
-                current_ids = next_tokens
+            if num_seqs == 1:
+                # Fast path: use pre-allocated buffers from __init__
+                total_s, base_vpos, max_bi, block_table, _ = per_seq_meta[0]
+                blk = self.block_size
+
+                # Compute into pre-allocated [K, ts1] buffers
+                all_vpos = self._vpos_buf
+                all_vpos[:] = self._base_arange.unsqueeze(0) + base_vpos + self._depth_offsets.unsqueeze(1)
+                all_ropes = self._ropes_buf
+                all_ropes[:] = batch_pos.unsqueeze(0) + self._depth_range.unsqueeze(1)
+                bi = (all_vpos // blk).clamp(max=max_bi)
+                self._slots_buf[:] = (block_table[bi] * blk + all_vpos % blk).to(torch.int32)
+                self._ctxs_buf[:] = (all_vpos + 1).to(torch.int32)
+                all_slots = self._slots_buf
+                all_ctxs = self._ctxs_buf
+
+                # Block table: prepare once
+                use_graph = total_s in self._batched_eagle_graphs
+                if use_graph:
+                    graph, g = self._batched_eagle_graphs[total_s]
+                    bt_len = block_table.shape[0]
+                    g["bt"][:, :bt_len] = block_table.unsqueeze(0).expand(total_s, -1)
+                    if bt_len < g["bt"].shape[1]:
+                        g["bt"][:, bt_len:] = 0
+                else:
+                    bt_expanded = block_table.unsqueeze(0).expand(total_s, -1)
+
+                for depth in range(self.K):
+                    if use_graph:
+                        g["ids"].copy_(current_ids)
+                        g["pos"].copy_(all_ropes[depth])
+                        g["hidden"].copy_(current_hidden)
+                        g["slot"].copy_(all_slots[depth])
+                        g["ctx"].copy_(all_ctxs[depth])
+                        set_context(False, slot_mapping=g["slot"], context_lens=g["ctx"], block_tables=g["bt"])
+                        graph.replay()
+                        reset_context()
+                        all_draft.append(g["tokens"].clone())
+                        current_hidden = g["out"]  # safe: copied to g["hidden"] before next replay
+                        current_ids = g["tokens"]   # safe: copied to g["ids"] before next replay
+                    else:
+                        set_context(False, slot_mapping=all_slots[depth], context_lens=all_ctxs[depth], block_tables=bt_expanded)
+                        if self.eagle3:
+                            eagle_out = self.draft_model(current_ids, all_ropes[depth], current_hidden,
+                                                         aux_hiddens=None)  # chain step, no aux
+                        else:
+                            eagle_out = self.draft_model(current_ids, all_ropes[depth], current_hidden)
+                        reset_context()
+                        if self.eagle3:
+                            logits = F.linear(self.draft_model.norm(eagle_out), self.draft_model.lm_head.weight)
+                            draft_tokens = logits.argmax(dim=-1)
+                            next_tokens = self.d2t[draft_tokens]  # map to target vocab
+                        else:
+                            logits = F.linear(eagle_out, self.lm_head.weight)
+                            next_tokens = logits.argmax(dim=-1)
+                        all_draft.append(next_tokens)
+                        current_hidden = eagle_out
+                        current_ids = next_tokens
+            else:
+                # Multi-seq path
+                for depth in range(self.K):
+                    all_slots = []
+                    all_ctxs = []
+                    all_ropes = []
+                    all_bts = []
+                    for total_s, base_vpos, max_bi, block_table, offset in per_seq_meta:
+                        vpos = torch.arange(total_s, device=d, dtype=torch.int64) + base_vpos + depth * total_s
+                        all_ropes.append(batch_pos[offset:offset+total_s] + depth)
+                        bi = (vpos // self.block_size).long().clamp(0, max_bi)
+                        bo = (vpos % self.block_size).int()
+                        all_slots.append((block_table[bi] * self.block_size + bo).int())
+                        all_ctxs.append((vpos + 1).to(torch.int32))
+                        all_bts.append(block_table.unsqueeze(0).expand(total_s, -1))
+                    b_slots = torch.cat(all_slots)
+                    b_ctxs = torch.cat(all_ctxs)
+                    b_ropes = torch.cat(all_ropes)
+                    max_btl = max(bt.shape[1] for bt in all_bts)
+                    b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bts]).contiguous()
+
+                    set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
+                    eagle_out = self.draft_model(current_ids, b_ropes, current_hidden)
+                    reset_context()
+                    logits = F.linear(eagle_out, self.lm_head.weight)
+                    next_tokens = logits.argmax(dim=-1)
+                    all_draft.append(next_tokens)
+                    current_hidden = eagle_out
+                    current_ids = next_tokens
 
             spec_tokens = torch.stack(all_draft, dim=1)
-            offset = 0
-            for sid, nv, ntok, btlen, spos in seq_infos:
-                total = nv * fan
-                keys = torch.stack([batch_sids[offset:offset+total], batch_acc_lens[offset:offset+total],
-                                     batch_cands[offset:offset+total]], dim=1)
-                self.tree_caches[sid] = (keys, spec_tokens[offset:offset+total])
-                offset += total
+            if num_seqs == 1:
+                # sid already read right after recv (no extra sync)
+                total = grand_total
+                sid = seq_infos[0][0]
+                s = torch.full((total,), sid, dtype=torch.int64, device=d)
+                keys = torch.stack([s, self._acc_lens_t[:total], batch_cands[:total]], dim=1)
+                self.tree_caches[sid] = (keys, spec_tokens)
+            else:
+                offset = 0
+                for sid, nv, ntok, btlen, spos in seq_infos:
+                    total = nv * fan
+                    s = torch.full((total,), sid, dtype=torch.int64, device=d)
+                    a = torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan)
+                    keys = torch.stack([s, a, batch_cands[offset:offset+total]], dim=1)
+                    self.tree_caches[sid] = (keys, spec_tokens[offset:offset+total])
+                    offset += total
         else:
             # 3b. Batched chain: single EAGLE step
-            b_slots = torch.tensor(all_slot_list, dtype=torch.int32, device=d)
-            b_ctxs = torch.cat(all_ctx_lens)
-            max_btl = max(bt.shape[1] for bt in all_bt_rows)
-            b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_bt_rows]).contiguous()
+            # Compute slots from batch_pos and block tables
+            all_chain_slots = []
+            all_chain_ctxs = []
+            all_chain_bts = []
+            h_off2 = 0; bt_off2 = 0
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                block_table = all_bt[bt_off2:bt_off2+btlen]
+                vp = all_pos[h_off2:h_off2+nv].repeat_interleave(fan)
+                bi = (vp // self.block_size).long()
+                bo = (vp % self.block_size).int()
+                all_chain_slots.append((block_table[bi] * self.block_size + bo).int())
+                all_chain_ctxs.append((vp + 1).to(torch.int32))
+                all_chain_bts.append(block_table.unsqueeze(0).expand(nv * fan, -1))
+                h_off2 += nv; bt_off2 += btlen
+            b_slots = torch.cat(all_chain_slots)
+            b_ctxs = torch.cat(all_chain_ctxs)
+            max_btl = max(bt.shape[1] for bt in all_chain_bts)
+            b_bt = torch.cat([F.pad(bt, (0, max_btl - bt.shape[1])) for bt in all_chain_bts]).contiguous()
 
             set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
             eagle_out = self.draft_model(batch_cands, batch_pos, batch_hidden)
@@ -1192,8 +1473,9 @@ class EAGLEDraftRunner:
             offset = 0
             for sid, nv, ntok, btlen, spos in seq_infos:
                 total = nv * fan
-                keys = torch.stack([batch_sids[offset:offset+total], batch_acc_lens[offset:offset+total],
-                                     batch_cands[offset:offset+total]], dim=1)
+                s = torch.full((total,), sid, dtype=torch.int64, device=d)
+                a = torch.arange(nv, device=d, dtype=torch.int64).repeat_interleave(fan)
+                keys = torch.stack([s, a, batch_cands[offset:offset+total]], dim=1)
                 self.tree_caches[sid] = (keys, draft_tokens[offset:offset+total].unsqueeze(1))
                 offset += total
 
@@ -1291,6 +1573,14 @@ class EAGLEDraftRunner:
 
     def draft_loop(self):
         print("[EAGLEDraftRunner] Starting draft loop", flush=True)
+        profile_path = os.environ.get("DRAFT_PROFILE_PATH")
+        prof = None
+        if profile_path:
+            prof = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=False, with_stack=True,
+            )
+            prof.__enter__()
         while True:
             dist.recv(self._cmd_buf, src=0, group=self.async_pg)
             cmd = int(self._cmd_buf[0].tolist())
@@ -1301,14 +1591,19 @@ class EAGLEDraftRunner:
             elif cmd == 3:
                 self.handle_cleanup()
             elif cmd == 5:
-                num_seqs = self._cmd_buf[1].tolist()
-                self.handle_early_speculate(num_seqs)
+                vals = self._cmd_buf[1:4].tolist()
+                num_seqs, packed_len, meta_len = int(vals[0]), int(vals[1]), int(vals[2])
+                self.handle_early_speculate(num_seqs, packed_len, meta_len)
             elif cmd == 6:
                 self.handle_cache_lookup()
             elif cmd == 2:
                 total = EAGLEDraftRunner._hit + EAGLEDraftRunner._miss
                 rate = EAGLEDraftRunner._hit / total * 100 if total else 0
                 print(f"[EAGLEDraftRunner] Exiting. Cache hit: {EAGLEDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                if prof:
+                    prof.__exit__(None, None, None)
+                    prof.export_chrome_trace(profile_path)
+                    print(f"[EAGLEDraftRunner] Draft trace saved to: {profile_path}", flush=True)
                 break
 
 

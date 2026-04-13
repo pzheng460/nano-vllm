@@ -23,12 +23,17 @@ if __name__ == '__main__':
     parser.add_argument('--early-layers', type=int, default=2)
     parser.add_argument('--fan-out', type=int, default=3)
     parser.add_argument('--tree-decode', action='store_true')
+    parser.add_argument('--num-prompts', type=int, default=50)
+    parser.add_argument('--profile', action='store_true')
     args = parser.parse_args()
+
+    prompts = prompts[:args.num_prompts]
 
     if args.mode == 'sync':
         llm = LLM(MODEL, draft_model=EAGLE, enforce_eager=True,
                    tensor_parallel_size=1, max_model_len=4096,
-                   num_speculative_tokens=args.K)
+                   num_speculative_tokens=args.K,
+                   profile=args.profile)
         name = f'Sync EAGLE K={args.K}'
     else:
         llm = LLM(MODEL, draft_model=EAGLE, enforce_eager=True,
@@ -37,7 +42,8 @@ if __name__ == '__main__':
                    draft_async=True, draft_gpu=1,
                    async_fan_out=args.fan_out,
                    ssd_early_layers=args.early_layers,
-                   ssd_tree_decode=args.tree_decode)
+                   ssd_tree_decode=args.tree_decode,
+                   profile=args.profile)
         td = ' tree' if args.tree_decode else ' chain'
         name = f'Async EAGLE SSD K={args.K} early={args.early_layers} fan={args.fan_out}{td}'
 

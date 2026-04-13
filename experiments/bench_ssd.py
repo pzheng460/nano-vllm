@@ -14,8 +14,7 @@ sp = SamplingParams(temperature=0.001, max_tokens=256)
 
 
 def bench(name, llm):
-    # Warmup
-    llm.generate(prompts[:5], sp)
+    # Warmup (skip under profiling to keep trace small)
     t0 = perf_counter()
     outputs = llm.generate(prompts, sp)
     elapsed = perf_counter() - t0
@@ -26,29 +25,33 @@ def bench(name, llm):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', choices=['sync1', 'sync3', 'async3'], required=True)
-    parser.add_argument('--model', default='/mnt/data/peizhen/MiMo-7B-Base/')
-    parser.add_argument('--early-layers', type=int, default=2,
-                        help='SSD: extract early hidden at layer N-X (default: 2)')
+    parser.add_argument('--mode', choices=['sync1', 'sync3', 'async1', 'async3'], required=True)
+    parser.add_argument('--model', default='/mnt/data/peizhen/MiMo-7B-RL/')
+    parser.add_argument('--early-layers', type=int, default=2)
     parser.add_argument('--fan-out', type=int, default=3)
-    parser.add_argument('--K', type=int, default=3)
-    parser.add_argument('--tree-decode', action='store_true',
-                        help='SSD: tree decode (K MTP steps per candidate) vs chain lookup')
+    parser.add_argument('--K', type=int, default=None)
+    parser.add_argument('--tree-decode', action='store_true')
+    parser.add_argument('--num-prompts', type=int, default=50)
+    parser.add_argument('--profile', action='store_true')
     args = parser.parse_args()
+    prompts = prompts[:args.num_prompts]
 
+    p = args.profile
     if args.mode == 'sync1':
-        llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1, max_model_len=4096)
+        llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1, max_model_len=4096, profile=p)
         bench('Sync MTP K=1', llm)
     elif args.mode == 'sync3':
+        k = args.K or 3
         llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
-                   num_speculative_tokens=args.K)
-        bench(f'Sync MTP K={args.K}', llm)
-    elif args.mode == 'async3':
+                   num_speculative_tokens=k, profile=p)
+        bench(f'Sync MTP K={k}', llm)
+    elif args.mode in ('async1', 'async3'):
+        k = args.K or (1 if args.mode == 'async1' else 3)
         llm = LLM(args.model, enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
                    draft_async=True, draft_gpu=1,
-                   num_speculative_tokens=args.K,
+                   num_speculative_tokens=k,
                    async_fan_out=args.fan_out,
                    ssd_early_layers=args.early_layers,
-                   ssd_tree_decode=args.tree_decode)
-        td = ' tree' if args.tree_decode else ' chain'
-        bench(f'Async SSD K={args.K} early={args.early_layers} fan={args.fan_out}{td}', llm)
+                   ssd_tree_decode=args.tree_decode, profile=p)
+        td = ' tree' if args.tree_decode else ''
+        bench(f'Async SSD K={k} EL={args.early_layers}{td}', llm)

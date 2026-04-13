@@ -29,6 +29,7 @@ class Config:
     num_gpus: int = -1                         # total world size (auto-computed)
     draft_rank: int = -1                       # rank of draft process (auto-computed)
     disable_mtp: bool = False                  # force disable MTP speculative decoding
+    profile: bool = False                      # enable torch.profiler tracing (saves to profile_dir)
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -55,6 +56,14 @@ class Config:
         # SSD: compute world size and draft rank
         self.num_gpus = self.tensor_parallel_size + (1 if self.draft_async else 0)
         self.eagle_async = self.draft_async and self.draft_model is not None and not self.use_mtp
+        # Detect EAGLE-3: has draft_vocab_size or architecture LlamaForCausalLMEagle3
+        self.eagle3 = False
+        if self.draft_hf_config is not None:
+            archs = getattr(self.draft_hf_config, 'architectures', []) or []
+            self.eagle3 = (
+                getattr(self.draft_hf_config, 'draft_vocab_size', None) is not None
+                or any('eagle3' in a.lower() for a in archs)
+            )
         if self.draft_async:
             assert self.use_mtp or self.draft_model is not None, \
                 "SSD async draft requires MTP model or EAGLE draft_model"

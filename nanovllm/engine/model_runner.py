@@ -120,10 +120,16 @@ class ModelRunner:
             d = self.device.device_name
             max_seqs = config.max_num_seqs
             K = config.num_speculative_tokens
-            self._cmd_buf = torch.zeros(2, dtype=torch.int64, device=d)
+            self._cmd_buf = torch.zeros(4, dtype=torch.int64, device=d)
             # Spec phase pre-allocated buffers
             self._lookup_buf = torch.zeros(1 + max_seqs * 3, dtype=torch.int64, device=d)
             self._result_buf = torch.zeros(max_seqs * K, dtype=torch.int64, device=d)
+            # Pre-allocated payload buf for early_speculate send
+            max_nv = (K + 1) * max_seqs
+            max_bt = (config.max_model_len // self.block_size + 2) * max_seqs
+            hidden_mult = 3 if getattr(config, 'eagle3', False) else 1
+            hidden_i64_size = max_nv * config.hf_config.hidden_size * hidden_mult * config.hf_config.torch_dtype.itemsize // 8
+            self._payload_buf = torch.zeros(1 + max_seqs * 5 + max_bt + max_nv + hidden_i64_size, dtype=torch.int64, device=d)
 
         if self.tp_size > 1:
             if rank == 0:
@@ -1047,39 +1053,83 @@ class ModelRunner:
         # === Verify phase (layer-by-layer for early hidden extraction) ===
         verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
         model_inner = self.model.model
-        early_layer = len(model_inner.layers) - self.config.ssd_early_layers
+        n_layers = len(model_inner.layers)
+        eagle3 = getattr(self.config, 'eagle3', False) and self.config.eagle_async
+        if eagle3:
+            # EAGLE-3: extract at 3 layers, send after the last one (N-3)
+            eagle3_layers = (2, n_layers // 2, n_layers - 3)
+            early_layer = n_layers - 3
+        else:
+            early_layer = n_layers - self.config.ssd_early_layers - 1
+            eagle3_layers = ()
+        eagle3_hiddens = {}
 
         hidden_states = model_inner.embed_tokens(verify_ids)
         residual = None
         _async_send_handles = []
         for i, layer in enumerate(model_inner.layers):
             hidden_states, residual = layer(verify_pos, hidden_states, residual)
+            # Collect tri-layer hiddens for EAGLE-3
+            if eagle3 and i in eagle3_layers:
+                eagle3_hiddens[i] = (hidden_states + residual).clone()
             if i == early_layer and self.rank == 0 and self.async_pg is not None:
-                early_hidden_all = (hidden_states + residual).clone()
+                if eagle3 and len(eagle3_hiddens) == 3:
+                    # Concatenate 3 layer hiddens: [N, 3*H]
+                    sorted_keys = sorted(eagle3_hiddens.keys())
+                    early_hidden_all = torch.cat([eagle3_hiddens[k] for k in sorted_keys], dim=-1)
+                else:
+                    early_hidden_all = (hidden_states + residual).clone()
                 # Non-blocking sends: overlap with remaining layers
                 num_seqs_batch = len(seqs)
-                self._cmd_buf[0] = 5
-                self._cmd_buf[1] = num_seqs_batch
-                meta_list = []
-                bt_list = []
-                pos_list = []
+                # Build packed meta
+                packed_list = []
                 for seq, dt in zip(seqs, all_draft_tokens):
                     nv = len(dt) + 1
                     bt = seq.block_table
                     seq_start_pos = len(seq) - 1
-                    meta_list.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), seq_start_pos])
-                    bt_list.extend(bt)
-                    pos_list.extend(range(seq_start_pos, seq_start_pos + nv))
-                meta_t = torch.tensor(meta_list, dtype=torch.int64, device=d)
-                bt_t = torch.tensor(bt_list, dtype=torch.int32, device=d)
-                pos_t = torch.tensor(pos_list, dtype=torch.int64, device=d)
-                _async_send_handles = [
-                    dist.isend(self._cmd_buf, dst=self.draft_rank, group=self.async_pg),
-                    dist.isend(meta_t, dst=self.draft_rank, group=self.async_pg),
-                    dist.isend(early_hidden_all, dst=self.draft_rank, group=self.async_pg),
-                    dist.isend(bt_t, dst=self.draft_rank, group=self.async_pg),
-                    dist.isend(pos_t, dst=self.draft_rank, group=self.async_pg),
-                ]
+                    packed_list.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), seq_start_pos])
+                    packed_list.extend(bt)
+                    packed_list.extend(range(seq_start_pos, seq_start_pos + nv))
+                meta_len = len(packed_list)
+                meta_t = torch.tensor(packed_list, dtype=torch.int64, device=d)
+
+                if self.config.eagle_async:
+                    # EAGLE: merged payload [meta_len_header, meta, hidden_as_int64]
+                    hidden_i64 = early_hidden_all.contiguous().view(-1).view(torch.int64)
+                    total_len = 1 + meta_len + hidden_i64.shape[0]
+                    payload = self._payload_buf[:total_len]
+                    payload[0] = meta_len
+                    payload[1:1 + meta_len] = meta_t
+                    payload[1 + meta_len:] = hidden_i64
+                    self._cmd_buf[0] = 5
+                    self._cmd_buf[1] = num_seqs_batch
+                    self._cmd_buf[2] = total_len
+                    self._cmd_buf[3] = meta_len
+                    _async_send_handles = [
+                        dist.isend(self._cmd_buf, dst=self.draft_rank, group=self.async_pg),
+                        dist.isend(payload, dst=self.draft_rank, group=self.async_pg),
+                    ]
+                else:
+                    # MTP: separate sends matching MTP draft recv protocol
+                    meta_only = []
+                    bt_list = []
+                    pos_list = []
+                    for seq, dt in zip(seqs, all_draft_tokens):
+                        nv = len(dt) + 1
+                        bt = seq.block_table
+                        spos = len(seq) - 1
+                        meta_only.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), spos])
+                        bt_list.extend(bt)
+                        pos_list.extend(range(spos, spos + nv))
+                    self._cmd_buf[0] = 5
+                    self._cmd_buf[1] = num_seqs_batch
+                    _async_send_handles = [
+                        dist.isend(self._cmd_buf, dst=self.draft_rank, group=self.async_pg),
+                        dist.isend(torch.tensor(meta_only, dtype=torch.int64, device=d), dst=self.draft_rank, group=self.async_pg),
+                        dist.isend(early_hidden_all, dst=self.draft_rank, group=self.async_pg),
+                        dist.isend(torch.tensor(bt_list, dtype=torch.int32, device=d), dst=self.draft_rank, group=self.async_pg),
+                        dist.isend(torch.tensor(pos_list, dtype=torch.int64, device=d), dst=self.draft_rank, group=self.async_pg),
+                    ]
 
         hidden_states, residual = model_inner.norm(hidden_states, residual)
 
