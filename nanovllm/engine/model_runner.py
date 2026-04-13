@@ -459,10 +459,11 @@ class ModelRunner:
             hidden_states, residual = layer(positions, hidden_states, residual)
             if i in aux_layers:
                 aux_hiddens[i] = (hidden_states + residual).detach().clone()
+        prenorm = hidden_states + residual  # prenorm for chain step hidden
         hidden_states, _ = model_inner.norm(hidden_states, residual)
         # Concatenate aux hiddens in order
         aux_concat = torch.cat([aux_hiddens[l] for l in aux_layers], dim=-1)
-        return hidden_states, aux_concat
+        return hidden_states, aux_concat, prenorm
 
     @torch.inference_mode()
     def _run_prefill_with_hidden(self, seqs: list[Sequence]) -> list[int]:
@@ -472,7 +473,7 @@ class ModelRunner:
         context = get_context()
         is_eagle3 = getattr(self, '_is_eagle3', False)
         if is_eagle3:
-            model_out, aux_concat = self._run_target_with_aux(input_ids, positions)
+            model_out, aux_concat, eagle3_prenorm = self._run_target_with_aux(input_ids, positions)
         else:
             model_out = self.model(input_ids, positions)
         # MiMo returns unnormed residual; Qwen3 returns normed hidden
@@ -515,11 +516,14 @@ class ModelRunner:
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
-            self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
             if is_eagle3:
+                # EAGLE-3 chain step needs prenorm hidden (not normed)
+                self.last_hidden[seq.seq_id] = eagle3_prenorm[last_indices[i]:last_indices[i]+1].clone()
                 if not hasattr(self, '_last_aux_hidden'):
                     self._last_aux_hidden = {}
                 self._last_aux_hidden[seq.seq_id] = aux_concat[last_indices[i]:last_indices[i]+1].clone()
+            else:
+                self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
 
@@ -633,7 +637,7 @@ class ModelRunner:
         input_ids, positions = self._prepare_verify(seqs, all_draft_tokens)
         is_eagle3 = getattr(self, '_is_eagle3', False)
         if is_eagle3:
-            hidden, aux_concat = self._run_target_with_aux(input_ids, positions)
+            hidden, aux_concat, eagle3_prenorm = self._run_target_with_aux(input_ids, positions)
         else:
             hidden = self.model(input_ids, positions)  # normed for Qwen2/3, unnormed for MiMo
         # MiMo returns unnormed → norm for logits; Qwen2/3 returns normed → use directly
@@ -660,13 +664,17 @@ class ModelRunner:
                         break
                 else:
                     accepted.append(predicted[k])
-                # Save normed hidden at accepted position (EAGLE trained with normed hidden)
+                # Save hidden at accepted position
                 accepted_idx = offset + len(accepted) - 1
-                self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 if is_eagle3:
+                    # EAGLE-3 chain step needs prenorm hidden (not normed)
+                    self.last_hidden[seq.seq_id] = eagle3_prenorm[accepted_idx:accepted_idx+1].clone()
                     if not hasattr(self, '_last_aux_hidden'):
                         self._last_aux_hidden = {}
                     self._last_aux_hidden[seq.seq_id] = aux_concat[accepted_idx:accepted_idx+1].clone()
+                else:
+                    # EAGLE-1: normed hidden (trained with model.model() output which is post-RMSNorm)
+                    self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
 
