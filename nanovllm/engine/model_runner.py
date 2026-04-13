@@ -516,14 +516,11 @@ class ModelRunner:
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
+            self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
             if is_eagle3:
-                # EAGLE-3 chain step needs prenorm hidden (not normed)
-                self.last_hidden[seq.seq_id] = eagle3_prenorm[last_indices[i]:last_indices[i]+1].clone()
                 if not hasattr(self, '_last_aux_hidden'):
                     self._last_aux_hidden = {}
                 self._last_aux_hidden[seq.seq_id] = aux_concat[last_indices[i]:last_indices[i]+1].clone()
-            else:
-                self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
 
@@ -666,15 +663,11 @@ class ModelRunner:
                     accepted.append(predicted[k])
                 # Save hidden at accepted position
                 accepted_idx = offset + len(accepted) - 1
+                self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 if is_eagle3:
-                    # EAGLE-3 chain step needs prenorm hidden (not normed)
-                    self.last_hidden[seq.seq_id] = eagle3_prenorm[accepted_idx:accepted_idx+1].clone()
                     if not hasattr(self, '_last_aux_hidden'):
                         self._last_aux_hidden = {}
                     self._last_aux_hidden[seq.seq_id] = aux_concat[accepted_idx:accepted_idx+1].clone()
-                else:
-                    # EAGLE-1: normed hidden (trained with model.model() output which is post-RMSNorm)
-                    self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
 
@@ -691,6 +684,7 @@ class ModelRunner:
                     for j in range(num_accepted - 1):
                         acc_pos = seq_start_pos + j + 1
                         tok_id = all_accepted[seq_idx][j]
+                        # EAGLE-3 needs prenorm hidden; EAGLE-1 uses normed
                         target_h = hidden[offset + j + 1:offset + j + 2]
                         inp = self.device.to_device(
                             torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
