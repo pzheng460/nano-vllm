@@ -1061,7 +1061,7 @@ class ModelRunner:
         eagle3 = getattr(self.config, 'eagle3', False) and self.config.eagle_async
         if eagle3:
             # EAGLE-3: extract at 3 layers, send after the last one (N-3)
-            eagle3_layers = (1, n_layers // 2 - 1, n_layers - 4)
+            eagle3_layers = self._get_eagle3_aux_layers()
             early_layer = n_layers - 3
         else:
             early_layer = n_layers - self.config.ssd_early_layers - 1
