@@ -965,6 +965,7 @@ class EAGLEDraftRunner:
         else:
             self._batched_eagle_graphs = {}
             self._eagle_graph = None
+            self._g = None
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -1007,7 +1008,8 @@ class EAGLEDraftRunner:
         self._sid_buf = torch.zeros(ts1, dtype=torch.int64, device=d)
 
         print(f"[EAGLEDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}", flush=True)
-        print(f"[EAGLEDraftRunner] norm.weight norm={self.draft_model.model.norm.weight.data.norm().item():.4f}", flush=True)
+        norm_mod = self.draft_model.norm if self.eagle3 else self.draft_model.model.norm
+        print(f"[EAGLEDraftRunner] norm.weight norm={norm_mod.weight.data.norm().item():.4f}", flush=True)
         print(f"[EAGLEDraftRunner] lm_head.weight norm={self.lm_head.weight.data.norm().item():.4f}", flush=True)
         print(f"[EAGLEDraftRunner] fc.weight norm={self.draft_model.fc.weight.data.norm().item():.4f}", flush=True)
 
@@ -1031,7 +1033,9 @@ class EAGLEDraftRunner:
             2, 1, num_blocks, self.block_size, num_kv_heads, head_dim,
             device=self.device, dtype=hf_config.torch_dtype,
         )
-        for module in self.draft_model.layers[0].modules():
+        # EAGLE-1 uses layers[0], EAGLE-3 uses midlayer
+        draft_layer = self.draft_model.midlayer if self.eagle3 else self.draft_model.layers[0]
+        for module in draft_layer.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.eagle_kv_cache[0, 0]
                 module.v_cache = self.eagle_kv_cache[1, 0]
@@ -1114,30 +1118,52 @@ class EAGLEDraftRunner:
 
     @torch.inference_mode()
     def _eagle_step(self, token_id, hidden_state, cur_pos, block_table_t):
-        """Single EAGLE forward step using CUDA graph."""
+        """Single EAGLE forward step (CUDA graph or eager for EAGLE-3)."""
         block_idx = cur_pos // self.block_size
         bt_len = block_table_t.shape[0]
         block_offset = cur_pos % self.block_size
         slot = block_table_t[min(block_idx, bt_len - 1)] * self.block_size + block_offset
 
-        g = self._g
-        g["input_id"][0] = token_id
-        g["pos"][0] = cur_pos
-        if hidden_state.dim() == 1:
-            g["hidden"][0].copy_(hidden_state)
+        if self._g is not None:
+            # CUDA graph path (EAGLE-1)
+            g = self._g
+            g["input_id"][0] = token_id
+            g["pos"][0] = cur_pos
+            if hidden_state.dim() == 1:
+                g["hidden"][0].copy_(hidden_state)
+            else:
+                g["hidden"].copy_(hidden_state)
+            g["slot"][0] = slot
+            g["ctx_len"][0] = cur_pos + 1
+            g["bt"][0, :bt_len] = block_table_t
+
+            set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
+            self._eagle_graph.replay()
+            reset_context()
+
+            logits = F.linear(g["out"], self.lm_head.weight)
+            next_token = logits.argmax(dim=-1).item()
+            return g["out"][0].clone(), logits.squeeze(0), next_token
         else:
-            g["hidden"].copy_(hidden_state)
-        g["slot"][0] = slot
-        g["ctx_len"][0] = cur_pos + 1
-        g["bt"][0, :bt_len] = block_table_t
-
-        set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
-        self._eagle_graph.replay()
-        reset_context()
-
-        logits = F.linear(g["out"], self.lm_head.weight)
-        next_token = logits.argmax(dim=-1).item()
-        return g["out"][0].clone(), logits.squeeze(0), next_token
+            # Eager path (EAGLE-3)
+            inp = torch.tensor([token_id], dtype=torch.int64, device=self.device)
+            pos = torch.tensor([cur_pos], dtype=torch.int64, device=self.device)
+            sm = torch.tensor([slot], dtype=torch.int32, device=self.device)
+            cl = torch.tensor([cur_pos + 1], dtype=torch.int32, device=self.device)
+            bt = block_table_t.unsqueeze(0)
+            h = hidden_state.unsqueeze(0) if hidden_state.dim() == 1 else hidden_state
+            set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt)
+            out = self.draft_model(inp, pos, h)
+            reset_context()
+            if self.eagle3:
+                normed = self.draft_model.norm(out)
+                logits = F.linear(normed, self.draft_model.lm_head.weight)
+                draft_tok = logits.argmax(dim=-1).item()
+                next_token = self.d2t[draft_tok].item()
+            else:
+                logits = F.linear(out, self.lm_head.weight)
+                next_token = logits.argmax(dim=-1).item()
+            return out[0].clone(), logits.squeeze(0), next_token
 
     def _reset_tree_cache(self, seq_id=None):
         if seq_id is None:

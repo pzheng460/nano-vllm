@@ -1,52 +1,76 @@
-"""Compare EAGLE acceptance rate: vLLM baseline."""
-import os
-os.environ["VLLM_USE_V1"] = "0"
+"""Compare EAGLE (v1) acceptance rate: vLLM vs nano-vllm."""
+import os, sys
 
-from vllm import LLM, SamplingParams
-
-MODEL = '/mnt/data/peizhen/Qwen2-7B-Instruct'
-EAGLE = '/mnt/data/peizhen/EAGLE-Qwen2-7B-Instruct'
+TARGET = '/mnt/data/peizhen/Qwen2.5-7B-Instruct'
+EAGLE = '/mnt/data/peizhen/EAGLE-Qwen2.5-7B-Instruct'
 
 prompts = [
+    'A train travels at 60 mph for 3 hours. How far does it travel?',
     'Janet sells 16 pies. Each pie costs 8 dollars. How much money does she make?',
     'A store has 120 apples. They sell 45 in the morning and 32 in the afternoon. How many are left?',
     'Tom reads 25 pages per day. How many pages does he read in 2 weeks?',
-    'A train travels at 60 mph for 3 hours. How far does it travel?',
     'Sarah has 3 times as many books as Tom. Tom has 12 books. How many do they have together?',
-] * 10
+]
 
-sp = SamplingParams(temperature=0.0, max_tokens=128)
+K = 3
+MAX_TOKENS = 256
 
-print("=== Loading vLLM with EAGLE ===")
-llm = LLM(MODEL,
-          speculative_config={
-              "model": EAGLE,
-              "num_speculative_tokens": 5,
-              "method": "eagle",
-          },
-          enforce_eager=True,
-          tensor_parallel_size=1,
-          max_model_len=4096,
-          gpu_memory_utilization=0.85,
-          disable_log_stats=False)
+mode = sys.argv[1] if len(sys.argv) > 1 else 'both'
 
-print("\n=== Running benchmark ===")
-outputs = llm.generate(prompts, sp)
+if mode in ('vllm', 'both'):
+    from vllm import LLM, SamplingParams
+    sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
 
-total_toks = 0
-for i, o in enumerate(outputs):
-    text = o.outputs[0].text
-    toks = len(o.outputs[0].token_ids)
-    total_toks += toks
-    print(f"\nPrompt {i}: {prompts[i][:60]}...")
-    print(f"Output ({toks} tokens): {text[:200]}")
+    print(f"\n{'='*60}")
+    print(f"vLLM EAGLE K={K}")
+    print(f"{'='*60}")
+    llm = LLM(TARGET,
+              speculative_config={
+                  'method': 'eagle',
+                  'model': EAGLE,
+                  'num_speculative_tokens': K,
+              },
+              enforce_eager=True,
+              max_model_len=4096,
+              gpu_memory_utilization=0.85,
+              disable_log_stats=False)
 
-print(f"\nTotal tokens: {total_toks}")
+    from time import perf_counter
+    t0 = perf_counter()
+    outputs = llm.generate(prompts, sp)
+    elapsed = perf_counter() - t0
+    total_toks = sum(len(o.outputs[0].token_ids) for o in outputs)
+    print(f"vLLM: {total_toks} tokens in {elapsed:.2f}s = {total_toks/elapsed:.1f} tok/s")
 
-# Get spec decode metrics from prometheus
-from prometheus_client import REGISTRY
-for metric in REGISTRY.collect():
-    for sample in metric.samples:
-        if 'spec' in sample.name or 'draft' in sample.name or 'accept' in sample.name:
-            if sample.value != 0:
-                print(f"  {sample.name} {sample.labels}: {sample.value}")
+    # Get spec decode metrics
+    try:
+        from prometheus_client import REGISTRY
+        for metric in REGISTRY.collect():
+            for sample in metric.samples:
+                if 'spec_decode' in sample.name and sample.value != 0:
+                    print(f"  {sample.name} {sample.labels}: {sample.value}")
+    except Exception as e:
+        print(f"  Metrics error: {e}")
+
+    del llm
+    import gc, torch
+    gc.collect()
+    torch.cuda.empty_cache()
+
+if mode in ('nano', 'both'):
+    from time import perf_counter
+    print(f"\n{'='*60}")
+    print(f"nano-vllm EAGLE K={K}")
+    print(f"{'='*60}")
+    from nanovllm import LLM as NanoLLM
+    from nanovllm import SamplingParams as NanoSP
+    nllm = NanoLLM(TARGET,
+                    draft_model=EAGLE,
+                    enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
+                    num_speculative_tokens=K)
+    nsp = NanoSP(temperature=0.0, max_tokens=256)
+    t0 = perf_counter()
+    nout = nllm.generate(prompts, nsp)
+    elapsed = perf_counter() - t0
+    ntok = sum(len(o['token_ids']) for o in nout)
+    print(f"nano-vllm: {ntok} tokens in {elapsed:.2f}s = {ntok/elapsed:.1f} tok/s")
