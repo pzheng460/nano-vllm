@@ -1229,13 +1229,15 @@ class EAGLEDraftRunner:
         seq_id, n, bt_len = meta.tolist()
         n, bt_len = int(n), int(bt_len)
 
+        H = self.hf_config.hidden_size
+        recv_cols = H * 3 if self.eagle3 else H  # EAGLE-3: 3H aux concat
         token_ids = torch.zeros(n, dtype=torch.int64, device=self.device)
-        hidden_states = torch.zeros(n, self.hf_config.hidden_size, dtype=self.hf_config.torch_dtype, device=self.device)
+        hidden_recv = torch.zeros(n, recv_cols, dtype=self.hf_config.torch_dtype, device=self.device)
         positions = torch.zeros(n, dtype=torch.int64, device=self.device)
         block_table = torch.zeros(bt_len, dtype=torch.int32, device=self.device)
 
         dist.recv(token_ids, src=0, group=self.async_pg)
-        dist.recv(hidden_states, src=0, group=self.async_pg)
+        dist.recv(hidden_recv, src=0, group=self.async_pg)
         dist.recv(positions, src=0, group=self.async_pg)
         dist.recv(block_table, src=0, group=self.async_pg)
 
@@ -1253,7 +1255,11 @@ class EAGLEDraftRunner:
 
         # Run EAGLE prefill (populates KV cache)
         set_context(True, cu_q, cu_k, n, total_seqlen, slot_t, None, None)
-        eagle_out = self.draft_model(token_ids, positions, hidden_states)
+        if self.eagle3:
+            # hidden_recv is 3H aux concat for EAGLE-3
+            eagle_out = self.draft_model(token_ids, positions, None, aux_hiddens=hidden_recv)
+        else:
+            eagle_out = self.draft_model(token_ids, positions, hidden_recv)
         reset_context()
 
         self.last_hidden[int(seq_id)] = eagle_out[-1:].clone()

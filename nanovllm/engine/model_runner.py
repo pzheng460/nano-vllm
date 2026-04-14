@@ -837,7 +837,11 @@ class ModelRunner:
         context = get_context()
         d = self.device.device_name
 
-        hidden = self.model(input_ids, positions)
+        eagle3 = getattr(self.config, 'eagle3', False)
+        if eagle3:
+            hidden, aux_concat, _ = self._run_target_with_aux(input_ids, positions)
+        else:
+            hidden = self.model(input_ids, positions)
         last_indices = context.cu_seqlens_q[1:] - 1
 
         # Sample first — needed for shifted MTP token IDs
@@ -878,7 +882,11 @@ class ModelRunner:
                 meta = torch.tensor([seq.seq_id, n, len(bt)], dtype=torch.int64, device=d)
                 dist.send(meta, dst=self.draft_rank, group=self.async_pg)
                 dist.send(send_ids.contiguous(), dst=self.draft_rank, group=self.async_pg)
-                dist.send(hidden[start:end].contiguous(), dst=self.draft_rank, group=self.async_pg)
+                if eagle3:
+                    # EAGLE-3: send 3H aux concat instead of H hidden
+                    dist.send(aux_concat[start:end].contiguous(), dst=self.draft_rank, group=self.async_pg)
+                else:
+                    dist.send(hidden[start:end].contiguous(), dst=self.draft_rank, group=self.async_pg)
                 dist.send(torch.tensor(seq_positions, dtype=torch.int64, device=d),
                           dst=self.draft_rank, group=self.async_pg)
                 dist.send(torch.tensor(bt, dtype=torch.int32, device=d),
