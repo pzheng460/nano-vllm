@@ -937,9 +937,33 @@ class EAGLEDraftRunner:
             self.draft_model = Eagle3DraftModel(hf_config, eagle_config)
             # Load target embed_tokens
             _load_draft_model(self.draft_model, config.model)
-            # Load EAGLE-3 weights (fc, midlayer, norm, lm_head, d2t, t2d)
+            # Load EAGLE-3 weights (fc, midlayer, norm, lm_head)
+            # Note: _load_draft_model uses get_parameter which skips buffers (d2t/t2d)
             _load_draft_model(self.draft_model, config.draft_model)
-            # Build t2d reverse mapping from d2t
+            # Manually load d2t buffer (registered buffer, not a parameter)
+            d2t_raw = None
+            safetensor_files = glob(os.path.join(config.draft_model, "*.safetensors"))
+            if safetensor_files:
+                for f in safetensor_files:
+                    with safe_open(f, "pt", "cpu") as sf:
+                        if 'd2t' in sf.keys():
+                            d2t_raw = sf.get_tensor('d2t')
+                            break
+            else:
+                bin_files = glob(os.path.join(config.draft_model, "pytorch_model*.bin"))
+                for f in bin_files:
+                    sd = torch.load(f, map_location="cpu", weights_only=True)
+                    if 'd2t' in sd:
+                        d2t_raw = sd['d2t']
+                    del sd
+            if d2t_raw is not None:
+                # d2t stores offsets: actual_target_id = draft_id + d2t[draft_id]
+                import torch as _torch
+                base = _torch.arange(d2t_raw.shape[0], dtype=d2t_raw.dtype) if 'd2t_raw' in dir() else _torch.arange(d2t_raw.shape[0], dtype=d2t_raw.dtype)
+                d2t_raw = d2t_raw.to(self.device)
+                d2t_direct = d2t_raw + _torch.arange(d2t_raw.shape[0], dtype=d2t_raw.dtype, device=self.device)
+                self.draft_model.d2t.copy_(d2t_direct.to(self.draft_model.d2t.device))
+            # Build t2d reverse mapping
             d2t = self.draft_model.d2t
             t2d_map = torch.full((hf_config.vocab_size,), 0, dtype=torch.int64, device=d2t.device)
             for draft_id in range(d2t.shape[0]):
