@@ -30,7 +30,10 @@ def _get_model_cls(hf_config):
     if model_type == 'llama':
         from nanovllm.models.llama import LlamaForCausalLM
         return LlamaForCausalLM
-    # Qwen2/Qwen3 (bias/QK-norm handled by config flags)
+    if model_type == 'qwen2':
+        from nanovllm.models.qwen2 import Qwen2ForCausalLM
+        return Qwen2ForCausalLM
+    # Qwen3 and other compatible architectures
     return Qwen3ForCausalLM
 
 
@@ -684,8 +687,14 @@ class ModelRunner:
                     for j in range(num_accepted - 1):
                         acc_pos = seq_start_pos + j + 1
                         tok_id = all_accepted[seq_idx][j]
-                        # EAGLE-3 needs prenorm hidden; EAGLE-1 uses normed
-                        target_h = hidden[offset + j + 1:offset + j + 2]
+                        # EAGLE-3: pass fc(aux_concat) as hidden (matches vLLM's
+                        # combine_hidden_states fed to set_inputs_first_pass)
+                        # EAGLE-1: pass normed hidden (fc takes embed+hidden directly)
+                        if is_eagle3:
+                            target_h = self.draft_model.combine_hidden_states(
+                                aux_concat[offset + j + 1:offset + j + 2])
+                        else:
+                            target_h = hidden[offset + j + 1:offset + j + 2]
                         inp = self.device.to_device(
                             torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
                         p = self.device.to_device(
@@ -1106,13 +1115,16 @@ class ModelRunner:
                 meta_t = torch.tensor(packed_list, dtype=torch.int64, device=d)
 
                 if self.config.eagle_async:
-                    # EAGLE: merged payload [meta_len_header, meta, hidden_as_int64]
+                    # EAGLE: merged payload [meta_len, meta, verify_ids, hidden_i64]
+                    verify_ids_i64 = verify_ids.to(torch.int64)
+                    n_verify_tok = verify_ids_i64.shape[0]
                     hidden_i64 = early_hidden_all.contiguous().view(-1).view(torch.int64)
-                    total_len = 1 + meta_len + hidden_i64.shape[0]
+                    total_len = 1 + meta_len + n_verify_tok + hidden_i64.shape[0]
                     payload = self._payload_buf[:total_len]
                     payload[0] = meta_len
                     payload[1:1 + meta_len] = meta_t
-                    payload[1 + meta_len:] = hidden_i64
+                    payload[1 + meta_len:1 + meta_len + n_verify_tok] = verify_ids_i64
+                    payload[1 + meta_len + n_verify_tok:] = hidden_i64
                     self._cmd_buf[0] = 5
                     self._cmd_buf[1] = num_seqs_batch
                     self._cmd_buf[2] = total_len

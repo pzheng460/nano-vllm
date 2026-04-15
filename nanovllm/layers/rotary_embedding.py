@@ -8,11 +8,14 @@ def apply_rotary_emb_neox(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
-    """Neox style: split into halves [x1, x2]."""
-    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
-    y1 = x1 * cos - x2 * sin
-    y2 = x2 * cos + x1 * sin
-    return torch.cat((y1, y2), dim=-1).to(x.dtype)
+    """Neox style: split into halves [x1, x2].
+    Matches vLLM: compute in input dtype (bf16), NOT float32."""
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    return torch.cat((o1, o2), dim=-1)
 
 
 def apply_rotary_emb_interleaved(
@@ -21,13 +24,13 @@ def apply_rotary_emb_interleaved(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     """Interleaved (GPT-J) style: rotate paired elements (x0,x1), (x2,x3), ..."""
-    orig_dtype = x.dtype
-    x = x.float()
+    cos = cos.to(x.dtype)
+    sin = sin.to(x.dtype)
     x_even = x[..., 0::2]
     x_odd = x[..., 1::2]
     y_even = x_even * cos - x_odd * sin
     y_odd = x_odd * cos + x_even * sin
-    return torch.stack([y_even, y_odd], dim=-1).reshape_as(x).to(orig_dtype)
+    return torch.stack([y_even, y_odd], dim=-1).reshape_as(x)
 
 
 # Backward compat alias
@@ -64,7 +67,11 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
+        cache = self.cos_sin_cache
+        if cache.dtype != query.dtype or cache.device != query.device:
+            cache = cache.to(device=query.device, dtype=query.dtype)
+            self.cos_sin_cache = cache
+        cos_sin = cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.is_partial:
             query = _apply_partial(query, cos, sin, self.rotary_dim, self._apply_fn)

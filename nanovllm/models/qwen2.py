@@ -1,8 +1,13 @@
+"""Qwen2/Qwen2.5 model.
+
+Differences from Qwen3:
+- QKV projection has bias (attention_bias=True)
+- No QK normalization
+"""
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -12,7 +17,7 @@ from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
-class Qwen3Attention(nn.Module):
+class Qwen2Attention(nn.Module):
 
     def __init__(
         self,
@@ -22,8 +27,6 @@ class Qwen3Attention(nn.Module):
         max_position: int = 4096 * 32,
         head_dim: int | None = None,
         rms_norm_eps: float = 1e-06,
-        qkv_bias: bool = False,
-        qk_norm: bool = True,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
         tp_group: dist.ProcessGroup | None = None,
@@ -41,14 +44,13 @@ class Qwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
-        self.qkv_bias = qkv_bias
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
             self.total_num_kv_heads,
-            bias=qkv_bias,
+            bias=True,
             tp_group=tp_group,
             tp_size=tp_size,
         )
@@ -72,11 +74,6 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        # QK norm: Qwen3 uses it when qkv_bias=False; Llama doesn't
-        self.use_qk_norm = not self.qkv_bias and qk_norm
-        if self.use_qk_norm:
-            self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-            self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
 
     def forward(
         self,
@@ -88,16 +85,13 @@ class Qwen3Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
 
-class Qwen3MLP(nn.Module):
+class Qwen2MLP(nn.Module):
 
     def __init__(
         self,
@@ -132,33 +126,23 @@ class Qwen3MLP(nn.Module):
         return x
 
 
-class Qwen3DecoderLayer(nn.Module):
+class Qwen2DecoderLayer(nn.Module):
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-        tp_group: dist.ProcessGroup | None = None,
-        tp_size: int | None = None,
-    ) -> None:
+    def __init__(self, config, tp_group=None, tp_size=None):
         super().__init__()
-        qkv_bias = getattr(config, 'attention_bias', False)
-        # Qwen3 uses QK norm when attention_bias=False; Llama doesn't
-        qk_norm = getattr(config, 'model_type', 'qwen3') == 'qwen3' and not qkv_bias
-        self.self_attn = Qwen3Attention(
+        self.self_attn = Qwen2Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
             head_dim=getattr(config, 'head_dim', None),
+            rms_norm_eps=config.rms_norm_eps,
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
             tp_group=tp_group,
             tp_size=tp_size,
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = Qwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -184,24 +168,17 @@ class Qwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class Qwen3Model(nn.Module):
+class Qwen2Model(nn.Module):
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-        tp_group: dist.ProcessGroup | None = None,
-        tp_size: int | None = None,
-    ) -> None:
+    def __init__(self, config, tp_group=None, tp_size=None):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, tp_group=tp_group, tp_size=tp_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, tp_group=tp_group, tp_size=tp_size) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([
+            Qwen2DecoderLayer(config, tp_group=tp_group, tp_size=tp_size) for _ in range(config.num_hidden_layers)
+        ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
@@ -210,7 +187,7 @@ class Qwen3Model(nn.Module):
         return hidden_states
 
 
-class Qwen3ForCausalLM(nn.Module):
+class Qwen2ForCausalLM(nn.Module):
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -219,42 +196,27 @@ class Qwen3ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(
-        self,
-        config: Qwen3Config,
-        tp_group: dist.ProcessGroup | None = None,
-        tp_size: int | None = None,
-    ) -> None:
+    def __init__(self, config, tp_group=None, tp_size=None):
         super().__init__()
         self.tp_group = tp_group
         self.tp_size = tp_size if tp_size is not None else (dist.get_world_size(tp_group) if tp_group is not None else dist.get_world_size())
         self.tp_rank = 0 if self.tp_size == 1 else (dist.get_rank(tp_group) if tp_group is not None else dist.get_rank())
-        self.model = Qwen3Model(config, tp_group=tp_group, tp_size=tp_size)
+        self.model = Qwen2Model(config, tp_group=tp_group, tp_size=tp_size)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size, tp_group=tp_group, tp_size=tp_size)
         if config.tie_word_embeddings:
-            self.lm_head.weight.data = self.model.embed_tokens.weight.data
+            self.lm_head.weight = self.model.embed_tokens.weight
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, input_ids, positions):
         return self.model(input_ids, positions)
 
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+    def compute_logits(self, hidden_states):
         return self.lm_head(hidden_states)
 
-    def compute_logits_all(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute logits for ALL positions (bypasses ParallelLMHead's last-index extraction)."""
+    def compute_logits_all(self, hidden_states):
         logits = F.linear(hidden_states, self.lm_head.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0, group=self.tp_group)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            if self.tp_rank == 0:
+                logits = torch.cat(all_logits, dim=-1)
         return logits

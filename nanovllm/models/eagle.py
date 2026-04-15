@@ -1,6 +1,10 @@
+import os
 import torch
+import torch.nn.functional as F
 from torch import nn
 import torch.distributed as dist
+from glob import glob
+from safetensors import safe_open
 
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
@@ -139,7 +143,7 @@ class EAGLEDecoderLayer(nn.Module):
 
 
 class Eagle3Attention(nn.Module):
-    """EAGLE3 attention: GQA, input_dim=2*hidden (takes concatenated input), no QKV bias."""
+    """EAGLE3 attention: GQA, input_dim=2*H (takes concatenated input), no QKV bias."""
 
     def __init__(self, hidden_size, num_heads, num_kv_heads, max_position=4096*32,
                  head_dim=None, rms_norm_eps=1e-6, rope_theta=1000000, rope_scaling=None,
@@ -177,7 +181,7 @@ class Eagle3Attention(nn.Module):
 
 
 class Eagle3DecoderLayer(nn.Module):
-    """EAGLE3 decoder layer: input_layernorm(embeds) + hidden_norm(fc_out) → cat → attn → post_attn_ln → mlp."""
+    """EAGLE3 decoder layer (layer 0 only): norm embeds + norm hidden -> cat -> attn -> post_attn_ln -> mlp."""
 
     def __init__(self, config, tp_group=None, tp_size=None):
         super().__init__()
@@ -198,7 +202,7 @@ class Eagle3DecoderLayer(nn.Module):
         self.hidden_norm = RMSNorm(H, eps=config.rms_norm_eps)
 
     def forward(self, positions, hidden_states, embeds):
-        # vLLM EAGLE3 layer 0: norm embeds + norm hidden → cat → attn → fused residual
+        # vLLM EAGLE3 layer 0: norm embeds + norm hidden -> cat -> attn -> fused residual
         normed_embeds = self.input_layernorm(embeds)
         normed_hidden = self.hidden_norm(hidden_states)
         residual = hidden_states  # pre-norm hidden as residual
@@ -211,7 +215,13 @@ class Eagle3DecoderLayer(nn.Module):
 
 
 class Eagle3Model(nn.Module):
-    """EAGLE3 model: fc(3*H) + decoder(2*H attn) + own lm_head (reduced vocab) + d2t/t2d mapping."""
+    """EAGLE-3 speculative decoding model.
+
+    Structure mirrors vLLM's Eagle3LlamaForCausalLM:
+      self.model   -- inner model (embed_tokens, fc, layers, norm)
+      self.lm_head -- reduced-vocab head (top-level)
+      self.d2t     -- draft->target vocab mapping (top-level)
+    """
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -220,92 +230,109 @@ class Eagle3Model(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config, draft_config, embed_tokens, tp_group=None, tp_size=None):
+    def __init__(self, config, draft_config, embed_tokens=None, tp_group=None, tp_size=None):
         super().__init__()
         H = config.hidden_size
         draft_vocab = getattr(draft_config, 'draft_vocab_size', config.vocab_size)
-        self.embed_tokens = embed_tokens  # shared with target
-        self.fc = ReplicatedLinear(H * 3, H, bias=False, tp_group=tp_group, tp_size=tp_size)
-        self.midlayer = Eagle3DecoderLayer(draft_config, tp_group=tp_group, tp_size=tp_size)
-        self.norm = RMSNorm(H, eps=config.rms_norm_eps)
-        # Own lm_head with reduced vocab
+        self.draft_vocab_size = draft_vocab
+        self.vocab_size = config.vocab_size
+
+        # Inner model (vLLM: self.model = LlamaModel(...))
+        self.model = nn.Module()
+        if embed_tokens is not None:
+            self.model.embed_tokens = embed_tokens  # shared with target
+        else:
+            from nanovllm.layers.embed_head import VocabParallelEmbedding
+            self.model.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, H, tp_group=tp_group, tp_size=tp_size)
+        self.model.fc = ReplicatedLinear(H * 3, H, bias=False, tp_group=tp_group, tp_size=tp_size)
+        self.model.layers = nn.ModuleList([
+            Eagle3DecoderLayer(draft_config, tp_group=tp_group, tp_size=tp_size)])
+        self.model.norm = RMSNorm(H, eps=config.rms_norm_eps)
+
+        # Top-level: lm_head and vocab mapping (same as vLLM)
         from nanovllm.layers.embed_head import ParallelLMHead
         self.lm_head = ParallelLMHead(draft_vocab, H, tp_group=tp_group, tp_size=tp_size)
-        # d2t: draft_id → target_id mapping (int64)
-        # t2d_mask: target_id → bool (is in draft vocab)
-        # t2d_map: target_id → draft_id (built from d2t after loading)
         self.register_buffer('d2t', torch.zeros(draft_vocab, dtype=torch.int64))
         self.register_buffer('t2d_mask', torch.zeros(config.vocab_size, dtype=torch.bool))
         self.register_buffer('t2d_map', torch.zeros(config.vocab_size, dtype=torch.int64))
-        self.draft_vocab_size = draft_vocab
 
-    def forward(self, input_ids, positions, target_hidden, aux_hiddens=None):
-        token_embeds = self.embed_tokens(input_ids)
-        # Step 0: fc(aux_hiddens) → hidden, then midlayer(hidden, embeds)
-        # Step 1+: no fc, midlayer(previous_output, embeds) directly
+    # -- vLLM-style API --
+
+    def embed_input_ids(self, input_ids):
+        return self.model.embed_tokens(input_ids)
+
+    def combine_hidden_states(self, hidden_states):
+        """Combine auxiliary hidden states from target layers. [N, 3*H] -> [N, H]."""
+        return self.model.fc(hidden_states)
+
+    def forward(self, input_ids, positions, hidden_states, aux_hiddens=None):
+        input_embeds = self.embed_input_ids(input_ids)
         if aux_hiddens is not None:
-            fc_hidden = self.fc(aux_hiddens)
-        else:
-            fc_hidden = target_hidden
-        hidden_states, residual = self.midlayer(positions, fc_hidden, token_embeds)
-        hidden = hidden_states + residual
-        return hidden
-
+            hidden_states = self.combine_hidden_states(aux_hiddens)
+        hidden_states, residual = self.model.layers[0](positions, hidden_states, input_embeds)
+        return hidden_states + residual
 
     def compute_logits(self, hidden_states):
-        """Compute draft logits in reduced vocab space."""
-        import torch.nn.functional as F
-        hidden_normed = self.norm(hidden_states)
+        """Compute logits in draft vocab space."""
+        hidden_normed = self.model.norm(hidden_states)
         return F.linear(hidden_normed, self.lm_head.weight)
 
     def draft_to_target(self, draft_token_ids):
-        """Map draft token IDs (16k) to target token IDs (152k)."""
+        """Map draft token IDs (reduced vocab) -> target token IDs."""
         return self.d2t[draft_token_ids]
 
     def target_to_draft(self, target_token_ids):
-        """Map target token IDs (152k) to draft token IDs (16k)."""
-        return self.t2d[target_token_ids]
+        """Map target token IDs -> draft token IDs."""
+        return self.t2d_map[target_token_ids]
+
+    # -- Weight loading (vLLM-style name remapping) --
 
     def load_weights(self, path):
-        """Custom weight loader handling d2t/t2d buffers and packed modules."""
-        import os
-        import torch as _torch
-        from glob import glob
-        from safetensors import safe_open
-        from nanovllm.utils.loader import _load_weight
-        packed = self.packed_modules_mapping
+        """Load weights with vLLM-style name remapping.
 
-        def _load_tensor(name, tensor):
+        EAGLE-3 checkpoint names:  fc.*, midlayer.*, lm_head.*, norm.*, d2t, t2d
+        Target checkpoint names:   model.embed_tokens.*
+
+        Remapping: non-lm_head names get 'model.' prefix; midlayer -> layers.0
+        """
+        from nanovllm.utils.loader import _load_weight
+
+        def _remap_and_load(name, tensor):
+            # Vocab-mapping buffers
             if name == 'd2t':
-                self.d2t.copy_(tensor.to(self.d2t.dtype))
-            elif name == 't2d':
-                self.t2d_mask.copy_(tensor.to(_torch.bool))
-            else:
-                try:
-                    _load_weight(self, packed, name, tensor)
-                except (AttributeError, KeyError):
-                    pass
+                # d2t stores offsets: target_id = draft_id + d2t[draft_id]
+                base = torch.arange(tensor.shape[0], dtype=tensor.dtype, device="cpu")
+                direct = (tensor + base).to(dtype=self.d2t.dtype, device=self.d2t.device)
+                self.d2t.copy_(direct)
+                return
+            if name == 't2d':
+                return  # reverse mapping built from d2t below
+            # vLLM convention: everything except lm_head lives under model.*
+            if 'lm_head' not in name and not name.startswith('model.'):
+                name = 'model.' + name
+            if 'midlayer.' in name:
+                name = name.replace('midlayer.', 'layers.0.')
+            try:
+                _load_weight(self, self.packed_modules_mapping, name, tensor)
+            except (AttributeError, KeyError, RuntimeError):
+                pass  # skip weights that don't match (e.g., target model layers)
 
         safetensor_files = glob(os.path.join(path, "*.safetensors"))
         if safetensor_files:
             for file in safetensor_files:
                 with safe_open(file, "pt", "cpu") as f:
                     for name in f.keys():
-                        _load_tensor(name, f.get_tensor(name))
+                        _remap_and_load(name, f.get_tensor(name))
         else:
-            import torch
             bin_files = glob(os.path.join(path, "pytorch_model*.bin"))
             for file in bin_files:
                 state_dict = torch.load(file, map_location="cpu", weights_only=True)
                 for name, tensor in state_dict.items():
-                    _load_tensor(name, tensor)
+                    _remap_and_load(name, tensor)
                 del state_dict
 
-        # d2t stores OFFSETS: actual_target_id = draft_id + d2t[draft_id]
-        # Convert to direct mapping
-        base = _torch.arange(self.d2t.shape[0], device=self.d2t.device, dtype=self.d2t.dtype)
-        self.d2t.add_(base)  # now d2t[draft_id] = target_id directly
-        # Build reverse mapping: target_id → draft_id
+        # Build reverse mapping: target_id -> draft_id
         for draft_id in range(self.d2t.shape[0]):
             target_id = self.d2t[draft_id].item()
             if target_id < self.t2d_map.shape[0]:

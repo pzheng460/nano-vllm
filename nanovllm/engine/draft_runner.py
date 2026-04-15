@@ -849,55 +849,8 @@ class EAGLEDraftModel(torch.nn.Module):
         return hidden
 
 
-class Eagle3DraftModel(torch.nn.Module):
-    """EAGLE-3 draft model for async SSD. FC(3H→H) + Eagle3DecoderLayer + own lm_head (reduced vocab)."""
-    packed_modules_mapping = {
-        "q_proj": ("qkv_proj", "q"),
-        "k_proj": ("qkv_proj", "k"),
-        "v_proj": ("qkv_proj", "v"),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
+# Eagle3DraftModel removed: now uses Eagle3Model from nanovllm.models.eagle
 
-    def __init__(self, target_config, draft_config):
-        super().__init__()
-        from nanovllm.models.eagle import Eagle3Attention, Eagle3DecoderLayer
-        H = target_config.hidden_size
-        draft_vocab = getattr(draft_config, 'draft_vocab_size', target_config.vocab_size)
-        self.draft_vocab_size = draft_vocab
-
-        # Shared embed_tokens loaded from target checkpoint
-        self.model = torch.nn.Module()
-        self.model.embed_tokens = VocabParallelEmbedding(target_config.vocab_size, H, tp_size=1)
-        # FC: 3*H → H (tri-layer fusion)
-        from nanovllm.layers.linear import ReplicatedLinear
-        self.fc = ReplicatedLinear(H * 3, H, bias=False, tp_size=1)
-        # Eagle3 decoder layer (2H attention input)
-        self.midlayer = Eagle3DecoderLayer(draft_config, tp_size=1)
-        # Own norm and lm_head (reduced vocab)
-        self.norm = RMSNorm(H, eps=target_config.rms_norm_eps)
-        self.lm_head = ParallelLMHead(draft_vocab, H, tp_size=1)
-        # d2t / t2d mapping buffers
-        self.register_buffer('d2t', torch.zeros(draft_vocab, dtype=torch.int64))
-        self.register_buffer('t2d', torch.zeros(target_config.vocab_size, dtype=torch.int64))
-
-    def forward(self, input_ids, positions, hidden_states, aux_hiddens=None):
-        """
-        Args:
-            input_ids: target vocab token ids
-            positions: rope positions
-            hidden_states: previous output (for chain steps) or fc output
-            aux_hiddens: [N, 3*H] tri-layer concat (only for first step)
-        Returns:
-            hidden output [N, H]
-        """
-        token_embeds = self.model.embed_tokens(input_ids)
-        if aux_hiddens is not None:
-            fc_out = self.fc(aux_hiddens)
-        else:
-            fc_out = hidden_states
-        hidden, residual = self.midlayer(positions, fc_out, token_embeds)
-        return hidden + residual
 
 
 class EAGLEDraftRunner:
@@ -934,49 +887,20 @@ class EAGLEDraftRunner:
         eagle_config = config.draft_hf_config if config.draft_hf_config is not None else hf_config
         self.eagle3 = getattr(config, 'eagle3', False)
         if self.eagle3:
-            self.draft_model = Eagle3DraftModel(hf_config, eagle_config)
-            # Load target embed_tokens
-            _load_draft_model(self.draft_model, config.model)
-            # Load EAGLE-3 weights (fc, midlayer, norm, lm_head)
-            # Note: _load_draft_model uses get_parameter which skips buffers (d2t/t2d)
-            _load_draft_model(self.draft_model, config.draft_model)
-            # Manually load d2t buffer (registered buffer, not a parameter)
-            d2t_raw = None
-            safetensor_files = glob(os.path.join(config.draft_model, "*.safetensors"))
-            if safetensor_files:
-                for f in safetensor_files:
-                    with safe_open(f, "pt", "cpu") as sf:
-                        if 'd2t' in sf.keys():
-                            d2t_raw = sf.get_tensor('d2t')
-                            break
-            else:
-                bin_files = glob(os.path.join(config.draft_model, "pytorch_model*.bin"))
-                for f in bin_files:
-                    sd = torch.load(f, map_location="cpu", weights_only=True)
-                    if 'd2t' in sd:
-                        d2t_raw = sd['d2t']
-                    del sd
-            if d2t_raw is not None:
-                # d2t stores offsets: actual_target_id = draft_id + d2t[draft_id]
-                import torch as _torch
-                base = _torch.arange(d2t_raw.shape[0], dtype=d2t_raw.dtype) if 'd2t_raw' in dir() else _torch.arange(d2t_raw.shape[0], dtype=d2t_raw.dtype)
-                d2t_raw = d2t_raw.to(self.device)
-                d2t_direct = d2t_raw + _torch.arange(d2t_raw.shape[0], dtype=d2t_raw.dtype, device=self.device)
-                self.draft_model.d2t.copy_(d2t_direct.to(self.draft_model.d2t.device))
-            # Build t2d reverse mapping
-            d2t = self.draft_model.d2t
-            t2d_map = torch.full((hf_config.vocab_size,), 0, dtype=torch.int64, device=d2t.device)
-            for draft_id in range(d2t.shape[0]):
-                t2d_map[d2t[draft_id]] = draft_id
-            self.draft_model.t2d = t2d_map
-            self.d2t = d2t
+            from nanovllm.models.eagle import Eagle3Model
+            self.draft_model = Eagle3Model(hf_config, eagle_config, tp_size=1)
+            # load_weights handles name remapping and skips mismatched weights;
+            # first call loads target embed_tokens, second loads EAGLE-3 weights + d2t
+            self.draft_model.load_weights(config.model)
+            self.draft_model.load_weights(config.draft_model)
+            self.d2t = self.draft_model.d2t
         else:
             self.draft_model = EAGLEDraftModel(eagle_config)
             _load_draft_model(self.draft_model, config.model)
             _load_draft_model(self.draft_model, config.draft_model)
 
         self.embed_tokens = self.draft_model.model.embed_tokens
-        self.lm_head = self.draft_model.lm_head if not self.eagle3 else self.draft_model.lm_head
+        self.lm_head = self.draft_model.lm_head
 
         self._warmup_and_allocate_kv_cache(eagle_config)
         if init_q is not None:
@@ -1032,10 +956,10 @@ class EAGLEDraftRunner:
         self._sid_buf = torch.zeros(ts1, dtype=torch.int64, device=d)
 
         print(f"[EAGLEDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}", flush=True)
-        norm_mod = self.draft_model.norm if self.eagle3 else self.draft_model.model.norm
-        print(f"[EAGLEDraftRunner] norm.weight norm={norm_mod.weight.data.norm().item():.4f}", flush=True)
+        print(f"[EAGLEDraftRunner] norm.weight norm={self.draft_model.model.norm.weight.data.norm().item():.4f}", flush=True)
         print(f"[EAGLEDraftRunner] lm_head.weight norm={self.lm_head.weight.data.norm().item():.4f}", flush=True)
-        print(f"[EAGLEDraftRunner] fc.weight norm={self.draft_model.fc.weight.data.norm().item():.4f}", flush=True)
+        fc_mod = self.draft_model.model.fc if self.eagle3 else self.draft_model.fc
+        print(f"[EAGLEDraftRunner] fc.weight norm={fc_mod.weight.data.norm().item():.4f}", flush=True)
 
     def _warmup_and_allocate_kv_cache(self, eagle_config):
         hf_config = self.hf_config
@@ -1057,8 +981,8 @@ class EAGLEDraftRunner:
             2, 1, num_blocks, self.block_size, num_kv_heads, head_dim,
             device=self.device, dtype=hf_config.torch_dtype,
         )
-        # EAGLE-1 uses layers[0], EAGLE-3 uses midlayer
-        draft_layer = self.draft_model.midlayer if self.eagle3 else self.draft_model.layers[0]
+        # Both EAGLE-1 and EAGLE-3 now use model.layers[0]
+        draft_layer = self.draft_model.model.layers[0] if self.eagle3 else self.draft_model.layers[0]
         for module in draft_layer.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.eagle_kv_cache[0, 0]
@@ -1180,8 +1104,7 @@ class EAGLEDraftRunner:
             out = self.draft_model(inp, pos, h)
             reset_context()
             if self.eagle3:
-                normed = self.draft_model.norm(out)
-                logits = F.linear(normed, self.draft_model.lm_head.weight)
+                logits = self.draft_model.compute_logits(out)
                 draft_tok = logits.argmax(dim=-1).item()
                 next_token = self.d2t[draft_tok].item()
             else:
@@ -1286,11 +1209,11 @@ class EAGLEDraftRunner:
         payload = self._meta_buf[:payload_len]
         dist.recv(payload, src=0, group=self.async_pg)
 
-        # Split payload: meta from cmd_buf, no .item() on GPU tensors
+        # Split payload: [meta_len, meta..., verify_ids..., hidden_i64...]
         if meta_len is None:
             meta_len = int(payload[0].item())
         meta_part = payload[1:1 + meta_len]
-        hidden_i64 = payload[1 + meta_len:]
+        rest = payload[1 + meta_len:]  # verify_ids + hidden_i64
 
         if num_seqs == 1:
             # === Fast path: read header NOW while GPU idle after recv ===
@@ -1334,27 +1257,53 @@ class EAGLEDraftRunner:
                 bt_off += blen
                 pos_off += plen
 
-        # Reinterpret hidden from int64 back to original dtype
+        # Extract verify_ids and hidden from rest
         total_nv_val = total_nv
+        verify_token_ids = rest[:total_nv_val].to(torch.int64)
+        hidden_i64 = rest[total_nv_val:]
         H = self.hf_config.hidden_size
         hidden_cols = H * 3 if self.eagle3 else H  # EAGLE-3: 3*H, EAGLE-1: H
         n_i64 = total_nv_val * hidden_cols * self.hf_config.torch_dtype.itemsize // 8
         early_hidden_all = hidden_i64[:n_i64].view(self.hf_config.torch_dtype).reshape(total_nv_val, hidden_cols)
 
+        # === Update EAGLE KV cache at verify positions ===
+        # Decode-style forward per position to write KV at decoded positions.
+        h_off = 0
+        bt_off = 0
+        for sid, nv, ntok, btlen, spos in seq_infos:
+            bt_seq = all_bt[bt_off:bt_off + btlen] if num_seqs > 1 else all_bt
+            bt_2d = bt_seq.unsqueeze(0)
+            for j in range(nv):
+                pos_val = int(all_pos[h_off + j].item())
+                bi = pos_val // self.block_size
+                bo = pos_val % self.block_size
+                slot = int(bt_seq[min(bi, btlen - 1)]) * self.block_size + bo
+                tok = verify_token_ids[h_off + j]
+                h_slice = early_hidden_all[h_off + j:h_off + j + 1]
+                sm = torch.tensor([slot], dtype=torch.int32, device=self.device)
+                cl = torch.tensor([pos_val + 1], dtype=torch.int32, device=self.device)
+                set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt_2d)
+                tok_t = tok.unsqueeze(0) if tok.dim() == 0 else tok[None]
+                pos_t = all_pos[h_off + j:h_off + j + 1].to(torch.int64)
+                if self.eagle3:
+                    self.draft_model(tok_t, pos_t, None, aux_hiddens=h_slice)
+                else:
+                    self.draft_model(tok_t, pos_t, h_slice)
+                reset_context()
+            h_off += nv
+            bt_off += btlen
+
         # === Batched processing: all seqs' candidates in one EAGLE forward ===
         fan = self.F
         d = self.device
 
-        # 1. Compute candidate tokens via topk
+        # 1. Compute candidate tokens via topk (approximate: fc without decoder layer)
         if self.eagle3:
-            # EAGLE-3: FC(3H→H) first, then norm+own_lm_head for topk
-            fc_hidden = self.draft_model.fc(early_hidden_all)  # [nv, H]
-            normed_fc = self.draft_model.norm(fc_hidden)
-            early_logits_all = F.linear(normed_fc, self.draft_model.lm_head.weight)
-            _, cands_draft = torch.topk(early_logits_all, fan, dim=-1)  # draft vocab ids
-            # Map draft→target token ids for embedding
-            cands_all = self.d2t[cands_draft]  # target vocab ids
-            normed_all = fc_hidden  # fc output used as hidden for tree decode
+            fc_hidden = self.draft_model.combine_hidden_states(early_hidden_all)
+            early_logits_all = self.draft_model.compute_logits(fc_hidden)
+            _, cands_draft = torch.topk(early_logits_all, fan, dim=-1)
+            cands_all = self.d2t[cands_draft]
+            normed_all = fc_hidden
         else:
             # EAGLE-1: shared norm+lm_head
             normed_all = self.draft_model.model.norm(early_hidden_all)
@@ -1437,15 +1386,14 @@ class EAGLEDraftRunner:
                     else:
                         set_context(False, slot_mapping=all_slots[depth], context_lens=all_ctxs[depth], block_tables=bt_expanded)
                         if self.eagle3:
-                            eagle_out = self.draft_model(current_ids, all_ropes[depth], current_hidden,
-                                                         aux_hiddens=None)  # chain step, no aux
+                            eagle_out = self.draft_model(current_ids, all_ropes[depth], current_hidden)
                         else:
                             eagle_out = self.draft_model(current_ids, all_ropes[depth], current_hidden)
                         reset_context()
                         if self.eagle3:
-                            logits = F.linear(self.draft_model.norm(eagle_out), self.draft_model.lm_head.weight)
+                            logits = self.draft_model.compute_logits(eagle_out)
                             draft_tokens = logits.argmax(dim=-1)
-                            next_tokens = self.d2t[draft_tokens]  # map to target vocab
+                            next_tokens = self.d2t[draft_tokens]
                         else:
                             logits = F.linear(eagle_out, self.lm_head.weight)
                             next_tokens = logits.argmax(dim=-1)
@@ -1476,8 +1424,13 @@ class EAGLEDraftRunner:
                     set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
                     eagle_out = self.draft_model(current_ids, b_ropes, current_hidden)
                     reset_context()
-                    logits = F.linear(eagle_out, self.lm_head.weight)
-                    next_tokens = logits.argmax(dim=-1)
+                    if self.eagle3:
+                        logits = self.draft_model.compute_logits(eagle_out)
+                        draft_tokens = logits.argmax(dim=-1)
+                        next_tokens = self.d2t[draft_tokens]
+                    else:
+                        logits = F.linear(eagle_out, self.lm_head.weight)
+                        next_tokens = logits.argmax(dim=-1)
                     all_draft.append(next_tokens)
                     current_hidden = eagle_out
                     current_ids = next_tokens
@@ -1523,8 +1476,12 @@ class EAGLEDraftRunner:
             set_context(False, slot_mapping=b_slots, context_lens=b_ctxs, block_tables=b_bt)
             eagle_out = self.draft_model(batch_cands, batch_pos, batch_hidden)
             reset_context()
-            logits = F.linear(eagle_out, self.lm_head.weight)
-            draft_tokens = logits.argmax(dim=-1)
+            if self.eagle3:
+                logits = self.draft_model.compute_logits(eagle_out)
+                draft_tokens = self.d2t[logits.argmax(dim=-1)]
+            else:
+                logits = F.linear(eagle_out, self.lm_head.weight)
+                draft_tokens = logits.argmax(dim=-1)
 
             offset = 0
             for sid, nv, ntok, btlen, spos in seq_infos:
