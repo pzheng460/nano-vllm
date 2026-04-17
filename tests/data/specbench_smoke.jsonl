@@ -1,0 +1,10 @@
+{"question_id": 1, "category": "math", "turns": ["A train travels 60 miles per hour for 3 hours. How far does it travel?"]}
+{"question_id": 2, "category": "math", "turns": ["Janet sells 16 pies at $8 each. What is her total revenue?", "If her cost per pie is $3, what is her total profit?"]}
+{"question_id": 3, "category": "reasoning", "turns": ["If today is Wednesday, what day of the week will it be 100 days from now? Show your work."]}
+{"question_id": 4, "category": "writing", "turns": ["Write a two-sentence tagline for a mobile app that helps students plan their study schedule."]}
+{"question_id": 5, "category": "summarization", "turns": ["Summarize this passage in one sentence: 'The Industrial Revolution, which began in Britain in the late 18th century, transformed manufacturing by introducing machinery and factory systems, dramatically increasing production capacity while reshaping social and economic structures across Europe and later the world.'"]}
+{"question_id": 6, "category": "translation", "turns": ["Translate the following English sentence to French: 'The weather is beautiful today, and the garden is full of blooming roses.'"]}
+{"question_id": 7, "category": "coding", "turns": ["Write a Python function called `is_prime(n)` that returns True if `n` is a prime number and False otherwise. Include a short docstring."]}
+{"question_id": 8, "category": "qa", "turns": ["What is the capital of Australia, and what is its approximate population?"]}
+{"question_id": 9, "category": "rag", "turns": ["Using only the following context, answer the question.\n\nContext: Mount Everest is the highest mountain on Earth, with an official height of 8,848.86 meters. It is located in the Himalayan mountain range on the border between Nepal and the Tibet Autonomous Region of China.\n\nQuestion: How tall is Mount Everest, and which countries does it border?"]}
+{"question_id": 10, "category": "mt_bench", "turns": ["Explain the concept of recursion in programming in two sentences.", "Now write a Python function that uses recursion to compute the factorial of a non-negative integer."]}

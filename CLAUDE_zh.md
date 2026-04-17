@@ -219,6 +219,54 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync3
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python bench_ssd.py --mode async3 --early-layers 2 --fan-out 3
 ```
 
+### 回测 Harness（Spec-Bench 对齐）
+
+`tests/` 目录提供了 Spec-Bench 兼容的回归测试框架，输出的 jsonl
+schema 与 [Spec-Bench](https://github.com/hemingkx/Spec-Bench) 完全一致，
+可直接用上游 `evaluation/speed.py` 与 `evaluation/equal.py` 做交叉验证。
+
+```bash
+# Baseline（无投机）
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m tests.harness.run_spec_bench \
+  --mode baseline --model /mnt/data/peizhen/Qwen2-7B-Instruct \
+  --input tests/data/specbench_smoke.jsonl --output /tmp/base.jsonl
+
+# 同步 EAGLE K=3，并打印 speedup 表
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m tests.harness.run_spec_bench \
+  --mode eagle --model /mnt/data/peizhen/Qwen2-7B-Instruct \
+  --draft /mnt/data/peizhen/EAGLE-Qwen2-7B-Instruct --K 3 \
+  --input tests/data/specbench_smoke.jsonl \
+  --output /tmp/eagle.jsonl --baseline-path /tmp/base.jsonl
+
+# 全套 pytest 回归（baseline + sync-EAGLE + async-SSD）
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest tests/test_qwen2_specbench.py -v -s
+```
+
+由于 nano-vllm 的 `init_process_group` 每个进程只能调用一次，pytest
+每个 mode 都通过子进程调用 CLI，保证环境干净。输出的 jsonl 兼容上游
+Spec-Bench 的 `evaluation/speed.py` 和 `evaluation/equal.py`。
+
+`tests/` 目录结构：
+
+- `harness/specbench.py` — Spec-Bench `Question` / `ModelAnswer` I/O
+- `harness/runner.py` — 批大小 1 的逐 prompt runner（记录每步 accept 长度）
+- `harness/metrics.py` — `compute_speed` / `speedup` / `equivalence`
+- `harness/chat.py` — Qwen2 聊天模板辅助函数
+- `harness/run_spec_bench.py` — CLI 入口
+- `data/specbench_smoke.jsonl` — 10 条冒烟样本（覆盖 6 类任务）
+- `test_specbench_io.py` / `test_metrics.py` / `test_chat.py` — 纯单测（不依赖 GPU）
+- `test_qwen2_specbench.py` — 端到端回归（标记 `gpu` / `two_gpu` / `slow`）
+
+回归阈值：
+
+| 检查项 | 阈值 | 说明 |
+|--------|------|------|
+| baseline 输出非空 | 全部通过 | 所有 smoke prompts 都能产生文本 |
+| sync-EAGLE 贪心一致性 | `match_ratio ≥ 0.7` | 允许少量数值漂移导致的 argmax 翻转 |
+| sync-EAGLE 平均接受长度 | `> 1.3` | 若 ≤1.3 说明投机草稿几乎不被接受 |
+| sync-EAGLE 速度回归 | `speedup ≥ 0.95` | 相对 baseline 不应变慢 |
+| async-SSD 贪心一致性 | `match_ratio ≥ 0.75` | 两卡异步路径允许稍大的漂移 |
+
 ## 性能分析与优化流程
 
 ### 使用 torch.profiler 生成火焰图

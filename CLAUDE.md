@@ -213,6 +213,48 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync3
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python bench_ssd.py --mode async3 --early-layers 2 --fan-out 3
 ```
 
+### Regression Test Harness (Spec-Bench compatible)
+
+`tests/harness/` ports [Spec-Bench](https://github.com/hemingkx/Spec-Bench)'s
+jsonl schema so nano-vllm outputs are directly comparable to upstream results.
+
+```bash
+# Baseline (no spec)
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m tests.harness.run_spec_bench \
+  --mode baseline --model /mnt/data/peizhen/Qwen2-7B-Instruct \
+  --input tests/data/specbench_smoke.jsonl --output /tmp/base.jsonl
+
+# Sync EAGLE K=3 with speedup table vs. baseline
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m tests.harness.run_spec_bench \
+  --mode eagle --model /mnt/data/peizhen/Qwen2-7B-Instruct \
+  --draft /mnt/data/peizhen/EAGLE-Qwen2-7B-Instruct --K 3 \
+  --input tests/data/specbench_smoke.jsonl \
+  --output /tmp/eagle.jsonl --baseline-path /tmp/base.jsonl
+
+# Full pytest suite (baseline + sync-EAGLE + async-SSD on 2 GPUs)
+CUDA_VISIBLE_DEVICES=0 .venv/bin/python -m pytest tests/ -v -s -m "gpu and not two_gpu"
+```
+
+Each engine runs in its own subprocess (via the CLI) because nano-vllm's
+`init_process_group` can only be called once per process. Emitted jsonl is
+compatible with upstream Spec-Bench's `evaluation/speed.py` and `equal.py`:
+
+```bash
+python Spec-Bench/evaluation/speed.py \
+  --file-path /tmp/eagle.jsonl --base-path /tmp/base.jsonl \
+  --tokenizer-path /mnt/data/peizhen/Qwen2-7B-Instruct
+```
+
+Harness layout (`tests/`):
+- `harness/specbench.py` — Spec-Bench `Question` / `ModelAnswer` IO
+- `harness/runner.py` — batch=1 instrumented runner (per-step accept lengths)
+- `harness/metrics.py` — `compute_speed`, `speedup`, `equivalence`
+- `harness/chat.py` — Qwen2 chat-template helper
+- `harness/run_spec_bench.py` — CLI entrypoint
+- `data/specbench_smoke.jsonl` — 10-question smoke subset (6 categories)
+- `test_specbench_io.py`, `test_metrics.py`, `test_chat.py` — unit tests (no GPU)
+- `test_qwen2_specbench.py` — end-to-end regression (marked `gpu`/`two_gpu`/`slow`)
+
 ## Profiling & Optimization Workflow
 
 ### Profiling with torch.profiler
