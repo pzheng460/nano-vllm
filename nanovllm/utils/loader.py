@@ -10,6 +10,10 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def _load_weight(model, packed_modules_mapping, weight_name, weight_tensor):
+    # Legacy HF checkpoints stored rotary_emb.inv_freq as buffers; modern
+    # implementations compute it on the fly, so silently skip such keys.
+    if "rotary_emb.inv_freq" in weight_name:
+        return
     for k in packed_modules_mapping:
         if k in weight_name:
             v, shard_id = packed_modules_mapping[k]

@@ -354,8 +354,10 @@ class EAGLEModel(nn.Module):
         self.embed_tokens = embed_tokens   # shared, frozen
         self.lm_head = lm_head             # shared, frozen
         model_type = getattr(config, 'model_type', '')
-        fc_bias = model_type in ('qwen2',)  # Qwen2 EAGLE has fc bias, Llama/Qwen3 don't
-        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=fc_bias, tp_group=tp_group, tp_size=tp_size)
+        # Upstream EAGLE-1 checkpoints (Vicuna, Qwen2) all ship an fc bias;
+        # creating the param unconditionally is safe — when the checkpoint has
+        # no bias, the default zero-init leaves the fused add as a no-op.
+        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_group=tp_group, tp_size=tp_size)
         self.layers = nn.ModuleList([EAGLEDecoderLayer(config, tp_group=tp_group, tp_size=tp_size)])
 
     def forward(

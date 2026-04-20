@@ -153,7 +153,12 @@ class Qwen3DecoderLayer(nn.Module):
             qkv_bias=qkv_bias,
             qk_norm=qk_norm,
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            # Default rope_theta depends on the model family: Qwen2/3 use 1e6,
+            # Llama (incl. Vicuna-7B-v1.3 which doesn't set rope_theta at all) uses 1e4.
+            rope_theta=getattr(
+                config, 'rope_theta',
+                1000000 if getattr(config, 'model_type', 'qwen3').startswith(('qwen',)) else 10000,
+            ),
             rope_scaling=getattr(config, "rope_scaling", None),
             tp_group=tp_group,
             tp_size=tp_size,
