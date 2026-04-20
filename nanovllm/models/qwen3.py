@@ -72,8 +72,8 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
-        # QK norm: Qwen3 uses it when qkv_bias=False; Llama doesn't
-        self.use_qk_norm = not self.qkv_bias and qk_norm
+        # QK norm is applied only when no QKV bias (Qwen3 convention).
+        self.use_qk_norm = qk_norm and not self.qkv_bias
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -141,24 +141,16 @@ class Qwen3DecoderLayer(nn.Module):
         tp_size: int | None = None,
     ) -> None:
         super().__init__()
-        qkv_bias = getattr(config, 'attention_bias', False)
-        # Qwen3 uses QK norm when attention_bias=False; Llama doesn't
-        qk_norm = getattr(config, 'model_type', 'qwen3') == 'qwen3' and not qkv_bias
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            qkv_bias=qkv_bias,
-            qk_norm=qk_norm,
+            qkv_bias=getattr(config, 'attention_bias', False),
+            qk_norm=True,
             head_dim=getattr(config, 'head_dim', None),
-            # Default rope_theta depends on the model family: Qwen2/3 use 1e6,
-            # Llama (incl. Vicuna-7B-v1.3 which doesn't set rope_theta at all) uses 1e4.
-            rope_theta=getattr(
-                config, 'rope_theta',
-                1000000 if getattr(config, 'model_type', 'qwen3').startswith(('qwen',)) else 10000,
-            ),
+            rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
             tp_group=tp_group,
             tp_size=tp_size,

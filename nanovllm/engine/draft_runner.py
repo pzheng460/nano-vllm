@@ -836,9 +836,10 @@ class EAGLEDraftModel(torch.nn.Module):
         self.model = torch.nn.Module()
         self.model.embed_tokens = VocabParallelEmbedding(config.vocab_size, hidden_size, tp_size=1)
         self.model.norm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-        model_type = getattr(config, 'model_type', '')
-        fc_bias = model_type in ('qwen2',)
-        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=fc_bias, tp_size=1)
+        # EAGLE-1 checkpoints vary on whether they ship an fc bias (Qwen2 and
+        # Vicuna do, some Llama variants don't). Always allocate — when the
+        # checkpoint has no bias, the zero-init makes the add a no-op.
+        self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_size=1)
         self.layers = torch.nn.ModuleList([EAGLEDecoderLayer(config, tp_size=1)])
         self.lm_head = ParallelLMHead(config.vocab_size, hidden_size, tp_size=1)
 
