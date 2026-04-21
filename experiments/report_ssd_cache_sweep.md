@@ -137,20 +137,26 @@ Qwen2.5 + EAGLE-3 在 nano-vllm chain K=3 下是 48.8 / 21.3 / 9.1 (mean 1.79)�
 Qwen2.5 + EAGLE-1 (57.5 / 28.8 / 14.6, mean 2.01)，与 EAGLE-3 论文方向相反。
 
 在独立 venv (`/mnt/data/peizhen/Spec-Bench/.venv-specbench`, transformers==4.48.2) 里跑
-**Spec-Bench 官方 `EaModel3.eagenerate()` 的 tree decode** (depth=5, top_k=10,
-auto-tuned total_token≈60) 做第三方参考：
+Spec-Bench 官方 `EaModel3.eagenerate()` 做第三方参考。**apples-to-apples 只能
+用 chain 配置 (top_k=1)** 做对比 — tree decode 每步能接受多个分支 (accept_len
+上限 = depth+1，实测最长 7)，与 nano-vllm 的 chain K=3 (max accept_len 4) 不是同一量级。
 
-| 实现 | 配置 | 120q mean_accept | drafts/step |
+| 实现 | 配置 | 120q mean_accept | max accept_len |
 |---|---|:---:|:---:|
-| Spec-Bench tree | depth=5, top_k=10, total_token≈60 | **3.954** | 2.95 |
-| Spec-Bench chain K=4 | depth=3, top_k=1, total_token=4 | **2.411** | 4 drafts |
-| **Spec-Bench chain K=3** | **depth=2, top_k=1, total_token=3** | **2.133** | **3 drafts** |
-| nano-vllm chain K=3 | — | **1.792** | 3 drafts |
+| nano-vllm chain K=3 (prefill shift fix) | — | **1.946** | 4 |
+| nano-vllm chain K=3 (before fix) | — | 1.792 | 4 |
+| **Spec-Bench chain K=3** (apples-to-apples) | **depth=2, top_k=1, total_token=3** | **2.133** | 4 |
+| Spec-Bench chain K=4 (仅参考) | depth=3, top_k=1, total_token=4 | 2.411 | 5 |
+| Spec-Bench tree (仅 ckpt sanity，不做对齐) | depth=5, top_k=10, total_token≈60 | 3.954 | 7 |
 
-**注意**：Spec-Bench `topK_genrate` 里 `depth=N` 实际产 `N+1` drafts（初始 sample + N 次 chain 迭代）。
-真正 apples-to-apples 的 chain K=3 要用 `depth=2, total_token=3`。
+**注意 1**：Spec-Bench `topK_genrate` 的 `depth=N` 实际产 `N+1` drafts（初始 sample + N 次
+chain 迭代）。真正 K=3 apples-to-apples 要用 `depth=2, top_k=1, total_token=3`。
 
-**真实 gap = 2.133 − 1.792 = 0.341 tokens/step**（nano-vllm 低 **~16%**，不是之前 0.62 那么大）。
+**注意 2**：tree (3.954) 每步可接 7 个 token，和 chain (max 4) 根本不是一个单位，之前把
+tree 当基准直接对比是错的。tree 数据只用来确认 draft checkpoint 本身是健康的。
+
+**真实 apples-to-apples gap**：Spec-Bench chain K=3 (2.133) vs nano-vllm chain K=3 (1.946
+post-shift-fix) = **0.19 tokens/step** (~8.8% 低，远小于最初误报的 26%)。
 
 已排除的怀疑：
 - 草稿 checkpoint 健康（Spec-Bench tree 3.95 确认）
