@@ -702,11 +702,21 @@ class ModelRunner:
                     num_accepted = len(all_accepted[seq_idx])
                     num_verify = len(all_draft_tokens[seq_idx]) + 1
                     seq_start_pos = len(seq) - 1
-                    # Update EAGLE KV at accepted positions with real target hidden
-                    # (skip last accepted — next round's first draft step overwrites it)
+                    # Update EAGLE KV at accepted positions with real target hidden.
+                    # Shift convention: draft KV at position p represents the
+                    # pair (token[p+1], aux[p]) — the same shift the prefill
+                    # path applies — so the input token here must be the one
+                    # AT THE NEXT POSITION after p, i.e. all_accepted[j+1],
+                    # not all_accepted[j] (= token at p itself). Writing the
+                    # token at p itself drifts draft KV off by one vs what
+                    # the EAGLE layer expects, which on long prompts flips
+                    # target's argmax to a different branch (Phase 4 greedy
+                    # violation on summarization/rag categories).
+                    # Skip last accepted — next round's first draft step
+                    # overwrites its slot.
                     for j in range(num_accepted - 1):
                         acc_pos = seq_start_pos + j + 1
-                        tok_id = all_accepted[seq_idx][j]
+                        tok_id = all_accepted[seq_idx][j + 1]
                         # EAGLE-3: pass fc(aux_concat) as hidden (matches vLLM's
                         # combine_hidden_states fed to set_inputs_first_pass)
                         # EAGLE-1: pass normed hidden (fc takes embed+hidden directly)
