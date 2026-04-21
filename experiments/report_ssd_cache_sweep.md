@@ -159,6 +159,18 @@ tree 当基准直接对比是错的。tree 数据只用来确认 draft checkpoin
 post-shift-fix) = 0.19 tokens/step。但 120q 数据里真实 gap 远大于这个数（Spec-Bench
 chain K=3 是 depth=3 total=4 配置 = 2.411，nano 是 1.946，gap 0.47）。
 
+### Phase 4 main model health check (已完成)
+
+用户提醒先确认 target main model 不背锅。对 q=288（长 summarization，prompt ~1500 tokens）在 max_new=512 greedy 下对比三种 baseline：
+
+| 实现 | tokens | 输出前缀 |
+|---|:---:|---|
+| HF baseline (SDPA) | 292 | "The summary describes..." [785, 3015, 5646, ...] |
+| HF baseline (eager) | 292 | 与 SDPA 完全一致 |
+| nano-vllm baseline (flash_attn) | 298 | 前 ~32 tokens 与 HF SDPA 完全一致，之后 bf16 数值漂移 |
+
+结论：target 本身健康。HF 自己的 SDPA vs eager 完全一致；nano 的 flash_attn 与 HF 在 token 32 之前完全对齐，之后差异在 bf16 数值精度范围内。**EAGLE 在 q=288 token 159 commit 错 token `some`（baseline 是 `at`），比 baseline 数值漂移点晚 ~130 tokens，说明不是 target 漂导致的 spec-decode 分歧**——问题锁定在 spec-decode 自身的路径（chain step 0 在 prefill 已写入的位置复用 aux hidden）。
+
 ### Phase 4 greedy correctness violation 发现 (task #10)
 
 对 120q per-question 分析发现 gap 高度分类型集中：
@@ -209,6 +221,28 @@ France..."`) 上两边输出完全一致、accept 100%。
 - aux 层选择（`[1, N/2-1, N-4]`，与 SpecForge 训练默认一致）
 - fc 权重形状 (3584×10752 = 3×H)、`combine_hidden_states` 调用点
 - d2t offset → absolute 转换
+- Target main model 数值（SDPA vs eager vs flash_attn 前 ~32 token 逐字一致）
+
+### Root-cause hypothesis: chain step 0 shift convention (未修复)
+
+对比 Spec-Bench (`cnets.py::topK_genrate`) 和 vLLM (`vllm/v1/spec_decode/eagle.py::set_inputs_first_pass`) 的 EAGLE chain 实现，两者都遵循 **-1 shift convention**：
+
+1. **Prefill**：draft 位置 p 接收 `(token[p+1], target_aux[p])`，输出预测 `token[p+2]`
+2. **d_0 采样**：从 prefill 最后位置的 draft 输出 hidden 过 lm_head 得 d_0 = token[L+1]，**不需要额外 forward**
+3. **Chain step i (i=0..K-2)**：在 position `L+i` forward，输入 `(d_i, prev_out)`，其中 prev_out 是 **draft 自己上一步的输出** 而非 target aux
+4. **共 K-1 次 forward 得 d_1..d_{K-1}**（加上 prefill 来的 d_0 凑 K 个 draft token）
+
+nano-vllm 当前实现两处偏离：
+- **chain step 0 输入**：`(bonus, target_aux[L-1])` at position L，相当于重复了 prefill 最后一 slot 的 pair，只是位置移到了 L。但 position embedding 已经不一样——draft 在训练时 position p 学的是 `(token[p+1], aux[p])` 预测 `token[p+2]`，位置 L 上喂 `(token[L], aux[L-1])` 语义错位
+- **d_0 采样途径**：走一次 step 0 forward 产出，而非直接从 prefill last hidden 拿；两者结果在 BF16 下不必然一致
+
+**已试过的 minimal patch（没效果）**：把 accept-loop 的 update 范围从 `L+1..L+m-1` 扩到 `L..L+m-1`，覆盖掉 chain step 0 在 L 上写的"错位 pair"。q=288 单题 mean_accept 1.167 → 1.157（噪声内）。说明根因在 **当前 round 的 chain step 0 自身**，不是下一轮读到的 KV 错。
+
+**未实施的 full fix**：
+1. `_run_prefill_with_hidden` 捕获每条 seq draft 的 prefill 最后位置输出 → `_draft_prev_hidden[seq_id]`
+2. `_run_speculative_decode` 开头：`d_0 = argmax(draft_model.compute_logits(draft_prev_hidden))`（EAGLE-3 再过 d2t）
+3. chain 缩成 K-1 次 forward，在 position `L+step` 输入 `(d_step, prev_out)`；prev_out 初值 = `draft_prev_hidden`
+4. 每次 chain forward 后 `prev_out = draft_out`；accept 后把对应 accepted 位置的 draft_out 存回 `_draft_prev_hidden` 以供下一轮；m ≥ K-1 时需多一次补写
 
 ### Phase 3.4 op-level bisection（已完成部分）
 
