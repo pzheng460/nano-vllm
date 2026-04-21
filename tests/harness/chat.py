@@ -30,7 +30,7 @@ def build_turn_input_ids(tokenizer, turns: list[str], prior_replies: list[str]) 
             messages, add_generation_prompt=True, tokenize=True
         )
     except Exception:
-        text = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        text = _fastchat_vicuna_prompt(messages)
         return list(tokenizer(text, add_special_tokens=True)["input_ids"])
     # Some transformers versions return a BatchEncoding dict instead of list[int].
     if hasattr(ids, "keys") and "input_ids" in ids:
@@ -38,6 +38,44 @@ def build_turn_input_ids(tokenizer, turns: list[str], prior_replies: list[str]) 
     if ids and isinstance(ids[0], (list, tuple)):  # batched shape [[...]]
         ids = ids[0]
     return list(ids)
+
+
+def _fastchat_vicuna_template(messages: list[dict]) -> str:
+    """Vicuna v1.1 conversation template (legacy tokenizers without chat_template).
+
+    Matches `fastchat.model.get_conversation_template("vicuna")` so that EAGLE-
+    Vicuna draft sees the same formatting it was trained on.
+    """
+    sys_prompt = (
+        "A chat between a curious user and an artificial intelligence assistant. "
+        "The assistant gives helpful, detailed, and polite answers to the user's "
+        "questions."
+    )
+    parts: list[str] = [sys_prompt]
+    for m in messages:
+        if m["role"] == "user":
+            parts.append(f" USER: {m['content']}")
+        elif m["role"] == "assistant":
+            parts.append(f" ASSISTANT: {m['content']}</s>")
+        else:
+            raise ValueError(f"unexpected role: {m['role']}")
+    parts.append(" ASSISTANT:")
+    return "".join(parts)
+
+
+def _fastchat_vicuna_prompt(messages: list[dict]) -> str:
+    try:
+        from fastchat.model.model_adapter import get_conversation_template
+    except Exception:
+        return _fastchat_vicuna_template(messages)
+    conv = get_conversation_template("vicuna")
+    for m in messages:
+        if m["role"] == "user":
+            conv.append_message(conv.roles[0], m["content"])
+        else:
+            conv.append_message(conv.roles[1], m["content"])
+    conv.append_message(conv.roles[1], None)
+    return conv.get_prompt()
 
 
 def tokenizer_encode_fallback(tokenizer, text: str) -> list[int]:
