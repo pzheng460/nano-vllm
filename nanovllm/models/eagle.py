@@ -363,10 +363,12 @@ class EAGLEModel(nn.Module):
         self.embed_tokens = embed_tokens   # shared, frozen
         self.lm_head = lm_head             # shared, frozen
         model_type = getattr(config, 'model_type', '')
-        # Upstream EAGLE-1 checkpoints (Vicuna, Qwen2) all ship an fc bias;
-        # creating the param unconditionally is safe — when the checkpoint has
-        # no bias, the default zero-init leaves the fused add as a no-op.
+        # Some EAGLE-1 checkpoints ship an fc.bias (Vicuna, Qwen2); others omit
+        # it (EAGLE-LLaMA3.1). Create the param unconditionally, but zero it so
+        # that a checkpoint lacking fc.bias leaves the fused add as a no-op
+        # (torch.empty() would leave garbage and break the draft forward).
         self.fc = ReplicatedLinear(hidden_size * 2, hidden_size, bias=True, tp_group=tp_group, tp_size=tp_size)
+        torch.nn.init.zeros_(self.fc.bias)
         self.layers = nn.ModuleList([EAGLEDecoderLayer(config, tp_group=tp_group, tp_size=tp_size)])
 
     def forward(

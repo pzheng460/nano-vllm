@@ -94,6 +94,15 @@ class ModelRunner:
                 )
             else:
                 eagle_cfg = draft_hf if draft_hf is not None else hf_config
+                # EAGLE draft's config usually omits rope_scaling; inherit from target.
+                # Also override if target has a real scaling type (e.g. 'llama3')
+                # while draft's only carries the HF-synthesized default ({'rope_type':'default'}).
+                tgt_scaling = getattr(hf_config, 'rope_scaling', None)
+                drf_scaling = getattr(eagle_cfg, 'rope_scaling', None)
+                tgt_type = (tgt_scaling or {}).get('rope_type', 'default')
+                drf_type = (drf_scaling or {}).get('rope_type', 'default')
+                if tgt_type != 'default' and drf_type == 'default':
+                    eagle_cfg.rope_scaling = tgt_scaling
                 self.draft_model = EAGLEModel(
                     eagle_cfg,
                     embed_tokens=self.model.model.embed_tokens,
@@ -507,15 +516,26 @@ class ModelRunner:
         # EAGLE uses normed hidden (trained with model.model() output which is post-RMSNorm);
         # MiMo MTP uses unnormed (model returns it directly)
         save_hidden = hidden
-        # Populate EAGLE KV cache during prefill so draft attention has valid context
+        # Populate EAGLE KV cache during prefill so draft attention has valid context.
+        # EAGLE training pairs (token_{i+1}, aux_i) → predict token_{i+2}; we must
+        # shift input_ids by one (drop first token, append sampled bonus at last pos)
+        # before feeding the draft, otherwise draft KV at positions 0..L-1 carries
+        # off-by-one token embeddings and chain-step attention reads wrong context.
         if hasattr(self, 'draft_model') and not getattr(self, '_warmup', False):
+            shifted_ids = input_ids.clone()
+            shifted_ids[:-1] = input_ids[1:]
+            if self.rank == 0:
+                for i, idx in enumerate(last_indices.tolist()):
+                    shifted_ids[idx] = token_ids[i]
+            if self.tp_size > 1:
+                dist.broadcast(shifted_ids, 0, group=self.tp_group)
             ctx = get_context()
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, None, None)
             if is_eagle3:
-                self.draft_model(input_ids, positions, hidden_normed, aux_hiddens=aux_concat)
+                self.draft_model(shifted_ids, positions, hidden_normed, aux_hiddens=aux_concat)
             else:
-                self.draft_model(input_ids, positions, hidden_normed)
+                self.draft_model(shifted_ids, positions, hidden_normed)
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
@@ -1080,10 +1100,43 @@ class ModelRunner:
             # EAGLE-3: extract at 3 layers, send after the last one (N-3)
             eagle3_layers = self._get_eagle3_aux_layers()
             early_layer = n_layers - 3
+            send_after_norm = False
         else:
-            early_layer = n_layers - self.config.ssd_early_layers - 1
+            # ssd_early_layers < 0 means "send post-norm final hidden" (no mid-loop send).
+            send_after_norm = self.config.ssd_early_layers < 0
+            early_layer = -1 if send_after_norm else n_layers - self.config.ssd_early_layers - 1
             eagle3_layers = ()
         eagle3_hiddens = {}
+
+        def _build_eagle_payload_and_send(hidden_to_send):
+            """Pack meta + verify_ids + hidden into one buffer and isend (EAGLE async)."""
+            packed_list = []
+            for seq, dt in zip(seqs, all_draft_tokens):
+                nv = len(dt) + 1
+                bt = seq.block_table
+                sp = len(seq) - 1
+                packed_list.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), sp])
+                packed_list.extend(bt)
+                packed_list.extend(range(sp, sp + nv))
+            meta_len = len(packed_list)
+            meta_t = torch.tensor(packed_list, dtype=torch.int64, device=d)
+            verify_ids_i64 = verify_ids.to(torch.int64)
+            n_verify_tok = verify_ids_i64.shape[0]
+            hidden_i64 = hidden_to_send.contiguous().view(-1).view(torch.int64)
+            total_len = 1 + meta_len + n_verify_tok + hidden_i64.shape[0]
+            payload = self._payload_buf[:total_len]
+            payload[0] = meta_len
+            payload[1:1 + meta_len] = meta_t
+            payload[1 + meta_len:1 + meta_len + n_verify_tok] = verify_ids_i64
+            payload[1 + meta_len + n_verify_tok:] = hidden_i64
+            self._cmd_buf[0] = 5
+            self._cmd_buf[1] = len(seqs)
+            self._cmd_buf[2] = total_len
+            self._cmd_buf[3] = meta_len
+            return [
+                dist.isend(self._cmd_buf, dst=self.draft_rank, group=self.async_pg),
+                dist.isend(payload, dst=self.draft_rank, group=self.async_pg),
+            ]
 
         hidden_states = model_inner.embed_tokens(verify_ids)
         residual = None
@@ -1100,39 +1153,9 @@ class ModelRunner:
                     early_hidden_all = torch.cat([eagle3_hiddens[k] for k in sorted_keys], dim=-1)
                 else:
                     early_hidden_all = (hidden_states + residual).clone()
-                # Non-blocking sends: overlap with remaining layers
                 num_seqs_batch = len(seqs)
-                # Build packed meta
-                packed_list = []
-                for seq, dt in zip(seqs, all_draft_tokens):
-                    nv = len(dt) + 1
-                    bt = seq.block_table
-                    seq_start_pos = len(seq) - 1
-                    packed_list.extend([seq.seq_id, nv, len(seq) + len(dt), len(bt), seq_start_pos])
-                    packed_list.extend(bt)
-                    packed_list.extend(range(seq_start_pos, seq_start_pos + nv))
-                meta_len = len(packed_list)
-                meta_t = torch.tensor(packed_list, dtype=torch.int64, device=d)
-
                 if self.config.eagle_async:
-                    # EAGLE: merged payload [meta_len, meta, verify_ids, hidden_i64]
-                    verify_ids_i64 = verify_ids.to(torch.int64)
-                    n_verify_tok = verify_ids_i64.shape[0]
-                    hidden_i64 = early_hidden_all.contiguous().view(-1).view(torch.int64)
-                    total_len = 1 + meta_len + n_verify_tok + hidden_i64.shape[0]
-                    payload = self._payload_buf[:total_len]
-                    payload[0] = meta_len
-                    payload[1:1 + meta_len] = meta_t
-                    payload[1 + meta_len:1 + meta_len + n_verify_tok] = verify_ids_i64
-                    payload[1 + meta_len + n_verify_tok:] = hidden_i64
-                    self._cmd_buf[0] = 5
-                    self._cmd_buf[1] = num_seqs_batch
-                    self._cmd_buf[2] = total_len
-                    self._cmd_buf[3] = meta_len
-                    _async_send_handles = [
-                        dist.isend(self._cmd_buf, dst=self.draft_rank, group=self.async_pg),
-                        dist.isend(payload, dst=self.draft_rank, group=self.async_pg),
-                    ]
+                    _async_send_handles = _build_eagle_payload_and_send(early_hidden_all)
                 else:
                     # MTP: separate sends matching MTP draft recv protocol
                     meta_only = []
@@ -1156,6 +1179,11 @@ class ModelRunner:
                     ]
 
         hidden_states, residual = model_inner.norm(hidden_states, residual)
+
+        # Post-norm send path (ssd_early_layers < 0): send fully normed final
+        # hidden so draft uses the same last_hidden distribution as sync EAGLE.
+        if send_after_norm and self.rank == 0 and self.async_pg is not None and self.config.eagle_async:
+            _async_send_handles = _build_eagle_payload_and_send(hidden_states.clone())
 
         # Wait for async sends to complete before proceeding
         for h in _async_send_handles:

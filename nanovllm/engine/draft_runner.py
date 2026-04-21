@@ -915,6 +915,8 @@ class EAGLEDraftRunner:
             self._batched_eagle_graphs = {}
             self._eagle_graph = None
             self._g = None
+            self._glue_graph = None
+            self._glue_g = None
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
@@ -1034,6 +1036,43 @@ class EAGLEDraftRunner:
                 pool = graph.pool()
             self._batched_eagle_graphs[bs] = (graph, g)
             torch.cuda.synchronize()
+
+        # --- Glue forward graph (EAGLE-1, bs=K+1) ---
+        # Captures norm + EAGLE glue forward + lm_head + top-F into one replay,
+        # so the common bs=1 handle_early_speculate path avoids per-kernel Python
+        # overhead. Outputs land in gg["normed"] / gg["cands"]; the per-depth
+        # tree-decode graph above still runs K times after this.
+        gg = {
+            "ids":       torch.zeros(nv, dtype=torch.int64, device=d),
+            "pos":       torch.zeros(nv, dtype=torch.int64, device=d),
+            "early_raw": torch.zeros(nv, hf.hidden_size, dtype=hf.torch_dtype, device=d),
+            "normed":    torch.zeros(nv, hf.hidden_size, dtype=hf.torch_dtype, device=d),
+            "cands":     torch.zeros(nv, self.F, dtype=torch.int64, device=d),
+            "slot":      torch.zeros(nv, dtype=torch.int32, device=d),
+            "ctx":       torch.zeros(nv, dtype=torch.int32, device=d),
+            "bt":        torch.zeros(nv, max_num_blocks, dtype=torch.int32, device=d),
+        }
+
+        def _glue_body():
+            n = self.draft_model.model.norm(gg["early_raw"])
+            self.draft_model(gg["ids"], gg["pos"], n)
+            lg = F.linear(n, self.lm_head.weight)
+            _, cds = torch.topk(lg, self.F, dim=-1)
+            gg["normed"].copy_(n)
+            gg["cands"].copy_(cds)
+
+        with torch.inference_mode():
+            set_context(False, slot_mapping=gg["slot"], context_lens=gg["ctx"], block_tables=gg["bt"])
+            _glue_body()  # warmup
+            reset_context()
+            graph = torch.cuda.CUDAGraph()
+            set_context(False, slot_mapping=gg["slot"], context_lens=gg["ctx"], block_tables=gg["bt"])
+            with torch.cuda.graph(graph, pool):
+                _glue_body()
+            reset_context()
+        self._glue_graph = graph
+        self._glue_g = gg
+        torch.cuda.synchronize()
 
     @torch.inference_mode()
     def _capture_eagle_graph(self, eagle_config):
@@ -1267,32 +1306,75 @@ class EAGLEDraftRunner:
         n_i64 = total_nv_val * hidden_cols * self.hf_config.torch_dtype.itemsize // 8
         early_hidden_all = hidden_i64[:n_i64].view(self.hf_config.torch_dtype).reshape(total_nv_val, hidden_cols)
 
-        # === Update EAGLE KV cache at verify positions ===
-        # Decode-style forward per position to write KV at decoded positions.
-        h_off = 0
-        bt_off = 0
-        for sid, nv, ntok, btlen, spos in seq_infos:
-            bt_seq = all_bt[bt_off:bt_off + btlen] if num_seqs > 1 else all_bt
-            bt_2d = bt_seq.unsqueeze(0)
-            for j in range(nv):
-                pos_val = int(all_pos[h_off + j].item())
-                bi = pos_val // self.block_size
-                bo = pos_val % self.block_size
-                slot = int(bt_seq[min(bi, btlen - 1)]) * self.block_size + bo
-                tok = verify_token_ids[h_off + j]
-                h_slice = early_hidden_all[h_off + j:h_off + j + 1]
-                sm = torch.tensor([slot], dtype=torch.int32, device=self.device)
-                cl = torch.tensor([pos_val + 1], dtype=torch.int32, device=self.device)
-                set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt_2d)
-                tok_t = tok.unsqueeze(0) if tok.dim() == 0 else tok[None]
-                pos_t = all_pos[h_off + j:h_off + j + 1].to(torch.int64)
-                if self.eagle3:
-                    self.draft_model(tok_t, pos_t, None, aux_hiddens=h_slice)
-                else:
-                    self.draft_model(tok_t, pos_t, h_slice)
-                reset_context()
-            h_off += nv
-            bt_off += btlen
+        # === Prepare slot/ctx/bt tensors for the glue forward ===
+        blk = self.block_size
+        if num_seqs == 1:
+            _, nv, _, btlen, _ = seq_infos[0]
+            pos_slice = all_pos[:nv]
+            bi = (pos_slice // blk).long().clamp(max=btlen - 1)
+            glue_slot_t = (all_bt[bi] * blk + (pos_slice % blk).to(torch.int32)).to(torch.int32)
+            glue_ctx_t = (pos_slice + 1).to(torch.int32)
+            glue_bt_t = all_bt.unsqueeze(0).expand(nv, -1).contiguous()
+        else:
+            bt_off = 0; h_off = 0
+            glue_slots_all = []; glue_ctxs_all = []; glue_bts_all = []
+            for sid, nv, ntok, btlen, spos in seq_infos:
+                bt_seq = all_bt[bt_off:bt_off + btlen]
+                pos_slice = all_pos[h_off:h_off + nv]
+                bi = (pos_slice // blk).long().clamp(max=btlen - 1)
+                glue_slots_all.append((bt_seq[bi] * blk + (pos_slice % blk).to(torch.int32)).to(torch.int32))
+                glue_ctxs_all.append((pos_slice + 1).to(torch.int32))
+                glue_bts_all.append(bt_seq.unsqueeze(0).expand(nv, -1))
+                h_off += nv
+                bt_off += btlen
+            glue_slot_t = torch.cat(glue_slots_all)
+            glue_ctx_t = torch.cat(glue_ctxs_all)
+            max_bt_len = max(bt.shape[1] for bt in glue_bts_all)
+            glue_bt_t = torch.cat(
+                [F.pad(bt, (0, max_bt_len - bt.shape[1])) for bt in glue_bts_all]
+            ).contiguous()
+        pos_int64 = all_pos[:total_nv_val].to(torch.int64)
+
+        # Glue forward: writes EAGLE KV at verify positions + extracts candidates.
+        # Fast path (EAGLE-1, bs=1, ssd_early_layers >= 0): one CUDA graph replay.
+        # Else: eager forward.
+        use_glue_graph = (
+            not self.eagle3
+            and self._glue_graph is not None
+            and num_seqs == 1
+            and self.config.ssd_early_layers >= 0
+        )
+        if use_glue_graph:
+            gg = self._glue_g
+            gg["ids"].copy_(verify_token_ids)
+            gg["pos"].copy_(pos_int64)
+            gg["early_raw"].copy_(early_hidden_all)
+            gg["slot"].copy_(glue_slot_t)
+            gg["ctx"].copy_(glue_ctx_t)
+            bt_len = glue_bt_t.shape[1]
+            gg["bt"][:, :bt_len] = glue_bt_t
+            if bt_len < gg["bt"].shape[1]:
+                gg["bt"][:, bt_len:] = 0
+            set_context(False, slot_mapping=gg["slot"], context_lens=gg["ctx"], block_tables=gg["bt"])
+            self._glue_graph.replay()
+            reset_context()
+            normed_all_pre = gg["normed"]
+        else:
+            if self.eagle3:
+                normed_all_pre = None
+                glue_hidden_all = early_hidden_all
+            elif self.config.ssd_early_layers < 0:
+                normed_all_pre = early_hidden_all
+                glue_hidden_all = early_hidden_all
+            else:
+                normed_all_pre = self.draft_model.model.norm(early_hidden_all)
+                glue_hidden_all = normed_all_pre
+            set_context(False, slot_mapping=glue_slot_t, context_lens=glue_ctx_t, block_tables=glue_bt_t)
+            if self.eagle3:
+                self.draft_model(verify_token_ids, pos_int64, None, aux_hiddens=glue_hidden_all)
+            else:
+                self.draft_model(verify_token_ids, pos_int64, glue_hidden_all)
+            reset_context()
 
         # === Batched processing: all seqs' candidates in one EAGLE forward ===
         fan = self.F
@@ -1306,10 +1388,14 @@ class EAGLEDraftRunner:
             cands_all = self.d2t[cands_draft]
             normed_all = fc_hidden
         else:
-            # EAGLE-1: shared norm+lm_head
-            normed_all = self.draft_model.model.norm(early_hidden_all)
-            early_logits_all = F.linear(normed_all, self.lm_head.weight)
-            _, cands_all = torch.topk(early_logits_all, fan, dim=-1)
+            # EAGLE-1: shared norm+lm_head (reuse normed_all_pre from glue stage)
+            normed_all = normed_all_pre
+            if use_glue_graph:
+                # Candidates already computed inside the glue graph
+                cands_all = self._glue_g["cands"]
+            else:
+                early_logits_all = F.linear(normed_all, self.lm_head.weight)
+                _, cands_all = torch.topk(early_logits_all, fan, dim=-1)
 
         # 2. Expand via pre-computed fan index
         batch_cands = cands_all.reshape(-1)
