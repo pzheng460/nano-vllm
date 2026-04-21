@@ -156,7 +156,53 @@ chain 迭代）。真正 K=3 apples-to-apples 要用 `depth=2, top_k=1, total_to
 tree 当基准直接对比是错的。tree 数据只用来确认 draft checkpoint 本身是健康的。
 
 **真实 apples-to-apples gap**：Spec-Bench chain K=3 (2.133) vs nano-vllm chain K=3 (1.946
-post-shift-fix) = **0.19 tokens/step** (~8.8% 低，远小于最初误报的 26%)。
+post-shift-fix) = 0.19 tokens/step。但 120q 数据里真实 gap 远大于这个数（Spec-Bench
+chain K=3 是 depth=3 total=4 配置 = 2.411，nano 是 1.946，gap 0.47）。
+
+### Phase 4 greedy correctness violation 发现 (task #10)
+
+对 120q per-question 分析发现 gap 高度分类型集中：
+
+| 类别 | n | mean gap (nano − Spec-Bench) |
+|---|:---:|:---:|
+| coding | 2 | −0.813 |
+| summarization | 20 | **−0.660** |
+| rag | 20 | **−0.608** |
+| stem | 3 | −0.541 |
+| humanities | 3 | −0.453 |
+| math_reasoning | 20 | −0.178 |
+| qa | 20 | −0.135 |
+| translation | 20 | −0.055 |
+
+**长上下文 / 叙事类 prompts 差距最大**，短 prompts 基本持平。
+
+对 qid=288 summarization (prompt ~1500 tokens, nano_gap = −1.20) 做 Phase 4 greedy 检查：
+
+| 输出对 | 首次分歧位置 |
+|---|:---:|
+| nano baseline vs HF baseline | token 33（flash_attn vs SDPA 数值差，可接受）|
+| **nano EAGLE-3 vs nano baseline** | **token 159**（' some' vs ' at'） |
+| **nano EAGLE-1 vs nano baseline** | **token 159**（**同一错误 token** ' some'）|
+| Spec-Bench EAGLE-3 vs HF baseline | token 2 |
+
+**Critical finding**：nano-vllm 的 EAGLE-1 和 EAGLE-3 **在 q=288 第 159 位 commit 同一个错误 token**
+`some`，而 baseline 在相同位置 commit `at`。EAGLE-1 和 EAGLE-3 共享同一 spec-decode 基础设施
+(`model_runner.py` 的 verify + accept 路径)，说明 bug 在这条共享路径，**不是 EAGLE-3 专有问题**。
+
+这违反 `spec-decode-calibration` skill 的 Phase 4 Greedy Sampling Verification:
+> 在 temperature=0 下，spec decode 输出必须与 baseline 逐 token 一致。
+
+120q 聚合里 accept rate 低，本质上是 **target 在 spec-decode 路径上走到与 baseline 不同的分支**，
+draft 训练时对齐的是 baseline 路径，自然预测不中现在的 spec-decode 分支。
+
+触发条件：仅在**长 context** (prompt > ~1500 tokens) 上出现。短 prompt (`"capital of
+France..."`) 上两边输出完全一致、accept 100%。
+
+下一步（task #10）：
+1. 二分 long-context 上 nano baseline 与 EAGLE 输出第一次 diverge 的 round，定位是
+   verify 的哪个 predicted[j] 选错了 token
+2. 怀疑：target verify 时 KV slot_mapping 对某些位置写反、或 flash_attn 的 softmax
+   在长 context 下精度下降到足以翻转 argmax
 
 已排除的怀疑：
 - 草稿 checkpoint 健康（Spec-Bench tree 3.95 确认）
