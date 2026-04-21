@@ -533,9 +533,9 @@ class ModelRunner:
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, None, None)
             if is_eagle3:
-                self.draft_model(shifted_ids, positions, hidden_normed, aux_hiddens=aux_concat)
+                draft_prefill_out = self.draft_model(shifted_ids, positions, hidden_normed, aux_hiddens=aux_concat)
             else:
-                self.draft_model(shifted_ids, positions, hidden_normed)
+                draft_prefill_out = self.draft_model(shifted_ids, positions, hidden_normed)
             set_context(True, ctx.cu_seqlens_q, ctx.cu_seqlens_k, ctx.max_seqlen_q,
                         ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
@@ -544,6 +544,10 @@ class ModelRunner:
                 if not hasattr(self, '_last_aux_hidden'):
                     self._last_aux_hidden = {}
                 self._last_aux_hidden[seq.seq_id] = aux_concat[last_indices[i]:last_indices[i]+1].clone()
+            if hasattr(self, 'draft_model') and not getattr(self, '_warmup', False):
+                if not hasattr(self, '_draft_prev_hidden'):
+                    self._draft_prev_hidden = {}
+                self._draft_prev_hidden[seq.seq_id] = draft_prefill_out[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
 
@@ -585,26 +589,57 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
+    def _sample_draft_tokens(self, draft_hidden, n_seqs, d, is_eagle3):
+        """Sample next draft token from draft hidden (EAGLE-3 applies d2t)."""
+        logits = self.draft_model.compute_logits(draft_hidden)
+        if self.rank == 0:
+            if is_eagle3:
+                draft_ids = logits.argmax(dim=-1)
+                tokens = self.draft_model.d2t[draft_ids].tolist()
+            else:
+                tokens = logits.argmax(dim=-1).tolist()
+        else:
+            tokens = [0] * n_seqs
+        if self.tp_size > 1:
+            t = torch.tensor(tokens, dtype=torch.int64, device=d)
+            dist.broadcast(t, 0, group=self.tp_group)
+            tokens = t.tolist()
+        return tokens
+
     @torch.inference_mode()
     def _run_speculative_decode(self, seqs: list[Sequence]) -> list[list[int]]:
-        """Draft k tokens with EAGLE, then verify with target model."""
-        k = self.num_speculative_tokens
-        all_draft_tokens = []  # per-seq draft token lists
+        """Draft k tokens with EAGLE, then verify with target model.
 
-        # === Draft phase (batched: all seqs together per step) ===
+        Follows Spec-Bench / vLLM's EAGLE chain convention:
+        - d_0 is sampled directly from the draft's prefill-last hidden via
+          compute_logits — no extra forward (the prefill forward already wrote
+          draft KV at position L-1 whose output predicts token[L+1] per the
+          -1 shift the draft was trained on).
+        - Chain runs K-1 forwards producing d_1..d_{K-1}. At position L+i the
+          input pair is (d_i, draft_prev_hidden) — the draft's own previous
+          output hidden stands in for aux[L+i] (which the target hasn't yet
+          produced). Feeding target's stale aux[L-1] at position L (the old
+          nano path) misaligned the draft vs its training shift.
+        """
+        k = self.num_speculative_tokens
         d = self.device.device_name
         n_seqs = len(seqs)
-        block_tables = self.prepare_block_tables(seqs)
-        cur_tokens = [seq.last_token for seq in seqs]
-        cur_positions = [len(seq) - 1 for seq in seqs]
-        cur_hiddens = torch.cat([self.last_hidden[seq.seq_id] for seq in seqs], dim=0)
         is_eagle3 = getattr(self, '_is_eagle3', False)
         all_draft_tokens = [[] for _ in seqs]
 
-        for step in range(k):
+        # === d_0 from draft prefill last hidden (no forward) ===
+        draft_prev_hidden = torch.cat(
+            [self._draft_prev_hidden[seq.seq_id] for seq in seqs], dim=0)
+        d0_tokens = self._sample_draft_tokens(draft_prev_hidden, n_seqs, d, is_eagle3)
+        for i in range(n_seqs):
+            all_draft_tokens[i].append(d0_tokens[i])
+        cur_tokens = d0_tokens
+        cur_hiddens = draft_prev_hidden
+
+        # === Chain K-1 forwards for d_1..d_{K-1} ===
+        for step in range(k - 1):
             input_ids = self.device.to_device(torch.tensor(cur_tokens, dtype=torch.int64, pin_memory=True))
-            positions = self.device.to_device(torch.tensor([p for p in [len(seq) - 1 + step for seq in seqs]], dtype=torch.int64, pin_memory=True))
-            # Compute slot mapping for all seqs
+            positions = self.device.to_device(torch.tensor([len(seq) - 1 + step for seq in seqs], dtype=torch.int64, pin_memory=True))
             slots = []
             ctx_lens = []
             for i, seq in enumerate(seqs):
@@ -615,39 +650,11 @@ class ModelRunner:
                 ctx_lens.append(p + 1)
             slot_map = self.device.to_device(torch.tensor(slots, dtype=torch.int32, pin_memory=True))
             ctx_lens_t = self.device.to_device(torch.tensor(ctx_lens, dtype=torch.int32, pin_memory=True))
-            set_context(False, slot_mapping=slot_map, context_lens=ctx_lens_t, block_tables=self.prepare_block_tables(seqs))
-
-            if is_eagle3:
-                aux_h = None
-                if step == 0 and hasattr(self, '_last_aux_hidden'):
-                    aux_list = [self._last_aux_hidden.get(seq.seq_id) for seq in seqs]
-                    if all(a is not None for a in aux_list):
-                        aux_h = torch.cat(aux_list, dim=0)
-                draft_hidden = self.draft_model(input_ids, positions, cur_hiddens, aux_hiddens=aux_h)
-            else:
-                draft_hidden = self.draft_model(input_ids, positions, cur_hiddens)
+            set_context(False, slot_mapping=slot_map, context_lens=ctx_lens_t,
+                        block_tables=self.prepare_block_tables(seqs))
+            draft_hidden = self.draft_model(input_ids, positions, cur_hiddens)
             reset_context()
-
-            # Get draft logits
-            if getattr(self, '_is_eagle3', False):
-                draft_logits = self.draft_model.compute_logits(draft_hidden)
-                if self.rank == 0:
-                    draft_ids = draft_logits.argmax(dim=-1)
-                    tokens = self.draft_model.d2t[draft_ids].tolist()
-                else:
-                    tokens = [0] * n_seqs
-            else:
-                draft_logits = self.model.compute_logits_all(draft_hidden)
-                if self.rank == 0:
-                    tokens = draft_logits.argmax(dim=-1).tolist()
-                else:
-                    tokens = [0] * n_seqs
-
-            if self.tp_size > 1:
-                t = torch.tensor(tokens, dtype=torch.int64, device=d)
-                dist.broadcast(t, 0, group=self.tp_group)
-                tokens = t.tolist()
-
+            tokens = self._sample_draft_tokens(draft_hidden, n_seqs, d, is_eagle3)
             for i in range(n_seqs):
                 all_draft_tokens[i].append(tokens[i])
             cur_tokens = tokens
@@ -694,7 +701,16 @@ class ModelRunner:
                 all_accepted.append(accepted)
                 offset += num_verify
 
-            # === EAGLE first-pass: update EAGLE KV for accepted tokens (matches vLLM) ===
+            # === EAGLE KV refresh after accept (Spec-Bench/vLLM convention) ===
+            # Chain step wrote positions L..L+K-2 using (d_i, draft_prev_out)
+            # pairs — draft's own hidden stood in for aux. After verify we
+            # have real target aux[L..L+K], so replay draft at accepted
+            # positions L..L+m-1 (m=num_accepted) using the -1 shift pair
+            # (token[p+1] = accepted[j], aux[p] = aux[L+j]) — the same pair
+            # prefill uses. The last replay's output hidden is the draft's
+            # hidden at position L+m-1, which is exactly what next round's
+            # chain step 0 needs as `draft_prev_hidden` (prev-slot draft
+            # output) at its position L_new-1 = L+m-1.
             if hasattr(self, 'draft_model'):
                 d = self.device.device_name
                 offset = 0
@@ -702,29 +718,15 @@ class ModelRunner:
                     num_accepted = len(all_accepted[seq_idx])
                     num_verify = len(all_draft_tokens[seq_idx]) + 1
                     seq_start_pos = len(seq) - 1
-                    # Update EAGLE KV at accepted positions with real target hidden.
-                    # Shift convention: draft KV at position p represents the
-                    # pair (token[p+1], aux[p]) — the same shift the prefill
-                    # path applies — so the input token here must be the one
-                    # AT THE NEXT POSITION after p, i.e. all_accepted[j+1],
-                    # not all_accepted[j] (= token at p itself). Writing the
-                    # token at p itself drifts draft KV off by one vs what
-                    # the EAGLE layer expects, which on long prompts flips
-                    # target's argmax to a different branch (Phase 4 greedy
-                    # violation on summarization/rag categories).
-                    # Skip last accepted — next round's first draft step
-                    # overwrites its slot.
-                    for j in range(num_accepted - 1):
-                        acc_pos = seq_start_pos + j + 1
-                        tok_id = all_accepted[seq_idx][j + 1]
-                        # EAGLE-3: pass fc(aux_concat) as hidden (matches vLLM's
-                        # combine_hidden_states fed to set_inputs_first_pass)
-                        # EAGLE-1: pass normed hidden (fc takes embed+hidden directly)
+                    last_draft_out = None
+                    for j in range(num_accepted):
+                        acc_pos = seq_start_pos + j
+                        tok_id = all_accepted[seq_idx][j]
                         if is_eagle3:
                             target_h = self.draft_model.combine_hidden_states(
-                                aux_concat[offset + j + 1:offset + j + 2])
+                                aux_concat[offset + j:offset + j + 1])
                         else:
-                            target_h = hidden[offset + j + 1:offset + j + 2]
+                            target_h = hidden[offset + j:offset + j + 1]
                         inp = self.device.to_device(
                             torch.tensor([tok_id], dtype=torch.int64, pin_memory=True))
                         p = self.device.to_device(
@@ -739,8 +741,10 @@ class ModelRunner:
                         cl = self.device.to_device(
                             torch.tensor([acc_pos + 1], dtype=torch.int32, pin_memory=True))
                         set_context(False, slot_mapping=sm, context_lens=cl, block_tables=bt)
-                        self.draft_model(inp, p, target_h)
+                        last_draft_out = self.draft_model(inp, p, target_h)
                         reset_context()
+                    if last_draft_out is not None:
+                        self._draft_prev_hidden[seq.seq_id] = last_draft_out.clone()
                     offset += num_verify
 
             return all_accepted
