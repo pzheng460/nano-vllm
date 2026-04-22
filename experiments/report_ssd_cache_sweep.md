@@ -309,7 +309,33 @@ Spec-Bench 对 `Qwen2ForCausalLM` 的加载路径用 `KVQwen2ForCausalLM`（定�
 3. `model/eagle3/modeling_llama_kv.py::LlamaModel.forward` — 原来只在 idx ∈ {2, N/2, N-3} 累加到 `all_hidden_states`（N 一变就越界），改成 `if output_hidden_states: all_hidden_states += (hidden_states,)` 全累加
 4. `model/eagle3/modeling_llama_kv.py::ROPE_INIT_FUNCTIONS` — 从 `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS` fallback 补 `llama3` / `yarn` / `longrope`（老表只有 default/linear/dynamic，不识别 Llama-3.1 的 `rope_scaling.rope_type="llama3"`）
 
-### vLLM EAGLE-3 对照（来自 vLLM 0.18.1rc，EAGLE-3 chain K=3）
+### Qwen2.5 EAGLE-3 精度对齐（rope_theta fallback bug，commit 3ee32d9）
+
+用 precision-alignment skill 做逐层 diff：nano 和 vLLM 的 `embed / ln_embeds / ln_hidden / qkv` 几乎逐 bit 一致，但 `L0_o_out` 从第 10 个 token 开始就有 max|Δ|=30+ 的分歧，最终 draft `last_hidden` 偏差大到翻转 d_0 采样。再细化到 rotary_emb.cos_sin_cache：
+
+- nano `cos[pos=1, dim_idx=1] = 0.648` → 反推 rope base ≈ **1e4**
+- vLLM `cos[pos=1, dim_idx=1] = 0.691` → 反推 rope base ≈ **1e6** (Qwen2.5 target 的值)
+
+即 nano 的 Qwen2.5 EAGLE-3 draft 在用 **错误的 rope_theta = 10000**（Llama 默认），而 vLLM 用的是 **正确的 1e6**（Qwen2.5 target）。
+
+**根因**：`nanovllm/models/eagle.py::_default_rope_theta` 只查 `hasattr(config, 'rope_theta')`。transformers>=5.x 把 `rope_theta` 搬到 `config.rope_parameters` 字典里，LlamaConfig 本身不再直接暴露 `rope_theta` 属性，于是 nano 的 fallback 走到 model_type 分支——EAGLE-3 draft 的 config 里 `model_type="llama"`，fallback 返回 10000。
+
+**修复**：检查 `config.rope_parameters` 再 fallback。
+
+**效果（Qwen2.5-7B + EAGLE-3, 120q, K=3 chain）**：
+
+| 指标 | 修复前 | 修复后 | vLLM ref |
+|---|---:|---:|---:|
+| mean_accept | 2.028 | **2.494** | 2.496 |
+| pos0 | 56.6% | **69.0%** | 69.0% |
+| pos1 | 29.9% | **47.4%** | 47.4% |
+| pos2 | 16.2% | **33.1%** | 33.2% |
+
+**现在 nano 与 vLLM 的 gap 只剩 0.002 tok/step（0.08%），实质已对齐。**
+
+Llama-3.1 EAGLE-3 rope_parameters.rope_theta=10000，和老 fallback 一致，修复前后完全一样（smoke mean=2.956 未变）。
+
+### vLLM EAGLE-3 对照（vLLM 0.18.1rc，EAGLE-3 chain K=3）
 
 | Model | 指标 | nano | vLLM | Spec-Bench |
 |---|---|---:|---:|---:|
