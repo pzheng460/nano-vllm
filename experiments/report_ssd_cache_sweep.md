@@ -341,23 +341,31 @@ Llama-3.1 EAGLE-3 rope_parameters.rope_theta=10000，和老 fallback 一致，�
 |---|---|---:|---:|---:|
 | Llama-3.1-8B | 120q mean_accept | **2.804** | 2.697 | 2.180 |
 |              | 120q pos0 / pos1 / pos2 | 76.6 / 58.8 / 44.9 | 74.6 / 54.6 / 40.4 | — |
-| Qwen2.5-7B   | 120q mean_accept | 2.028 | **2.496** | 2.411 |
-|              | 120q pos0 / pos1 / pos2 | 56.6 / 29.9 / 16.2 | 69.0 / 47.4 / 33.2 | — |
-|              | smoke 10q mean_accept | 2.71 | **2.84** | — |
+| Qwen2.5-7B (post rope-fix) | 120q mean_accept | **2.494** | 2.496 | 2.411 |
+|              | pos0 / pos1 / pos2 | 69.0% / 47.4% / 33.1% | 69.0% / 47.4% / 33.2% | — |
+| Qwen2.5-7B (pre rope-fix) | 120q mean_accept | 2.028 | 2.496 | 2.411 |
+|              | pos0 / pos1 / pos2 | 56.6% / 29.9% / 16.2% | 69.0% / 47.4% / 33.2% | — |
+| Vicuna-7B (EAGLE-1) | 120q mean_accept | **2.587** | — | 2.512 |
+|              | pos0 / pos1 / pos2 | 74.4% / 51.1% / 33.1% | — | 72.5% / 48.2% / 30.5% |
 
 **结论**：
-- **Llama-3.1 上 nano 全面领先** — 比 vLLM 高 +0.11 tok/step (+4%)，比 Spec-Bench 高 +0.62 (+29%)
-- **Qwen2.5 上 nano 落后 vLLM 0.47 tok/step (-19%)**；短 prompt 上差距较小 (−0.13)，长 prompt 拉大到 −0.5 以上
-- gap 集中在 pos1 / pos2：nano chain 继续到第 2、3 个 draft token 时 Qwen 模型下降得比 vLLM 明显（pos2 相差 17pp）
+- **Llama-3.1 EAGLE-3**：nano 超过 vLLM +0.11 tok/step (+4%)，超过 Spec-Bench +0.62 (+29%)
+- **Qwen2.5 EAGLE-3（rope fix 后）**：nano 与 vLLM 对齐到 0.002 tok/step（0.08%），pos0/1/2 逐位匹配
+- **Vicuna-7B EAGLE-1**：nano 超过 Spec-Bench eagle2 chain3 +0.075 tok/step (+3%)
+- Qwen2.5 上之前 19% 的 gap 全部来自 `_default_rope_theta` 没走 `config.rope_parameters` 分支（transformers 5.x 迁移）；commit 3ee32d9 修好后 pos0 从 56.6% → 69.0%
 
-### Qwen2.5 EAGLE-3 单独的 gap（TODO）
+### Vicuna-7B EAGLE-1 vs Spec-Bench eagle2（逐题）
 
-Llama EAGLE-3 上 nano 已经验证正确。Qwen2.5 EAGLE-3 上 nano 落后 vLLM ~0.47 tok/step。可能线索：
+Spec-Bench 原生只有 `model/eagle`（EAGLE-2 tree）和 `model/eagle2`（EAGLE-1 chain with chain-params）；要和 nano 的 K=3 chain 对齐，用 eagle2 + `total_token=4, depth=3, top_k=1`。120 题逐题统计：
 
-- smoke (短 prompt) 已经有 −0.13 gap，说明不是纯长 context bf16 数值漂移
-- 两者跑同一份 `yuhuili/EAGLE3-Qwen2.5-7B-Instruct`、同一份 Qwen2.5-7B-Instruct，同 K=3
-- q288 上 nano baseline 与 vllm baseline 在 token 62 就发生数值分歧，两者 trajectory 已经不同，所以 accept rate 不是严格可比；但即便算上 trajectory 差异，pos0 accept 差 12pp 已经偏大
-- 未排查：Qwen2.5 EAGLE-3 checkpoint 里 `architectures=["LlamaForCausalLMEagle3"]` / `attention_bias=false` / `head_dim=128` / `rope_theta=1e6` 等与 Llama 的差别有没有在 nano Eagle3Attention 的加载/前向里漏处理；Qwen2 target 的 QKV bias 经过 nano `Qwen2Attention` 与 SpecForge 训练时使用的 target attention 是否等价
+| 统计 | 值 |
+|---|---:|
+| overall mean_gap (nano − spec) | **+0.065** |
+| 题数 gap < −0.3 | 3 |
+| 题数 \|gap\| ≤ 0.3 | 111 |
+| 题数 gap > +0.3 | 6 |
+
+类别平均：coding +0.26, translation +0.12, rag +0.10, qa/math_reasoning/roleplay/stem +0.05~0.07, summarization 0, extraction/humanities −0.15。最差单题 q495 (rag, −0.51) 是 trajectory 长度差异（nano 8 step vs spec 5 step），不是结构性 bug。
 
 ### Phase 3.4 op-level bisection（已完成部分）
 
