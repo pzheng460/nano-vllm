@@ -16,9 +16,19 @@ from nanovllm.layers.rotary_embedding import get_rope
 
 def _default_rope_theta(config) -> float:
     """Pick rope_theta default by model family when the config doesn't set it.
-    Qwen2/Qwen3 use 1e6; LLaMA (and derivatives like Vicuna) use 1e4."""
+    Qwen2/Qwen3 use 1e6; LLaMA (and derivatives like Vicuna) use 1e4.
+
+    transformers>=5.x moved `rope_theta` into `config.rope_parameters` (dict),
+    so a plain hasattr(config, 'rope_theta') returns False even when the JSON
+    file has it. We check both places. Without this fallback EAGLE-3 drafts
+    whose config declares model_type='llama' silently get base=1e4 — and a
+    Qwen2.5 draft that needs base=1e6 gets a ~20pp pos0 accept-rate loss.
+    """
     if hasattr(config, 'rope_theta') and config.rope_theta is not None:
         return float(config.rope_theta)
+    rp = getattr(config, 'rope_parameters', None)
+    if isinstance(rp, dict) and rp.get('rope_theta') is not None:
+        return float(rp['rope_theta'])
     mt = getattr(config, 'model_type', '').lower()
     return 1_000_000.0 if mt.startswith('qwen') else 10_000.0
 from nanovllm.models.qwen3 import Qwen3MLP
