@@ -162,19 +162,17 @@ class LLMEngine:
                     dist.send(meta, dst=self.model_runner.draft_rank, group=self.model_runner.async_pg)
                     ack = torch.zeros(1, dtype=torch.int64, device=self.model_runner.device.device_name)
                     dist.recv(ack, src=self.model_runner.draft_rank, group=self.model_runner.async_pg)
-        # Drop per-seq caches for finished seqs (these hold GPU tensors
-        # clones; left unfreed they grow with every completed prompt and
-        # have been linked to a mid-run CUDA illegal-access crash on
-        # Vicuna-7B + EAGLE-1 around the 13th prompt).
+        # Drop per-seq caches for finished seqs (these hold .clone()'d GPU
+        # tensors; without eviction they grow unbounded and were traced to
+        # a mid-run CUDA illegal-access crash on Vicuna EAGLE-1 ~prompt 13).
         mr = getattr(self, 'model_runner', None)
         if mr is not None:
-            for seq in seqs:
-                if not seq.is_finished:
-                    continue
-                for cache_attr in ('last_hidden', '_last_aux_hidden', '_draft_prev_hidden'):
-                    cache = getattr(mr, cache_attr, None)
-                    if isinstance(cache, dict):
-                        cache.pop(seq.seq_id, None)
+            finished_ids = [seq.seq_id for seq in seqs if seq.is_finished]
+            for cache_attr in ('last_hidden', '_draft_prev_hidden'):
+                cache = getattr(mr, cache_attr, None)
+                if isinstance(cache, dict):
+                    for sid in finished_ids:
+                        cache.pop(sid, None)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens, draft_count, accept_count, per_pos_accept
 

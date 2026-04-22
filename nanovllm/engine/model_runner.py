@@ -111,7 +111,15 @@ class ModelRunner:
                 )
             load_model(self.draft_model, config.draft_model)
         if self.speculative:
+            # Per-seq caches indexed by seq_id. llm_engine.step() evicts the
+            # seq_id when the sequence finishes (see #6 — unbounded growth
+            # caused a CUDA illegal-access crash on Vicuna EAGLE-1).
+            #   last_hidden       — target's final hidden at last prefill pos
+            #                       (MTP path; EAGLE no longer reads it)
+            #   _draft_prev_hidden — draft's prefill output at last position;
+            #                       fed as chain-step-0 `hidden_states`
             self.last_hidden = {}
+            self._draft_prev_hidden = {}
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -540,13 +548,7 @@ class ModelRunner:
                         ctx.max_seqlen_k, ctx.slot_mapping, ctx.context_lens, ctx.block_tables)
         for i, seq in enumerate(seqs):
             self.last_hidden[seq.seq_id] = save_hidden[last_indices[i]:last_indices[i]+1].clone()
-            if is_eagle3:
-                if not hasattr(self, '_last_aux_hidden'):
-                    self._last_aux_hidden = {}
-                self._last_aux_hidden[seq.seq_id] = aux_concat[last_indices[i]:last_indices[i]+1].clone()
             if hasattr(self, 'draft_model') and not getattr(self, '_warmup', False):
-                if not hasattr(self, '_draft_prev_hidden'):
-                    self._draft_prev_hidden = {}
                 self._draft_prev_hidden[seq.seq_id] = draft_prefill_out[last_indices[i]:last_indices[i]+1].clone()
         reset_context()
         return token_ids
@@ -694,10 +696,6 @@ class ModelRunner:
                 # Save hidden at accepted position
                 accepted_idx = offset + len(accepted) - 1
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx+1].clone()
-                if is_eagle3:
-                    if not hasattr(self, '_last_aux_hidden'):
-                        self._last_aux_hidden = {}
-                    self._last_aux_hidden[seq.seq_id] = aux_concat[accepted_idx:accepted_idx+1].clone()
                 all_accepted.append(accepted)
                 offset += num_verify
 
