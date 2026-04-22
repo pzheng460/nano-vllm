@@ -223,7 +223,7 @@ France..."`) 上两边输出完全一致、accept 100%。
 - d2t offset → absolute 转换
 - Target main model 数值（SDPA vs eager vs flash_attn 前 ~32 token 逐字一致）
 
-### Root-cause hypothesis: chain step 0 shift convention (未修复)
+### Root-cause fix: chain step 0 shift convention (已实施 @ 542a3ed)
 
 对比 Spec-Bench (`cnets.py::topK_genrate`) 和 vLLM (`vllm/v1/spec_decode/eagle.py::set_inputs_first_pass`) 的 EAGLE chain 实现，两者都遵循 **-1 shift convention**：
 
@@ -238,11 +238,42 @@ nano-vllm 当前实现两处偏离：
 
 **已试过的 minimal patch（没效果）**：把 accept-loop 的 update 范围从 `L+1..L+m-1` 扩到 `L..L+m-1`，覆盖掉 chain step 0 在 L 上写的"错位 pair"。q=288 单题 mean_accept 1.167 → 1.157（噪声内）。说明根因在 **当前 round 的 chain step 0 自身**，不是下一轮读到的 KV 错。
 
-**未实施的 full fix**：
+**Full fix 已在 commit 542a3ed 落地**：
 1. `_run_prefill_with_hidden` 捕获每条 seq draft 的 prefill 最后位置输出 → `_draft_prev_hidden[seq_id]`
-2. `_run_speculative_decode` 开头：`d_0 = argmax(draft_model.compute_logits(draft_prev_hidden))`（EAGLE-3 再过 d2t）
-3. chain 缩成 K-1 次 forward，在 position `L+step` 输入 `(d_step, prev_out)`；prev_out 初值 = `draft_prev_hidden`
-4. 每次 chain forward 后 `prev_out = draft_out`；accept 后把对应 accepted 位置的 draft_out 存回 `_draft_prev_hidden` 以供下一轮；m ≥ K-1 时需多一次补写
+2. `_run_speculative_decode` 开头：`d_0 = argmax(draft_model.compute_logits(draft_prev_hidden))`（EAGLE-3 走 d2t）
+3. chain 缩成 K-1 次 forward，在 position `L+step` 输入 `(d_step, prev_out)`；prev_out 初值 = `_draft_prev_hidden`
+4. 每次 chain forward 后 `prev_out = draft_out`；accept 后在 post-accept replay 里复算 L..L+m-1 并把最后一次的 draft_out 存回 `_draft_prev_hidden` 给下一轮
+
+**修复后的指标（Qwen2.5-7B + EAGLE-3）**：
+
+| 指标 | pre-fix | post-fix K=3 | post-fix K=4 | Spec-Bench (K=3 depth3) |
+|---|---:|---:|---:|---:|
+| smoke 10q 贪心一致 | <5/10 | **9/10** | 9/10 | — |
+| 120q mean_accept | 1.983 | 2.028 | 2.095 | 2.411 |
+| EAGLE-1 smoke 贪心一致 | — | **10/10** | — | — |
+
+**按类别的残余 gap（post-fix K=3 vs Spec-Bench）**：
+
+| 类别 | nano post-fix | Spec-Bench | gap |
+|---|---:|---:|---:|
+| summarization | 1.554 | 2.328 | **-0.774** |
+| coding | 2.019 | 2.739 | -0.720 |
+| rag | 1.748 | 2.287 | -0.539 |
+| stem | 2.018 | 2.475 | -0.457 |
+| humanities | 2.016 | 2.392 | -0.376 |
+| qa | 2.170 | 2.225 | -0.055 |
+| translation | 2.042 | 2.042 | 0.000 |
+| math_reasoning | 2.766 | 2.783 | -0.017 |
+| extraction | 2.559 | 2.500 | **+0.059** |
+
+短 prompt 类别（math_reasoning / translation / extraction）已完全对齐或反超，算法侧收敛。**长 prompt 类别仍低 0.5~0.8 tok/step**，与 prompt 长度正相关。
+
+**残余 gap 归因**：Spec-Bench 的 target `modeling_qwen2_kv.py::LlamaAttention` 是 vanilla PyTorch（`matmul(Q,K) + softmax` 显式走 fp32 累加），nano target 走 flash_attn（bf16 累加）。Phase 3.5 里 q288 (~1500 tok prompt) 上 nano flash_attn 与 HF SDPA 在 token 32 之后开始漂移；draft 训练时见到的是 vanilla/SDPA 分支的 target 输出，长 context 下漂开的 token 不在 draft 分布里 → accept_len 掉。
+
+**下一步（task #10 后续）**：若要继续闭合长 context 的 0.5~0.8 tok/step gap，可选
+- 把 target attention 切到 SDPA（只在 `max_seq_len > 阈值` 时生效）做 A/B 测量
+- 验 flash_attn 的 fp32 累加选项（`softmax_scale` 或 backend 层面）
+- 或接受这个现象，当作 flash_attn vs vanilla PyTorch 的 bf16 精度差异的已知副作用
 
 ### Phase 3.4 op-level bisection（已完成部分）
 
