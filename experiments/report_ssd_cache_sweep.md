@@ -266,9 +266,48 @@ nano-vllm 当前实现两处偏离：
 | math_reasoning | 2.766 | 2.783 | -0.017 |
 | extraction | 2.559 | 2.500 | **+0.059** |
 
-短 prompt 类别（math_reasoning / translation / extraction）已完全对齐或反超，算法侧收敛。**长 prompt 类别仍低 0.5~0.8 tok/step**，与 prompt 长度正相关。
+短 prompt 类别（math_reasoning / translation / extraction）已完全对齐或反超。Qwen2.5 长 prompt 类别看似低 0.5~0.8，但 Llama-3.1 的对照实验直接证伪了这是 nano 的问题。
 
-**残余 gap 归因**：Spec-Bench 的 target `modeling_qwen2_kv.py::LlamaAttention` 是 vanilla PyTorch（`matmul(Q,K) + softmax` 显式走 fp32 累加），nano target 走 flash_attn（bf16 累加）。Phase 3.5 里 q288 (~1500 tok prompt) 上 nano flash_attn 与 HF SDPA 在 token 32 之后开始漂移；draft 训练时见到的是 vanilla/SDPA 分支的 target 输出，长 context 下漂开的 token 不在 draft 分布里 → accept_len 掉。
+**Qwen2.5 表观 gap 不是 nano 的问题**（详见下面 Llama-3.1 对照）。对 q288 直接 diff 两端的 raw 输出：
+
+- nano baseline (flash_attn) / HF SDPA / HF eager 都输出 `"The summary details a disturbing incident following a terrorist attack at Garissa University College..."`（连贯摘要，~292 tok）
+- Spec-Bench EAGLE-3 输出 `"The summary\n<|im_start|><|im_start|>user\nSummarize: The decomposing bodies..."`（幻觉成 chat-template echo，515 tok 到 max_new）
+
+Spec-Bench 对 `Qwen2ForCausalLM` 的加载路径用 `KVQwen2ForCausalLM`（定义在 `modeling_qwen2_kv.py` 但类名叫 `LlamaForCausalLM`），新 transformers 合成的 rope_scaling 处理不全，生成时 target 跑飞。所以 2.36 的 mean_accept 是 "draft 预测 Spec-Bench 这个坏了的 target 的幻觉序列" 得到的，不是预测正常摘要。换句话说 **Spec-Bench 在 Qwen2.5 q288 上的高接收率是被 buggy target artifact 抬高的**，nano 的 1.15 是对正常输出采集的真实接收率。
+
+### Llama-3.1 + EAGLE-3 对照实验（决定性）
+
+下载 `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` 跑同 120q、K=3 chain：
+
+| 指标 | nano post-refactor | Spec-Bench |
+|---|---:|---:|
+| smoke 10q mean_accept | 2.96 | — |
+| 120q mean_accept | **2.804** | 2.180 |
+
+**nano 领先 +0.624 tok/step = +29%**。逐题：120 题里 **94 题 nano 领先 >0.3**，仅 6 题 Spec-Bench 领先 >0.3。**13 个 category 全部 nano 赢**：
+
+| 类别 | nano | spec | gap |
+|---|---:|---:|---:|
+| math | 3.45 | 2.50 | **+0.95** |
+| reasoning | 3.09 | 2.21 | +0.88 |
+| extraction | 3.30 | 2.44 | +0.86 |
+| humanities | 2.94 | 2.10 | +0.84 |
+| stem | 2.89 | 2.30 | +0.59 |
+| coding | 3.25 | 2.69 | +0.56 |
+| qa | 2.51 | 1.97 | +0.54 |
+| math_reasoning | 3.00 | 2.48 | +0.51 |
+| translation | 2.36 | 1.85 | +0.51 |
+| rag | 2.67 | 2.20 | +0.47 |
+| summarization | 2.55 | 2.18 | +0.38 |
+| roleplay | 2.23 | 1.85 | +0.37 |
+| writing | 2.26 | 2.07 | +0.19 |
+
+### Spec-Bench 端对照所需的 4 处补丁（都在本地 Spec-Bench clone）
+
+1. `model/eagle3/ea_model.py::forward` — 开 `output_hidden_states=True`，按 `[1+1, N/2-1+1, N-4+1]` 过滤 3 个 aux 层
+2. `model/eagle3/modeling_qwen2_kv.py::_init_rope` — 新 transformers 合成的 `{rope_type:"default"}` 走默认分支
+3. `model/eagle3/modeling_llama_kv.py::LlamaModel.forward` — 原来只在 idx ∈ {2, N/2, N-3} 累加到 `all_hidden_states`（N 一变就越界），改成 `if output_hidden_states: all_hidden_states += (hidden_states,)` 全累加
+4. `model/eagle3/modeling_llama_kv.py::ROPE_INIT_FUNCTIONS` — 从 `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS` fallback 补 `llama3` / `yarn` / `longrope`（老表只有 default/linear/dynamic，不识别 Llama-3.1 的 `rope_scaling.rope_type="llama3"`）
 
 **下一步（task #10 后续）**：若要继续闭合长 context 的 0.5~0.8 tok/step gap，可选
 - 把 target attention 切到 SDPA（只在 `max_seq_len > 阈值` 时生效）做 A/B 测量
