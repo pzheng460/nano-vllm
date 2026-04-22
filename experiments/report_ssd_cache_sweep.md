@@ -309,10 +309,29 @@ Spec-Bench 对 `Qwen2ForCausalLM` 的加载路径用 `KVQwen2ForCausalLM`（定�
 3. `model/eagle3/modeling_llama_kv.py::LlamaModel.forward` — 原来只在 idx ∈ {2, N/2, N-3} 累加到 `all_hidden_states`（N 一变就越界），改成 `if output_hidden_states: all_hidden_states += (hidden_states,)` 全累加
 4. `model/eagle3/modeling_llama_kv.py::ROPE_INIT_FUNCTIONS` — 从 `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS` fallback 补 `llama3` / `yarn` / `longrope`（老表只有 default/linear/dynamic，不识别 Llama-3.1 的 `rope_scaling.rope_type="llama3"`）
 
-**下一步（task #10 后续）**：若要继续闭合长 context 的 0.5~0.8 tok/step gap，可选
-- 把 target attention 切到 SDPA（只在 `max_seq_len > 阈值` 时生效）做 A/B 测量
-- 验 flash_attn 的 fp32 累加选项（`softmax_scale` 或 backend 层面）
-- 或接受这个现象，当作 flash_attn vs vanilla PyTorch 的 bf16 精度差异的已知副作用
+### vLLM EAGLE-3 对照（来自 vLLM 0.18.1rc，EAGLE-3 chain K=3）
+
+| Model | 指标 | nano | vLLM | Spec-Bench |
+|---|---|---:|---:|---:|
+| Llama-3.1-8B | 120q mean_accept | **2.804** | 2.697 | 2.180 |
+|              | 120q pos0 / pos1 / pos2 | 76.6 / 58.8 / 44.9 | 74.6 / 54.6 / 40.4 | — |
+| Qwen2.5-7B   | 120q mean_accept | 2.028 | **2.496** | 2.411 |
+|              | 120q pos0 / pos1 / pos2 | 56.6 / 29.9 / 16.2 | 69.0 / 47.4 / 33.2 | — |
+|              | smoke 10q mean_accept | 2.71 | **2.84** | — |
+
+**结论**：
+- **Llama-3.1 上 nano 全面领先** — 比 vLLM 高 +0.11 tok/step (+4%)，比 Spec-Bench 高 +0.62 (+29%)
+- **Qwen2.5 上 nano 落后 vLLM 0.47 tok/step (-19%)**；短 prompt 上差距较小 (−0.13)，长 prompt 拉大到 −0.5 以上
+- gap 集中在 pos1 / pos2：nano chain 继续到第 2、3 个 draft token 时 Qwen 模型下降得比 vLLM 明显（pos2 相差 17pp）
+
+### Qwen2.5 EAGLE-3 单独的 gap（TODO）
+
+Llama EAGLE-3 上 nano 已经验证正确。Qwen2.5 EAGLE-3 上 nano 落后 vLLM ~0.47 tok/step。可能线索：
+
+- smoke (短 prompt) 已经有 −0.13 gap，说明不是纯长 context bf16 数值漂移
+- 两者跑同一份 `yuhuili/EAGLE3-Qwen2.5-7B-Instruct`、同一份 Qwen2.5-7B-Instruct，同 K=3
+- q288 上 nano baseline 与 vllm baseline 在 token 62 就发生数值分歧，两者 trajectory 已经不同，所以 accept rate 不是严格可比；但即便算上 trajectory 差异，pos0 accept 差 12pp 已经偏大
+- 未排查：Qwen2.5 EAGLE-3 checkpoint 里 `architectures=["LlamaForCausalLMEagle3"]` / `attention_bias=false` / `head_dim=128` / `rope_theta=1e6` 等与 Llama 的差别有没有在 nano Eagle3Attention 的加载/前向里漏处理；Qwen2 target 的 QKV bias 经过 nano `Qwen2Attention` 与 SpecForge 训练时使用的 target attention 是否等价
 
 ### Phase 3.4 op-level bisection（已完成部分）
 

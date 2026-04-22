@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--K", type=int, default=3)
+    ap.add_argument("--method", choices=("eagle", "eagle3"), default="eagle")
     ap.add_argument("--max-new-tokens", type=int, default=512)
     ap.add_argument("--max-model-len", type=int, default=2048)
     args = ap.parse_args()
@@ -78,7 +79,7 @@ def main():
         max_model_len=max(args.max_model_len, 2048),
         gpu_memory_utilization=0.85,
         speculative_config={
-            "method": "eagle",
+            "method": args.method,
             "model": args.draft,
             "num_speculative_tokens": args.K,
         },
