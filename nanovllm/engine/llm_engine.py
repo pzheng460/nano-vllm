@@ -168,7 +168,7 @@ class LLMEngine:
         mr = getattr(self, 'model_runner', None)
         if mr is not None:
             finished_ids = [seq.seq_id for seq in seqs if seq.is_finished]
-            for cache_attr in ('last_hidden', '_draft_prev_hidden'):
+            for cache_attr in ('last_hidden', '_draft_prev_hidden', '_pending_draft'):
                 cache = getattr(mr, cache_attr, None)
                 if isinstance(cache, dict):
                     for sid in finished_ids:

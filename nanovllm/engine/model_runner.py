@@ -120,6 +120,11 @@ class ModelRunner:
             #                       fed as chain-step-0 `hidden_states`
             self.last_hidden = {}
             self._draft_prev_hidden = {}
+            # _pending_draft: next step's MTP draft tokens (post-verify flow).
+            # Populated at prefill end and after each decode step. Mirrors
+            # vLLM's propose(): MTP runs on the target's fresh verify hidden
+            # to produce the draft used in the NEXT verify window.
+            self._pending_draft = {}
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -520,7 +525,11 @@ class ModelRunner:
                 dist.broadcast(shifted_ids, 0, group=self.tp_group)
             embeds = self.model.model.embed_tokens(shifted_ids)
             mtp_hidden = hidden if self._mtp_uses_unnormed else hidden_normed
-            self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
+            mtp_out = self.model.model.mtp_layers[0](embeds, mtp_hidden, positions)
+            mtp_normed = mtp_out[0] if isinstance(mtp_out, tuple) else mtp_out
+            # Capture first draft per seq for next step's verify (post-verify flow).
+            if not getattr(self, '_warmup', False):
+                self._stash_pending_draft(seqs, mtp_normed, last_indices)
         # EAGLE uses normed hidden (trained with model.model() output which is post-RMSNorm);
         # MiMo MTP uses unnormed (model returns it directly)
         save_hidden = hidden
@@ -749,73 +758,68 @@ class ModelRunner:
         else:
             return None
 
+    def _stash_pending_draft(self, seqs, mtp_normed, last_indices):
+        """Compute argmax draft from mtp_normed at last_indices and cache per seq.
+        Matches vLLM's propose(): MTP hidden → shared_head.head linear → argmax.
+        Gathers logits across TP (the shared_head.head weight is col-parallel),
+        broadcasts the chosen token to all ranks, then writes _pending_draft[seq_id].
+        """
+        d = self.device.device_name
+        n_seqs = len(seqs)
+        mtp_layer = self.model.model.mtp_layers[0]
+        last_normed = mtp_normed[last_indices] if isinstance(last_indices, torch.Tensor) \
+            else mtp_normed[torch.tensor(last_indices, dtype=torch.int64, device=d)]
+        draft_logits = F.linear(last_normed, mtp_layer.shared_head.head.weight)
+        if self.tp_size > 1:
+            all_l = [torch.empty_like(draft_logits) for _ in range(self.tp_size)] if self.rank == 0 else None
+            dist.gather(draft_logits, all_l, 0, group=self.tp_group)
+            draft_logits = torch.cat(all_l, -1) if self.rank == 0 else None
+        if self.rank == 0:
+            drafts = draft_logits.argmax(dim=-1).tolist()
+        else:
+            drafts = [0] * n_seqs
+        if self.tp_size > 1:
+            t = torch.tensor(drafts, dtype=torch.int64, device=d)
+            dist.broadcast(t, 0, group=self.tp_group)
+            drafts = t.tolist()
+        for i, seq in enumerate(seqs):
+            self._pending_draft[seq.seq_id] = [drafts[i]]
+
     @torch.inference_mode()
     def _run_mtp_decode(self, seqs: list[Sequence]) -> list[list[int]]:
-        """Draft k tokens with MTP layers, then verify with target model.
-        Batched: all seqs processed together per draft step.
+        """MTP decode, vLLM-aligned post-verify draft flow.
+
+        Per-step:
+          1. Use the draft cached in _pending_draft (populated by prefill or the
+             previous decode step). No live draft forward here.
+          2. Run target verify on [last_token, d_0, ..., d_{k-1}] per seq.
+          3. Greedy-accept by comparing target argmax against drafts.
+          4. Run MTP on accepted verify positions with shifted token IDs and
+             the target's UNNORMED hidden. MTP output at each seq's last
+             accepted position becomes the draft for NEXT step's verify.
+
+        This matches vLLM's drafter.propose() call shape: MTP sees (target_hidden[p],
+        embed(token[p+1])) and predicts token[p+2], using the freshly-committed
+        sequence prefix. The prior nano flow drafted BEFORE verify using the stale
+        prefill `last_hidden` → lost ~50pp accept rate vs vLLM on PanGu.
         """
         k = self.num_speculative_tokens
         d = self.device.device_name
         n_seqs = len(seqs)
-        all_draft_tokens = [[] for _ in seqs]
         mtp_layer = self.model.model.mtp_layers[0]
         embed_tokens = self.model.model.embed_tokens
 
-        # === Draft phase (batched) ===
-        block_tables = self.prepare_block_tables(seqs)
-        cur_tokens = [seq.last_token for seq in seqs]
-        cur_positions = [len(seq) - 1 for seq in seqs]
-        cur_hiddens = torch.cat([self.last_hidden[seq.seq_id] for seq in seqs], dim=0)
-
-        def _compute_mtp_logits(normed):
-            if hasattr(mtp_layer, 'shared_head'):
-                return F.linear(normed, mtp_layer.shared_head.head.weight)
-            return F.linear(normed, self.model.lm_head.weight)
-
-        for step in range(k):
-            input_ids = self.device.to_device(torch.tensor(cur_tokens, dtype=torch.int64, pin_memory=True))
-            positions = self.device.to_device(torch.tensor(cur_positions, dtype=torch.int64, pin_memory=True))
-            slot_mapping = []
-            context_lens = []
-            for i, seq in enumerate(seqs):
-                pos = cur_positions[i]
-                bi = pos // self.block_size
-                bo = pos % self.block_size
-                slot_mapping.append(seq.block_table[bi] * self.block_size + bo)
-                context_lens.append(pos + 1)
-            slot_mapping = self.device.to_device(torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True))
-            context_lens_t = self.device.to_device(torch.tensor(context_lens, dtype=torch.int32, pin_memory=True))
-            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens_t, block_tables=block_tables)
-            token_embeds = embed_tokens(input_ids)
-            mtp_normed, _ = mtp_layer(token_embeds, cur_hiddens, positions)
-            reset_context()
-            draft_logits = _compute_mtp_logits(mtp_normed)
-            if self.tp_size > 1:
-                all_l = [torch.empty_like(draft_logits) for _ in range(self.tp_size)] if self.rank == 0 else None
-                dist.gather(draft_logits, all_l, 0, group=self.tp_group)
-                draft_logits = torch.cat(all_l, -1) if self.rank == 0 else None
-            if self.rank == 0:
-                tokens = draft_logits.argmax(dim=-1).tolist()
-            else:
-                tokens = [0] * n_seqs
-            if self.tp_size > 1:
-                t = torch.tensor(tokens, dtype=torch.int64, device=d)
-                dist.broadcast(t, 0, group=self.tp_group)
-                tokens = t.tolist()
-            for i in range(n_seqs):
-                all_draft_tokens[i].append(tokens[i])
-            cur_tokens = tokens
-            cur_positions = [p + 1 for p in cur_positions]
-            cur_hiddens = mtp_normed
+        # === Draft tokens come from _pending_draft (seeded at prefill end) ===
+        all_draft_tokens = [list(self._pending_draft[seq.seq_id]) for seq in seqs]
 
         # === Verify ===
         verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
-        hidden = self.model(verify_ids, verify_pos)
+        hidden = self.model(verify_ids, verify_pos)  # UNNORMED residual out
         hidden_normed = self.model.model.norm(hidden)
         target_logits = self.model.compute_logits_all(hidden_normed)
         reset_context()
 
-        # === Accept ===
+        # === Accept (rank 0) ===
         if self.rank == 0:
             all_accepted = []
             offset = 0
@@ -824,43 +828,109 @@ class ModelRunner:
                 seq_logits = target_logits[offset:offset + num_verify]
                 predicted = seq_logits.argmax(dim=-1).tolist()
                 accepted = []
-                for j in range(k):
+                nd = len(draft_tokens)
+                for j in range(nd):
                     if predicted[j] == draft_tokens[j]:
                         accepted.append(draft_tokens[j])
                     else:
                         accepted.append(predicted[j])
                         break
                 else:
-                    accepted.append(predicted[k])
+                    accepted.append(predicted[nd])
                 all_accepted.append(accepted)
                 offset += num_verify
         else:
             all_accepted = [[] for _ in seqs]
 
-        # === Broadcast accepted tokens (TP) & update last_hidden ===
+        # === Broadcast accepted tokens (TP) ===
         if self.tp_size > 1:
-            n_acc = torch.tensor([len(a) for a in all_accepted], dtype=torch.int64, device=d)
-            dist.broadcast(n_acc, 0, group=self.tp_group)
+            n_acc_t = torch.tensor(
+                [len(a) for a in all_accepted] if self.rank == 0 else [0] * n_seqs,
+                dtype=torch.int64, device=d)
+            dist.broadcast(n_acc_t, 0, group=self.tp_group)
+            n_acc_list = n_acc_t.tolist()
             if self.rank != 0:
-                all_accepted = [[0] * int(n_acc[i].item()) for i in range(n_seqs)]
+                all_accepted = [[0] * n_acc_list[i] for i in range(n_seqs)]
             for i in range(n_seqs):
-                if len(all_accepted[i]) > 0:
+                if n_acc_list[i] > 0:
                     acc_t = torch.tensor(all_accepted[i], dtype=torch.int64, device=d)
                     dist.broadcast(acc_t, 0, group=self.tp_group)
                     if self.rank != 0:
                         all_accepted[i] = acc_t.tolist()
+        else:
+            n_acc_list = [len(a) for a in all_accepted]
 
+        # === Post-verify MTP: generate next step's draft per seq ===
+        # Ragged batch with `num_accepted_i` positions per seq.
+        # At verify pos p (= L + j), input_id = accepted[j] (shifted by 1: tok at p+1).
+        mtp_positions_py = []
+        mtp_input_ids_py = []
+        mtp_hidden_idx_py = []
+        mtp_slot_py = []
+        mtp_cu_q = [0]
+        mtp_cu_k = [0]
+        mtp_last_idx_py = []
+        max_q = 0
+        max_k = 0
+
+        verify_offset = 0
+        for i, seq in enumerate(seqs):
+            num_verify = len(self._pending_draft[seq.seq_id]) + 1  # K+1
+            n_acc = n_acc_list[i]
+            L = len(seq) - 1  # position of last_token at verify time
+            for j in range(n_acc):
+                pos = L + j
+                mtp_positions_py.append(pos)
+                mtp_input_ids_py.append(all_accepted[i][j])  # shift: tok at pos+1
+                mtp_hidden_idx_py.append(verify_offset + j)
+                bi = pos // self.block_size
+                bo = pos % self.block_size
+                mtp_slot_py.append(seq.block_table[bi] * self.block_size + bo)
+            mtp_cu_q.append(mtp_cu_q[-1] + n_acc)
+            seqlen_k = L + n_acc  # context covers 0..L+n_acc-1
+            mtp_cu_k.append(mtp_cu_k[-1] + seqlen_k)
+            max_q = max(max_q, n_acc)
+            max_k = max(max_k, seqlen_k)
+            mtp_last_idx_py.append(mtp_cu_q[-1] - 1)
+            verify_offset += num_verify
+
+        mtp_positions = self.device.to_device(
+            torch.tensor(mtp_positions_py, dtype=torch.int64, pin_memory=True))
+        mtp_input_ids = self.device.to_device(
+            torch.tensor(mtp_input_ids_py, dtype=torch.int64, pin_memory=True))
+        mtp_hidden_idx = self.device.to_device(
+            torch.tensor(mtp_hidden_idx_py, dtype=torch.int64, pin_memory=True))
+        mtp_hidden_input = hidden.index_select(0, mtp_hidden_idx)
+        mtp_slot = self.device.to_device(
+            torch.tensor(mtp_slot_py, dtype=torch.int32, pin_memory=True))
+        mtp_cu_q_t = self.device.to_device(
+            torch.tensor(mtp_cu_q, dtype=torch.int32, pin_memory=True))
+        mtp_cu_k_t = self.device.to_device(
+            torch.tensor(mtp_cu_k, dtype=torch.int32, pin_memory=True))
+        mtp_block_tables = self.prepare_block_tables(seqs)
+
+        set_context(True, mtp_cu_q_t, mtp_cu_k_t, max_q, max_k,
+                    mtp_slot, None, mtp_block_tables)
+        mtp_embeds = embed_tokens(mtp_input_ids)
+        mtp_out = mtp_layer(mtp_embeds, mtp_hidden_input, mtp_positions)
+        mtp_normed = mtp_out[0] if isinstance(mtp_out, tuple) else mtp_out
+        reset_context()
+
+        last_idx_t = self.device.to_device(
+            torch.tensor(mtp_last_idx_py, dtype=torch.int64, pin_memory=True))
+        self._stash_pending_draft(seqs, mtp_normed, last_idx_t)
+
+        # Update last_hidden (unused by new flow, kept for external readers) ---
         if self.rank == 0:
             offset = 0
             for seq_idx, seq in enumerate(seqs):
-                num_accepted = len(all_accepted[seq_idx])
-                accepted_idx = offset + num_accepted - 1 if num_accepted > 0 else offset
+                n_acc = n_acc_list[seq_idx]
+                num_verify = len(all_draft_tokens[seq_idx]) + 1
+                accepted_idx = offset + n_acc - 1 if n_acc > 0 else offset
                 self.last_hidden[seq.seq_id] = hidden[accepted_idx:accepted_idx + 1].clone()
-                offset += len(all_draft_tokens[seq_idx]) + 1
+                offset += num_verify
 
-        if self.rank == 0:
-            return all_accepted
-        return None
+        return all_accepted if self.rank == 0 else None
 
     def _send_cmd(self, cmd: int, aux: int = 0):
         """Send command to draft via NCCL. [cmd, aux] in one message."""
