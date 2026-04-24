@@ -42,7 +42,7 @@ class RMSNorm(torch.nn.Module):
         return x
 
 if is_cuda():
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache, flash_attn_func
 
 
 # ---------------------------------------------------------------------------
@@ -273,55 +273,101 @@ class PanguSinkAttention(nn.Module):
             return self._initial_prefill_with_sink(q, k, v, context)
 
     def _gather_and_attend_with_sink(self, q, context, k_cache, v_cache):
-        """Unified sink attention for both decode and verify/prefill-with-cache.
-        Gathers KV from cache, prepends sink, uses flash_attn_varlen_func."""
-        block_size = k_cache.shape[1]
-        sink_k, sink_v = self._sink_k, self._sink_v
+        """Sink attention: split body/sink and merge via LSE.
 
-        # Get per-sequence Q lengths and cached KV lengths
+        Decode path is GPU-only (graph-safe). Prefill-with-cache path uses the
+        same split; the sink broadcast tensors are built with vectorized ops
+        (no .item()/.tolist()) so warmup/verify also stay host-sync-free.
+        """
         if context.is_prefill:
-            cu_q_in = context.cu_seqlens_q
-            num_seqs = cu_q_in.numel() - 1
-            # cu_seqlens_k has NO sink adjustment — raw cached lengths
-            seq_k_lens = [(context.cu_seqlens_k[i+1] - context.cu_seqlens_k[i]).item()
-                          for i in range(num_seqs)]
-        else:
-            num_seqs = q.shape[0]
-            cu_q_in = None
-            seq_k_lens = context.context_lens.tolist()
+            return self._sink_attn_prefill_split(q, context, k_cache, v_cache)
+        return self._sink_attn_decode_split(q, context, k_cache, v_cache)
 
-        new_k_parts, new_v_parts = [], []
-        new_cu_q, new_cu_k = [0], [0]
-        for i in range(num_seqs):
-            cached_len = seq_k_lens[i]
-            # Prepend sink
-            new_k_parts.append(sink_k)
-            new_v_parts.append(sink_v)
-            # Gather cached KV from block_table
-            bt = context.block_tables[i]
-            rem = cached_len
-            for b in range((cached_len + block_size - 1) // block_size):
-                bid = bt[b].item()
-                take = min(rem, block_size)
-                new_k_parts.append(k_cache[bid, :take])
-                new_v_parts.append(v_cache[bid, :take])
-                rem -= take
-            new_cu_k.append(new_cu_k[-1] + self.sink_len + cached_len)
-            q_len = (cu_q_in[i+1] - cu_q_in[i]).item() if cu_q_in is not None else 1
-            new_cu_q.append(new_cu_q[-1] + q_len)
+    def _sink_attn_decode_split(self, q, context, k_cache, v_cache):
+        """Graph-safe decode: one attention over cache, one over sink, merge via LSE.
+        q: [bs, num_heads, head_dim]."""
+        q_b = q.unsqueeze(1)  # [bs, 1, H, D]
+        bs = q_b.shape[0]
+        out_body, lse_body = flash_attn_with_kvcache(
+            q_b, k_cache, v_cache,
+            cache_seqlens=context.context_lens,
+            block_table=context.block_tables,
+            softmax_scale=self.scaling,
+            causal=True,
+            return_softmax_lse=True,
+        )
+        sink_k = self._sink_k.unsqueeze(0).expand(bs, -1, -1, -1).contiguous()
+        sink_v = self._sink_v.unsqueeze(0).expand(bs, -1, -1, -1).contiguous()
+        out_sink, lse_sink, _ = flash_attn_func(
+            q_b, sink_k, sink_v,
+            softmax_scale=self.scaling,
+            causal=False,
+            return_attn_probs=True,
+        )
+        out = self._merge_attn_lse(out_body, lse_body, out_sink, lse_sink)
+        return out.squeeze(1)  # [bs, H, D]
 
-        all_k = torch.cat(new_k_parts, dim=0)
-        all_v = torch.cat(new_v_parts, dim=0)
-        cu_q = torch.tensor(new_cu_q, dtype=torch.int32, device=q.device)
-        cu_k = torch.tensor(new_cu_k, dtype=torch.int32, device=q.device)
-        max_q = max(new_cu_q[i+1] - new_cu_q[i] for i in range(num_seqs))
-        max_k = max(new_cu_k[i+1] - new_cu_k[i] for i in range(num_seqs))
+    def _sink_attn_prefill_split(self, q, context, k_cache, v_cache):
+        """Prefill / verify path: varlen body attention + per-seq sink attention,
+        merged via LSE. Uses block_table for cache gather (no Python-side copy)."""
+        # Body: cache attention via block_table (causal within sequence).
+        out_body, lse_body, _ = flash_attn_varlen_func(
+            q, k_cache, v_cache,
+            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+            softmax_scale=self.scaling, causal=True,
+            block_table=context.block_tables,
+            return_attn_probs=True,
+        )
+        # out_body: [total_q, H, D]; lse_body: [H, total_q] (varlen transposes)
+        # Sink: every query attends to the full sink, causal=False.
+        # Treat all queries as one sequence for sink (same K/V for every q).
+        total_q = q.shape[0]
+        q_flat = q.unsqueeze(0)                                # [1, total_q, H, D]
+        sink_k = self._sink_k.unsqueeze(0)                     # [1, sink_len, Hk, D]
+        sink_v = self._sink_v.unsqueeze(0)                     # [1, sink_len, Hk, D]
+        out_sink, lse_sink, _ = flash_attn_func(
+            q_flat, sink_k, sink_v,
+            softmax_scale=self.scaling, causal=False,
+            return_attn_probs=True,
+        )
+        # out_sink: [1, total_q, H, D]; lse_sink: [1, H, total_q]
+        out_sink = out_sink.squeeze(0)                         # [total_q, H, D]
+        lse_sink = lse_sink.squeeze(0)                         # [H, total_q]
 
-        return flash_attn_varlen_func(
-            q, all_k, all_v,
-            max_seqlen_q=max_q, cu_seqlens_q=cu_q,
-            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
-            softmax_scale=self.scaling, causal=True)
+        # Merge body and sink. lse layout is [H, total_q] for both.
+        out = self._merge_attn_lse_varlen(out_body, lse_body, out_sink, lse_sink)
+        return out
+
+    @staticmethod
+    def _merge_attn_lse(o_a, lse_a, o_b, lse_b):
+        """Merge two attention outputs (batched form) via LSE.
+        Inputs:
+          o_*:   [bs, q_len, H, D]
+          lse_*: [bs, H, q_len]
+        """
+        max_lse = torch.maximum(lse_a, lse_b)
+        e_a = torch.exp(lse_a - max_lse)
+        e_b = torch.exp(lse_b - max_lse)
+        denom = e_a + e_b
+        w_a = (e_a / denom).transpose(1, 2).unsqueeze(-1).to(o_a.dtype)  # [bs, q_len, H, 1]
+        w_b = (e_b / denom).transpose(1, 2).unsqueeze(-1).to(o_b.dtype)
+        return o_a * w_a + o_b * w_b
+
+    @staticmethod
+    def _merge_attn_lse_varlen(o_a, lse_a, o_b, lse_b):
+        """Merge two attention outputs (varlen form) via LSE.
+        Inputs:
+          o_*:   [total_q, H, D]
+          lse_*: [H, total_q]
+        """
+        max_lse = torch.maximum(lse_a, lse_b)
+        e_a = torch.exp(lse_a - max_lse)
+        e_b = torch.exp(lse_b - max_lse)
+        denom = e_a + e_b
+        w_a = (e_a / denom).t().unsqueeze(-1).to(o_a.dtype)  # [total_q, H, 1]
+        w_b = (e_b / denom).t().unsqueeze(-1).to(o_b.dtype)
+        return o_a * w_a + o_b * w_b
 
     def _initial_prefill_with_sink(self, q, k, v, context):
         """Initial prefill (no cache): prepend sink K/V to current batch K/V."""
