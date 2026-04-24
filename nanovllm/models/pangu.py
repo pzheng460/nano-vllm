@@ -44,6 +44,16 @@ class RMSNorm(torch.nn.Module):
 if is_cuda():
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache, flash_attn_func
 
+# Optional: vLLM's fused MoE Triton kernel — drop-in replacement for the
+# Python-side expert loop / BMM paths. Gracefully fall back if not installed.
+import os as _os
+if _os.environ.get("NANOVLLM_NO_FUSED_MOE", "0") == "1":
+    _fused_experts = None
+    _HAS_FUSED_MOE = False
+else:
+    from nanovllm.layers.fused_moe import fused_experts as _fused_experts
+    _HAS_FUSED_MOE = True
+
 
 # ---------------------------------------------------------------------------
 # Sink Attention
@@ -528,14 +538,29 @@ class PanguMoE(nn.Module):
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-        # Expert computation
+        # Expert computation. For large batches (prefill / verify), vLLM's
+        # triton fused_experts beats the Python-loop grouped path by a wide
+        # margin. For small batches (single-token decode at low bs), the
+        # triton kernel launch overhead outweighs its savings and the BMM
+        # path is faster — keep it as the low-NK fast path.
         NK = num_tokens * self.top_k
-        flat_ids = topk_ids.view(-1)
-        flat_w = topk_weights.view(-1)
         if NK <= 256:
+            flat_ids = topk_ids.view(-1)
+            flat_w = topk_weights.view(-1)
             routed_output = self._forward_bmm(hidden_states, flat_ids, flat_w,
                                               num_tokens, hidden_dim)
+        elif _HAS_FUSED_MOE:
+            routed_output = _fused_experts(
+                hidden_states,
+                self.w13_weight,
+                self.w2_weight,
+                topk_weights,
+                topk_ids,
+                inplace=False,
+            )
         else:
+            flat_ids = topk_ids.view(-1)
+            flat_w = topk_weights.view(-1)
             routed_output = self._forward_grouped(hidden_states, flat_ids, flat_w,
                                                   num_tokens, hidden_dim)
 
