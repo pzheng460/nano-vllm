@@ -348,34 +348,53 @@ class MTPDraftRunner:
 
     @torch.inference_mode()
     def _mtp_step(self, token_id, hidden_state, cur_pos, block_table_t):
-        """Single MTP forward step using CUDA graph. Returns (prenorm, logits, next_token)."""
+        """Single MTP forward step. Uses the pre-captured CUDA graph when
+        available (MiMo etc.); falls back to eager for models where the MoE
+        path blocks graph capture (PanGu). Returns (prenorm, logits, next_token).
+        """
         block_idx = cur_pos // self.block_size
         bt_len = block_table_t.shape[0]
         block_offset = cur_pos % self.block_size
         slot = block_table_t[min(block_idx, bt_len - 1)] * self.block_size + block_offset
 
-        g = self._g
-        g["input_id"][0] = token_id
-        g["pos"][0] = cur_pos
-        if hidden_state.dim() == 1:
-            g["hidden"][0].copy_(hidden_state)
-        else:
-            g["hidden"].copy_(hidden_state)
-        g["slot"][0] = slot
-        g["ctx_len"][0] = cur_pos + 1
-        g["bt"][0, :bt_len] = block_table_t
+        if getattr(self, "_g", None) is not None:
+            g = self._g
+            g["input_id"][0] = token_id
+            g["pos"][0] = cur_pos
+            if hidden_state.dim() == 1:
+                g["hidden"][0].copy_(hidden_state)
+            else:
+                g["hidden"].copy_(hidden_state)
+            g["slot"][0] = slot
+            g["ctx_len"][0] = cur_pos + 1
+            g["bt"][0, :bt_len] = block_table_t
+            set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
+            self._mtp_graph.replay()
+            reset_context()
+            logits = self.compute_mtp_logits(g["out_normed"])
+            next_token = logits.argmax(dim=-1).item()
+            return g["out_prenorm"][0].clone(), logits.squeeze(0), next_token
 
-        set_context(False, slot_mapping=g["slot"], context_lens=g["ctx_len"], block_tables=g["bt"])
-        self._mtp_graph.replay()
+        # Eager fallback (PanGu / any model that skipped graph capture)
+        dev = self.device
+        input_id_t = torch.tensor([token_id], dtype=torch.int64, device=dev)
+        pos_t = torch.tensor([cur_pos], dtype=torch.int64, device=dev)
+        hidden = hidden_state.unsqueeze(0) if hidden_state.dim() == 1 else hidden_state
+        slot_t = torch.tensor([int(slot.item()) if torch.is_tensor(slot) else int(slot)],
+                              dtype=torch.int32, device=dev)
+        ctx_len_t = torch.tensor([cur_pos + 1], dtype=torch.int32, device=dev)
+        bt_t = block_table_t.to(torch.int32).reshape(1, -1)
+        set_context(False, slot_mapping=slot_t, context_lens=ctx_len_t, block_tables=bt_t)
+        embeds = self.embed_tokens(input_id_t)
+        mtp_normed, mtp_prenorm = self.mtp_layer(embeds, hidden, pos_t)
         reset_context()
-
-        logits = self.compute_mtp_logits(g["out_normed"])
-        next_token = logits.argmax(dim=-1).item()
-        return g["out_prenorm"][0].clone(), logits.squeeze(0), next_token
+        logits = self.compute_mtp_logits(mtp_normed)
+        d_token = logits.argmax(dim=-1).item()
+        return mtp_prenorm[0].clone(), logits.squeeze(0), d_token
 
     @torch.inference_mode()
     def jit_speculate(self, recovery_token, hidden_state, num_tokens, block_table_t):
-        K = self.Kneng
+        K = self.K
         draft_tokens = []
         cur_token = recovery_token
         cur_pos = num_tokens - 1

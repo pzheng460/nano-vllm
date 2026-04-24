@@ -933,7 +933,7 @@ class ModelRunner:
         return all_accepted if self.rank == 0 else None
 
     def _send_cmd(self, cmd: int, aux: int = 0):
-        """Send command to draft via NCCL. [cmd, aux] in one message."""
+        """Send command to draft via NCCL. [cmd, aux, 0, 0] in one message."""
         if not hasattr(self, '_cmd_buf'):
             return
         self._cmd_buf[0] = cmd
@@ -1125,42 +1125,27 @@ class ModelRunner:
                                 all_draft_tokens.append(draft_tokens)
                                 self._cache_hit += 1
                                 continue
-                    # Cache miss: local MTP fallback
+                    # Cache miss: delegate to draft via cmd=0 (same as EAGLE
+                    # path). Running MTP locally on rank 0 deadlocks when
+                    # tp_size > 1 because its TP collectives (allreduce in
+                    # o_proj / MoE) expect all TP ranks to participate — but
+                    # this block is inside `if self.rank == 0:`. The draft GPU
+                    # has its own single-device MTP replica, so handing the
+                    # JIT speculation off avoids the problem entirely.
                     self._cache_miss += 1
-                    embed_tokens = self.model.model.embed_tokens
-                    target_hidden = self.last_hidden[seq.seq_id]
-                    draft_tokens = []
-                    cur_token_id = seq.last_token
-                    cur_pos = len(seq) - 1
-                    for step in range(k):
-                        input_id = self.device.to_device(
-                            torch.tensor([cur_token_id], dtype=torch.int64, pin_memory=True))
-                        p = self.device.to_device(
-                            torch.tensor([cur_pos], dtype=torch.int64, pin_memory=True))
-                        bi = cur_pos // self.block_size
-                        bo = cur_pos % self.block_size
-                        slot = seq.block_table[bi] * self.block_size + bo
-                        slot_map = self.device.to_device(
-                            torch.tensor([slot], dtype=torch.int32, pin_memory=True))
-                        bt = seq.block_table
-                        if self.config.num_sink_blocks > 0:
-                            bt = list(range(self.config.num_sink_blocks)) + bt
-                        sink_ctx_ssd = self.config.num_sink_blocks * self.block_size
-                        block_table_t = self.device.to_device(
-                            torch.tensor([bt], dtype=torch.int32, pin_memory=True))
-                        context_lens = self.device.to_device(
-                            torch.tensor([cur_pos + 1 + sink_ctx_ssd], dtype=torch.int32, pin_memory=True))
-                        set_context(False, slot_mapping=slot_map, context_lens=context_lens, block_tables=block_table_t)
-                        token_embeds = embed_tokens(input_id)
-                        mtp_normed, mtp_prenorm = mtp_layer(token_embeds, target_hidden, p)
-                        reset_context()
-                        draft_logits = self.model.compute_logits_all(mtp_normed)
-                        d_token = draft_logits.argmax(dim=-1).item()
-                        draft_tokens.append(d_token)
-                        target_hidden = mtp_normed
-                        cur_token_id = d_token
-                        cur_pos += 1
-                    all_draft_tokens.append(draft_tokens)
+                    self._send_cmd(0)
+                    meta = torch.tensor(
+                        [seq.seq_id, getattr(seq, 'last_accepted_len', 0),
+                         seq.last_token, len(seq), len(seq.block_table)],
+                        dtype=torch.int64, device=d)
+                    dist.send(meta, dst=self.draft_rank, group=self.async_pg)
+                    dist.send(self.last_hidden[seq.seq_id].squeeze(0).contiguous(),
+                              dst=self.draft_rank, group=self.async_pg)
+                    dist.send(torch.tensor(seq.block_table, dtype=torch.int32, device=d),
+                              dst=self.draft_rank, group=self.async_pg)
+                    jit_buf = torch.zeros(k, dtype=torch.int64, device=d)
+                    dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
+                    all_draft_tokens.append(jit_buf.tolist())
 
         # Broadcast draft tokens to TP workers
         if self.tp_size > 1:
