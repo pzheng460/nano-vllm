@@ -21,11 +21,13 @@ A lightweight vLLM implementation built from scratch.
 
 ### GPU Installation
 
-For GPU users, 
+For GPU users, we recommend [uv](https://github.com/astral-sh/uv):
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+uv pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
+
+(If you prefer `pip`, `pip install git+https://github.com/GeeeekExplorer/nano-vllm.git` also works.)
 
 ### Ascend NPU Installation
 
@@ -66,9 +68,9 @@ docker run --rm \
 The default workdir is `/workspace`, vLLM and vLLM Ascend code are placed in `/vllm-workspace` and installed in development mode (`pip install -e`) to help developer immediately take place changes without requiring a new installation.
 
 ```bash
-pip install -e .
+uv pip install -e .
 ```
-Install the nano-vllm from source.
+Install the nano-vllm from source (falls back to `pip install -e .` if `uv` is unavailable).
 
 ## Model Download
 
