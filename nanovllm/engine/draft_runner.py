@@ -228,9 +228,16 @@ class MTPDraftRunner:
             init_q.put(config.num_kvcache_blocks)
             init_q.close()
 
-        # CUDA graph capture for single-token MTP decode (skip for Pangu: MoE breaks graph)
-        if not self.is_pangu:
+        # CUDA graph capture for single-token MTP decode.
+        # Pangu was historically skipped because the MoE topk dispatch had
+        # dynamic shapes; now that the BMM path uses fixed [N*top_k, ...]
+        # gathers and the c003a62 sink-attention fix made attention
+        # capturable, capture is safe for Pangu single-token decode too.
+        try:
             self._capture_mtp_graph()
+        except Exception as exc:
+            print(f"[MTPDraftRunner] CUDA graph capture failed ({exc!r}); falling back to eager.", flush=True)
+            self._g = None
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
