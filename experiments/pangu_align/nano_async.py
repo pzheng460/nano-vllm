@@ -14,8 +14,11 @@ PROMPTS = [
     "The capital of France is",
     "Write a Python function that computes the nth Fibonacci number.",
     "List the planets in our solar system.",
+    "What are the advantages and disadvantages of TCP vs UDP?",
+    "Explain how attention works in a transformer model.",
+    "Summarize the theory of relativity in one paragraph.",
 ]
-MAX_TOKENS = 64
+MAX_TOKENS = 128
 
 
 def main():
@@ -31,7 +34,7 @@ def main():
         draft_async=True,
         async_fan_out=3,
         ssd_early_layers=2,
-        ssd_tree_decode=False,  # K=1 → tree not needed
+        ssd_tree_decode=False,  # K=1: tree adds build cost without helping hit rate
     )
     sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
 
