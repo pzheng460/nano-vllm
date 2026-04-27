@@ -32,11 +32,13 @@ def main():
         enforce_eager=True,
         num_speculative_tokens=1,
         draft_async=True,
-        # F=16 brings tree-cache hit ≥90% (top-16 of MTP-on-early covers most
-        # actual recovery tokens). Tuneable via NANO_FAN env.
-        async_fan_out=int(__import__('os').environ.get('NANO_FAN', 16)),
-        ssd_early_layers=int(__import__('os').environ.get('NANO_EARLY', 2)),
-        ssd_tree_decode=False,  # K=1 doesn't engage tree mode anyway
+        # Grid-sweep sweet spot: extract early hidden at 倒数第2层 (e=1)
+        # and predict top-3 candidates (f=3). Cache hit ~95%, ~91 tok/s
+        # on PanGu 4×H100+1draft (within ~10% of sync's 100 tok/s).
+        # Tuneable via NANO_EARLY / NANO_FAN env.
+        async_fan_out=int(__import__('os').environ.get('NANO_FAN', 3)),
+        ssd_early_layers=int(__import__('os').environ.get('NANO_EARLY', 1)),
+        ssd_tree_decode=False,
     )
     sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
 
