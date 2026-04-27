@@ -680,11 +680,25 @@ class MTPDraftRunner:
                 base_vpos = spos + nv
                 per_seq_meta.append((total, base_vpos, max_bi, block_table, grand_total))
             else:
-                # Vectorized slot computation (no Python loop)
+                # Vectorized slot computation. With F candidates per verify
+                # position all sharing the same `flat_pos`, the F MTP forwards
+                # would race-write the same KV slot in arbitrary order; only
+                # the F-th overwrite would survive, yielding the K/V of an
+                # arbitrary candidate (last in batch). To keep MTP KV
+                # deterministic and aligned with the most-likely recovery
+                # token, mark all but the first-of-F write with sentinel -1
+                # (`store_kvcache_kernel` skips slot==-1). Position 0 is the
+                # top-1 candidate (`torch.topk` returns descending-sorted),
+                # so the surviving KV is the top-1 prediction's K/V.
                 flat_pos = batch_pos[grand_total:grand_total+total]
                 bi = (flat_pos // self.block_size).long()
                 bo = (flat_pos % self.block_size).int()
-                all_slot_list.append((block_table[bi] * self.block_size + bo).int())
+                slot_chunk = (block_table[bi] * self.block_size + bo).int()
+                # mask: position-within-F-group != 0 → -1
+                fan_idx = torch.arange(total, device=d, dtype=torch.int32) % fan
+                slot_chunk = torch.where(fan_idx == 0, slot_chunk,
+                                         torch.full_like(slot_chunk, -1))
+                all_slot_list.append(slot_chunk)
                 all_ctx_lens.append((flat_pos + 1).to(torch.int32))
                 all_bt_rows.append(block_table.unsqueeze(0).expand(total, -1))
 
