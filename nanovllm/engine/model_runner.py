@@ -932,6 +932,7 @@ class ModelRunner:
 
         return all_accepted if self.rank == 0 else None
 
+
     def _send_cmd(self, cmd: int, aux: int = 0):
         """Send command to draft via NCCL. [cmd, aux, 0, 0] in one message."""
         if not hasattr(self, '_cmd_buf'):
@@ -1193,9 +1194,18 @@ class ModelRunner:
             early_layer = n_layers - 3
             send_after_norm = False
         else:
-            # ssd_early_layers < 0 means "send post-norm final hidden" (no mid-loop send).
-            send_after_norm = self.config.ssd_early_layers < 0
-            early_layer = -1 if send_after_norm else n_layers - self.config.ssd_early_layers - 1
+            # ssd_early_layers semantic — K MUST be < 0:
+            #   K=-1 → extract after the last layer (= 倒数第1, sync MTP equivalent)
+            #   K=-3 → extract after the 3rd-from-last (= 倒数第3)
+            # The hidden sent to draft is always pre-final-norm (unnormed
+            # residual sum). Draft applies its own norm downstream.
+            ssd_K = self.config.ssd_early_layers
+            assert ssd_K < 0, (
+                f"ssd_early_layers must be < 0 "
+                f"(K=-1 → last layer, K=-N → 倒数第N); got {ssd_K}"
+            )
+            send_after_norm = False
+            early_layer = n_layers + ssd_K   # K=-1 → N-1, K=-3 → N-3
             eagle3_layers = ()
         eagle3_hiddens = {}
 
@@ -1271,15 +1281,22 @@ class ModelRunner:
 
         hidden_states, residual = model_inner.norm(hidden_states, residual)
 
-        # Post-norm send path (ssd_early_layers < 0): send fully normed final
-        # hidden so draft uses the same last_hidden distribution as sync EAGLE.
-        if send_after_norm and self.rank == 0 and self.async_pg is not None and self.config.eagle_async:
-            _async_send_handles = _build_eagle_payload_and_send(hidden_states.clone())
-
         # Wait for async sends to complete before proceeding
         for h in _async_send_handles:
             h.wait()
         hidden = residual  # unnormed, for MTP last_hidden
+
+        # Pipelined recv: as soon as cmd=5 isends are done, kick off the
+        # irecv for the size of draft's push response. This lets the NCCL
+        # transfer overlap with target's logits / accept work below. Wait
+        # at the end of this step (before cleanup_send) to keep p2p ordering.
+        push_sz_irecv = None
+        if (self.rank == 0 and self.async_pg is not None and self.use_mtp
+                and len(_async_send_handles) > 0):
+            if not hasattr(self, '_push_sz_buf'):
+                self._push_sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
+            push_sz_irecv = dist.irecv(
+                self._push_sz_buf, src=self.draft_rank, group=self.async_pg)
 
         target_logits = self.model.compute_logits_all(hidden_states)
         reset_context()
@@ -1316,9 +1333,35 @@ class ModelRunner:
         # Skip MTP KV cache update in SSD mode — cache hit rate ~99% makes it unnecessary
         # (MTP KV only needed for cache miss local fallback, which is rare)
 
-        # Mark push as pending — will be received at the beginning of next step
-        if self.rank == 0 and self.async_pg is not None and len(_async_send_handles) > 0:
-            self._push_pending = True
+        # Drain push tree-cache (cmd=5 response). The size irecv was kicked off
+        # right after the cmd=5 isends completed, so its NCCL transfer has been
+        # running in parallel with target's logits + accept work above. Wait
+        # the size, recv the variable-length payload synchronously, parse into
+        # _local_tree_cache. Done BEFORE engine.step's cleanup_send so the p2p
+        # FIFO is preserved (target=[isend cmd5, irecv sz, recv push, send
+        # cmd3, recv ack] vs draft=[recv cmd5, send sz, send push, recv cmd3,
+        # send ack]).
+        if push_sz_irecv is not None:
+            push_sz_irecv.wait()
+            buf_size = int(self._push_sz_buf.item())
+            push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
+            dist.recv(push_buf, src=self.draft_rank, group=self.async_pg)
+            if not hasattr(self, '_local_tree_cache'):
+                self._local_tree_cache = {}
+            pidx = 0
+            n_push = int(push_buf[pidx].item()); pidx += 1
+            for _ in range(n_push):
+                sid = int(push_buf[pidx].item())
+                n_e = int(push_buf[pidx + 1].item())
+                K_a = int(push_buf[pidx + 2].item())
+                pidx += 3
+                if n_e > 0:
+                    keys = push_buf[pidx:pidx + n_e * 3].reshape(n_e, 3).clone()
+                    pidx += n_e * 3
+                    toks = push_buf[pidx:pidx + n_e * K_a].reshape(n_e, K_a).clone()
+                    pidx += n_e * K_a
+                    self._local_tree_cache[sid] = (keys, toks)
+        # _push_pending no longer needed — we drained inside this function.
 
         if self.rank == 0:
             return all_accepted

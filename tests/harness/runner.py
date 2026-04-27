@@ -33,7 +33,7 @@ class RunnerConfig:
     draft_async: bool = False
     draft_gpu: int = 1
     async_fan_out: int = 3
-    ssd_early_layers: int = 2
+    ssd_early_layers: int = -3
     ssd_tree_decode: bool = True
     # Engine options
     tensor_parallel_size: int = 1

@@ -53,7 +53,7 @@ def bench_nano(prompts, mode, max_tokens=256):
         kwargs["draft_async"] = True
         kwargs["draft_gpu"] = 1
         kwargs["async_fan_out"] = 5
-        kwargs["ssd_early_layers"] = 2
+        kwargs["ssd_early_layers"] = -3
         kwargs["ssd_tree_decode"] = True
 
     llm = LLM(**kwargs)

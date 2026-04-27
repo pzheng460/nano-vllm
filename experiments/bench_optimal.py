@@ -104,7 +104,7 @@ CONFIGS = {
         enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
         num_speculative_tokens=3,
         draft_async=True, draft_gpu=1,
-        async_fan_out=5, ssd_early_layers=2, ssd_tree_decode=True,
+        async_fan_out=5, ssd_early_layers=-3, ssd_tree_decode=True,
     ),
     # Qwen2.5-7B + EAGLE
     "qwen25_sync": dict(
@@ -119,7 +119,7 @@ CONFIGS = {
         enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
         num_speculative_tokens=3,
         draft_async=True, draft_gpu=1,
-        async_fan_out=5, ssd_early_layers=2, ssd_tree_decode=True,
+        async_fan_out=5, ssd_early_layers=-3, ssd_tree_decode=True,
     ),
     # Llama-3.1-8B + EAGLE
     "llama31_sync": dict(
@@ -134,7 +134,7 @@ CONFIGS = {
         enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
         num_speculative_tokens=3,
         draft_async=True, draft_gpu=1,
-        async_fan_out=5, ssd_early_layers=2, ssd_tree_decode=True,
+        async_fan_out=5, ssd_early_layers=-3, ssd_tree_decode=True,
     ),
     # MiMo-7B MTP
     "mimo_sync": dict(
@@ -147,7 +147,7 @@ CONFIGS = {
         enforce_eager=True, tensor_parallel_size=1, max_model_len=4096,
         num_speculative_tokens=3,
         draft_async=True, draft_gpu=1,
-        async_fan_out=3, ssd_early_layers=2, ssd_tree_decode=True,
+        async_fan_out=3, ssd_early_layers=-3, ssd_tree_decode=True,
     ),
 }
 

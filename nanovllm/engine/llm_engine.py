@@ -135,7 +135,12 @@ class LLMEngine:
         if self.draft_async and self.model_runner.async_pg is not None:
             # Drain pending push from draft BEFORE cleanup (NCCL ordering)
             mr = self.model_runner
-            if getattr(mr, '_push_pending', False) and not is_prefill:
+            # MTP path drains its push tree-cache inside _run_ssd_decode itself
+            # (irecv kicked off right after cmd=5 isend, waited before return —
+            # so the data transfer overlaps with target's accept work). Only
+            # the eagle_async path still drains here.
+            if (getattr(mr, '_push_pending', False) and not is_prefill
+                    and not mr.use_mtp):
                 import torch
                 d = mr.device.device_name
                 if not hasattr(mr, '_local_tree_cache'):

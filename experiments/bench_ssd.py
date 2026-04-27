@@ -27,7 +27,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['sync1', 'sync3', 'async1', 'async3'], required=True)
     parser.add_argument('--model', default='/mnt/data/peizhen/MiMo-7B-RL/')
-    parser.add_argument('--early-layers', type=int, default=2)
+    parser.add_argument('--early-layers', type=int, default=-3)
     parser.add_argument('--fan-out', type=int, default=3)
     parser.add_argument('--K', type=int, default=None)
     parser.add_argument('--tree-decode', action='store_true')

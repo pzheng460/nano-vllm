@@ -24,7 +24,8 @@ class Config:
     draft_async: bool = False                  # enable SSD async draft on separate GPU
     draft_gpu: int = -1                        # GPU for draft model (-1 = auto)
     async_fan_out: int = 3                     # fan-out for tree speculation
-    ssd_early_layers: int = 2                  # extract early hidden at layer N-X
+    ssd_early_layers: int = -3                 # extract early hidden at layer N+K (K must be < 0).
+                                               # -1 = last layer (sync-equiv), -3 = 倒数第3, etc.
     ssd_tree_decode: bool = True               # tree decode: K draft steps per candidate (default on for correct multi-step speculation)
     num_gpus: int = -1                         # total world size (auto-computed)
     draft_rank: int = -1                       # rank of draft process (auto-computed)

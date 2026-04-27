@@ -54,7 +54,7 @@ run_async() {
 from nanovllm import LLM, SamplingParams
 $PROMPTS
 llm = LLM('$MODEL', enforce_eager=True, tensor_parallel_size=4, max_model_len=4096,
-           draft_async=True, draft_gpu=4, num_speculative_tokens=1, async_fan_out=3, ssd_early_layers=2)
+           draft_async=True, draft_gpu=4, num_speculative_tokens=1, async_fan_out=3, ssd_early_layers=-3)
 $BENCH
 print(f'PanGu SSD K=1 TP4: {total_tokens} tokens in {elapsed:.2f}s = {total_tokens/elapsed:.1f} tok/s')
 "

@@ -20,7 +20,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=['sync', 'async'], required=True)
     parser.add_argument('--K', type=int, default=5)
-    parser.add_argument('--early-layers', type=int, default=2)
+    parser.add_argument('--early-layers', type=int, default=-3)
     parser.add_argument('--fan-out', type=int, default=3)
     parser.add_argument('--tree-decode', action='store_true')
     parser.add_argument('--num-prompts', type=int, default=50)

@@ -43,7 +43,7 @@ PROMPTS = [
 
 
 def _run_generate(model, draft_model=None, num_speculative_tokens=3, max_tokens=128,
-                  draft_async=False, draft_gpu=-1, async_fan_out=5, ssd_early_layers=2,
+                  draft_async=False, draft_gpu=-1, async_fan_out=5, ssd_early_layers=-3,
                   ssd_tree_decode=True, prompts=None):
     """Helper to run LLM generation and return outputs + stats."""
     from nanovllm import LLM, SamplingParams
@@ -175,7 +175,7 @@ class TestMiMoMTPSSD:
         outputs = _run_generate(
             MIMO_MODEL,
             draft_async=True, draft_gpu=1,
-            async_fan_out=3, ssd_early_layers=2,
+            async_fan_out=3, ssd_early_layers=-3,
             ssd_tree_decode=True,
             max_tokens=64,
         )

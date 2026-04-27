@@ -66,7 +66,7 @@ GPU 0（目标）                      GPU 1（草稿）
   对每个位置：`norm(early_hidden) → lm_head → topF 候选 → embed → MTP → draft_token`。
   每个 seq 存储 `(K+1)*F` 个条目。
 - **查找**：链式 K 步查找：`(sid, 0, recovery_token) → d0`，`(sid, 1, d0) → d1`，`(sid, 2, d1) → d2`
-- **命中率**：`ssd_early_layers=2`，`async_fan_out=3` 时约 99%
+- **命中率**：`ssd_early_layers=-3`，`async_fan_out=3` 时约 99%
 
 **NCCL 通信协议（cmd ID）：**
 | cmd | 名称 | 方向 | 数据 |
@@ -83,7 +83,7 @@ GPU 0（目标）                      GPU 1（草稿）
 - 批量 NCCL：所有 seq 的 early hidden 一次发送（非逐 seq）
 - SSD 模式跳过目标端 MTP KV 更新（99% cache 命中，更新无必要）
 - 草稿 KV cache 上限为 `max_num_seqs * max_blocks_per_seq`（不填满 GPU）
-- `ssd_early_layers` 配置：在第 `N-X` 层提取 early hidden（默认 2）
+- `ssd_early_layers` 配置：值 K 必须 < 0；在第 `N+K` 层提取 early hidden。`K=-1` 为最后一层（等价 sync MTP），`K=-3` 为倒数第 3 层（默认）
 
 ### SSD-MTP 算法详解
 
@@ -109,7 +109,7 @@ GPU 0 (Target)                         GPU 1 (Draft)
 |------|------|
 | `draft_async=True` | 启用异步双 GPU 模式 |
 | `num_speculative_tokens (K)` | 每步投机 token 数 |
-| `ssd_early_layers` | 从第 `N-X` 层抽取 early hidden（默认 2） |
+| `ssd_early_layers` | K 必须 < 0；从第 `N+K` 层抽取 pre-norm early hidden。K=-1 → 最后一层（等价 sync MTP）；K=-3 → 倒数第3层（默认） |
 | `async_fan_out (F)` | 树缓存扇出因子（默认 3），每个位置取 top-F 候选 |
 
 #### 二、算法流程（每个 Decode Step）
@@ -133,7 +133,7 @@ lookup(sid, pos=2, d₁) → d₂
 
 Target 模型对 `[last_token, d₀, d₁, ..., d_{K-1}]` 做一次 **prefill-like forward**：
 
-- 逐层计算，到达第 `N - ssd_early_layers` 层时：
+- 逐层计算，到达第 `N + ssd_early_layers` 层时（K 是负值）：
   - **抽取 early hidden state**
   - **非阻塞异步 NCCL 发送**（cmd=5）给 Draft，包含所有 seq 的 early hidden、block table、positions
   - Target **继续计算剩余层**，与 Draft 的树构建**并行执行**
@@ -319,5 +319,5 @@ NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd
 - **bs=1 时异步 K=3（80.0）超过同步 K=3（78.4）** — draft 完全被掩盖，比基线快 53%
 - bs=50 时同步更快（batched EAGLE draft 在大 batch 下高效）
 - K>1 时必须使用 `ssd_tree_decode=True`（chain 模式只做 1 步 draft）
-- EAGLE 对 `ssd_early_layers=1` 最优（多层时接受率大幅下降）
+- EAGLE 对 `ssd_early_layers=-2` 最优（更早抽取的层接受率会大幅下降）
 - 同步 EAGLE draft 已 batch 化（所有 seq 一起处理，非逐 seq 串行）

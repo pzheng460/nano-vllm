@@ -29,6 +29,7 @@ def main():
         tensor_parallel_size=4,
         trust_remote_code=True,
         max_model_len=2048,
+        max_num_seqs=8,  # default for the 6-prompt smoke; spec_graph silently falls back to eager when batch overflows BMM
         enforce_eager=True,
         num_speculative_tokens=1,
         draft_async=True,
@@ -36,9 +37,13 @@ def main():
         # and predict top-3 candidates (f=3). Cache hit ~95%, ~91 tok/s
         # on PanGu 4×H100+1draft (within ~10% of sync's 100 tok/s).
         # Tuneable via NANO_EARLY / NANO_FAN env.
+        # ssd_early_layers convention: K must be < 0; |K| = 倒数第|K|层.
+        #   K=-1 → last layer (sync MTP equivalent)
+        #   K=-3 → 倒数第3 (matches old K=2 default)
         async_fan_out=int(__import__('os').environ.get('NANO_FAN', 3)),
-        ssd_early_layers=int(__import__('os').environ.get('NANO_EARLY', 1)),
+        ssd_early_layers=int(__import__('os').environ.get('NANO_EARLY', -2)),
         ssd_tree_decode=False,
+        profile=__import__('os').environ.get('NANO_PROFILE', '0') == '1',
     )
     sp = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS)
 

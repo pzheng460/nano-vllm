@@ -239,6 +239,17 @@ class MTPDraftRunner:
             print(f"[MTPDraftRunner] CUDA graph capture failed ({exc!r}); falling back to eager.", flush=True)
             self._g = None
 
+        # Capture speculate-graph for the batched chain-mode MTP forward used in
+        # handle_early_speculate (target waits on the push of this output, so it's
+        # on the critical path). Static shape: total = max_num_seqs * (K+1) * F.
+        # Smaller batches pad to total with dummy slots (slot_mapping=-1).
+        self._spec_graph = None
+        try:
+            self._capture_speculate_graph()
+        except Exception as exc:
+            print(f"[MTPDraftRunner] speculate graph capture failed ({exc!r}); fallback to eager.", flush=True)
+            self._spec_graph = None
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -335,9 +346,47 @@ class MTPDraftRunner:
         torch.cuda.synchronize()
         self._g = g
 
+    @torch.inference_mode()
+    def _capture_speculate_graph(self):
+        """Capture the batched MTP forward used by handle_early_speculate
+        (chain mode). Static-shape graph at total=max_num_seqs*(K+1)*F.
+        Smaller batches pad up via slot_mapping=-1 to skip writes."""
+        K, F_ = self.K, self.F
+        max_num_seqs = self.config.max_num_seqs
+        total = max_num_seqs * (K + 1) * F_
+        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size + 16
+        hf = self.hf_config
+        d = self.device
+
+        sg = {}
+        sg["embeds"]    = torch.zeros(total, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+        sg["hidden"]    = torch.zeros(total, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+        sg["pos"]       = torch.zeros(total, dtype=torch.int64, device=d)
+        sg["slot"]      = torch.full((total,), -1, dtype=torch.int32, device=d)
+        sg["ctx_lens"]  = torch.ones(total, dtype=torch.int32, device=d)
+        sg["bt"]        = torch.zeros(total, max_num_blocks, dtype=torch.int32, device=d)
+        sg["out_normed"] = torch.zeros(total, hf.hidden_size, dtype=hf.torch_dtype, device=d)
+        sg["total"]     = total
+
+        # Warmup
+        set_context(False, slot_mapping=sg["slot"], context_lens=sg["ctx_lens"], block_tables=sg["bt"])
+        normed, _ = self.mtp_layer(sg["embeds"], sg["hidden"], sg["pos"])
+        sg["out_normed"].copy_(normed)
+        reset_context()
+
+        graph = torch.cuda.CUDAGraph()
+        set_context(False, slot_mapping=sg["slot"], context_lens=sg["ctx_lens"], block_tables=sg["bt"])
+        with torch.cuda.graph(graph):
+            normed, _ = self.mtp_layer(sg["embeds"], sg["hidden"], sg["pos"])
+            sg["out_normed"].copy_(normed)
+        reset_context()
+        torch.cuda.synchronize()
+        self._spec_graph = graph
+        self._spec_g = sg
+
     def _reset_tree_cache(self, seq_id=None):
         if seq_id is None:
-            self.tree_caches = {}  # seq_id -> (keys, tokens)
+            self.tree_caches = {}
         elif seq_id in self.tree_caches:
             del self.tree_caches[seq_id]
 
@@ -614,6 +663,7 @@ class MTPDraftRunner:
         dist.send(resp, dst=0, group=self.async_pg)
         # Cache is populated by early_speculate (cmd=5) during next verify
 
+    @torch.inference_mode()
     def handle_early_speculate(self, num_seqs):
         """Receive batched early hidden for all seqs from target.
         For each seq: norm → lm_head → topF → embed → MTP → cache."""
@@ -751,16 +801,48 @@ class MTPDraftRunner:
                                      batch_cands[offset:offset+total]], dim=1)
                 self.tree_caches[sid] = (keys, spec_tokens[offset:offset+total])
                 offset += total
-        else:
-            # 3b. Batched chain: single MTP step for ALL seqs' candidates
+        if not (self.tree_decode and self.K > 1):
+            # 3b. Batched chain: single MTP forward for ALL seqs' candidates.
+            # Critical path — target stalls on push of draft_tokens until this
+            # finishes. Use static-shape CUDA graph when batch fits; else eager.
             batch_slots = torch.cat(all_slot_list)
             batch_ctxs = torch.cat(all_ctx_lens)
-            max_bt_len = max(bt.shape[1] for bt in all_bt_rows)
-            batch_bt = torch.cat([F.pad(bt, (0, max_bt_len - bt.shape[1])) for bt in all_bt_rows]).contiguous()
+            max_bt_real = max(bt.shape[1] for bt in all_bt_rows)
+            batch_bt = torch.cat([F.pad(bt, (0, max_bt_real - bt.shape[1])) for bt in all_bt_rows]).contiguous()
+            real_n = batch_embeds.shape[0]
 
-            set_context(False, slot_mapping=batch_slots, context_lens=batch_ctxs, block_tables=batch_bt)
-            normed_out, _ = self.mtp_layer(batch_embeds, batch_hidden, batch_pos)
-            reset_context()
+            sg = getattr(self, "_spec_g", None)
+            sgraph = getattr(self, "_spec_graph", None)
+            can_graph = (
+                sgraph is not None and sg is not None
+                and real_n <= sg["total"]
+                and max_bt_real <= sg["bt"].shape[1]
+            )
+
+            if can_graph:
+                cap_n = sg["total"]
+                cap_bt = sg["bt"].shape[1]
+                sg["embeds"][:real_n].copy_(batch_embeds)
+                sg["embeds"][real_n:].zero_()
+                sg["hidden"][:real_n].copy_(batch_hidden)
+                sg["hidden"][real_n:].zero_()
+                sg["pos"][:real_n].copy_(batch_pos)
+                sg["pos"][real_n:].zero_()
+                sg["slot"][:real_n].copy_(batch_slots)
+                sg["slot"][real_n:].fill_(-1)        # padding: skip KV write
+                sg["ctx_lens"][:real_n].copy_(batch_ctxs)
+                sg["ctx_lens"][real_n:].fill_(1)
+                sg["bt"][:real_n, :max_bt_real].copy_(batch_bt)
+                if max_bt_real < cap_bt:
+                    sg["bt"][:real_n, max_bt_real:].zero_()
+                sg["bt"][real_n:].zero_()
+                sgraph.replay()
+                normed_out = sg["out_normed"][:real_n]
+            else:
+                set_context(False, slot_mapping=batch_slots, context_lens=batch_ctxs, block_tables=batch_bt)
+                normed_out, _ = self.mtp_layer(batch_embeds, batch_hidden, batch_pos)
+                reset_context()
+
             logits = self.compute_mtp_logits(normed_out)
             draft_tokens = logits.argmax(dim=-1)
 
@@ -1416,13 +1498,11 @@ class EAGLEDraftRunner:
         pos_int64 = all_pos[:total_nv_val].to(torch.int64)
 
         # Glue forward: writes EAGLE KV at verify positions + extracts candidates.
-        # Fast path (EAGLE-1, bs=1, ssd_early_layers >= 0): one CUDA graph replay.
-        # Else: eager forward.
+        # Fast path (EAGLE-1, bs=1): one CUDA graph replay. Else: eager.
         use_glue_graph = (
             not self.eagle3
             and self._glue_graph is not None
             and num_seqs == 1
-            and self.config.ssd_early_layers >= 0
         )
         if use_glue_graph:
             gg = self._glue_g
@@ -1443,10 +1523,9 @@ class EAGLEDraftRunner:
             if self.eagle3:
                 normed_all_pre = None
                 glue_hidden_all = early_hidden_all
-            elif self.config.ssd_early_layers < 0:
-                normed_all_pre = early_hidden_all
-                glue_hidden_all = early_hidden_all
             else:
+                # ssd_early_layers is now always < 0 (extract pre-norm at layer
+                # N+K). Target always sends unnormed hidden, so draft norms here.
                 normed_all_pre = self.draft_model.model.norm(early_hidden_all)
                 glue_hidden_all = normed_all_pre
             set_context(False, slot_mapping=glue_slot_t, context_lens=glue_ctx_t, block_tables=glue_bt_t)

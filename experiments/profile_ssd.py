@@ -36,7 +36,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", default="/mnt/data/peizhen/MiMo-7B-RL")
     parser.add_argument("--draft-model", default="/mnt/data/peizhen/EAGLE-Qwen2-7B-Instruct")
     parser.add_argument("--K", type=int, default=3)
-    parser.add_argument("--early-layers", type=int, default=2)
+    parser.add_argument("--early-layers", type=int, default=-3)
     parser.add_argument("--fan-out", type=int, default=3)
     parser.add_argument("--prompts", type=int, default=3)
     parser.add_argument("--max-tokens", type=int, default=256)

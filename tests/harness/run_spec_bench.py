@@ -49,7 +49,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None, help="cap on question count")
     p.add_argument("--draft-gpu", type=int, default=1)
     p.add_argument("--fan-out", type=int, default=3)
-    p.add_argument("--early-layers", type=int, default=1)
+    p.add_argument("--early-layers", type=int, default=-2)
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
     if args.mode != "baseline" and args.draft is None:
