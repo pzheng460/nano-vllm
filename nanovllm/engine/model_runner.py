@@ -1005,6 +1005,30 @@ class ModelRunner:
                 ack = torch.zeros(1, dtype=torch.int64, device=d)
                 dist.recv(ack, src=self.draft_rank, group=self.async_pg)
 
+                # Receive prewarm tree-cache push from draft (MTP path only;
+                # eagle async sends nothing during prefill).
+                if self.use_mtp:
+                    sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
+                    dist.recv(sz_buf, src=self.draft_rank, group=self.async_pg)
+                    buf_size = int(sz_buf.item())
+                    push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
+                    dist.recv(push_buf, src=self.draft_rank, group=self.async_pg)
+                    if not hasattr(self, '_local_tree_cache'):
+                        self._local_tree_cache = {}
+                    pidx = 0
+                    n_push = int(push_buf[pidx].item()); pidx += 1
+                    for _ in range(n_push):
+                        sid = int(push_buf[pidx].item())
+                        n_e = int(push_buf[pidx + 1].item())
+                        K_a = int(push_buf[pidx + 2].item())
+                        pidx += 3
+                        if n_e > 0:
+                            keys = push_buf[pidx:pidx + n_e * 3].reshape(n_e, 3).clone()
+                            pidx += n_e * 3
+                            toks = push_buf[pidx:pidx + n_e * K_a].reshape(n_e, K_a).clone()
+                            pidx += n_e * K_a
+                            self._local_tree_cache[sid] = (keys, toks)
+
         reset_context()
 
         if self.rank == 0:

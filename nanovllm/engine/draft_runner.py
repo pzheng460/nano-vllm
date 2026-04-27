@@ -553,6 +553,46 @@ class MTPDraftRunner:
         ack = torch.ones(1, dtype=torch.int64, device=self.device)
         dist.send(ack, dst=0, group=self.async_pg)
 
+        # Prewarm tree cache for first decode step. Without this, the very
+        # first decode step on every new request misses the local cache,
+        # falls into the cmd=0 round-trip path, and pays one full NCCL hop
+        # plus a draft-side jit_speculate before producing any token.
+        # Run jit_speculate using target's prefill last hidden (NOT the
+        # MTP prenorm — that's a different distribution and tanks accept).
+        # This also writes MTP KV slot at L so subsequent decode-step
+        # tree builds have the right context.
+        d = self.device
+        sid_int = int(seq_id)
+        last_input_id = int(token_ids[-1].item())
+        target_hidden_last = hidden_states[-1].clone()  # target's hidden[L-1]
+        bt_t = block_table.to(torch.int32)
+        try:
+            draft_tokens = self.jit_speculate(
+                last_input_id, target_hidden_last,
+                int(positions[-1].item()) + 1, bt_t)
+        except Exception as e:
+            print(f"[MTPDraftRunner] prefill prewarm failed sid={sid_int}: {e!r}", flush=True)
+            draft_tokens = None
+        if draft_tokens:
+            keys = torch.tensor([[sid_int, 0, last_input_id]], dtype=torch.int64, device=d)
+            toks = torch.tensor([draft_tokens], dtype=torch.int64, device=d)
+            self.tree_caches[sid_int] = (keys, toks)
+            parts = [
+                torch.tensor([1], dtype=torch.int64, device=d),
+                torch.tensor([sid_int, 1, len(draft_tokens)], dtype=torch.int64, device=d),
+                keys.reshape(-1),
+                toks.reshape(-1),
+            ]
+        else:
+            parts = [
+                torch.tensor([1], dtype=torch.int64, device=d),
+                torch.tensor([sid_int, 0, 0], dtype=torch.int64, device=d),
+            ]
+        push_buf = torch.cat(parts)
+        dist.send(torch.tensor([push_buf.shape[0]], dtype=torch.int64, device=d),
+                  dst=0, group=self.async_pg)
+        dist.send(push_buf, dst=0, group=self.async_pg)
+
     def handle_speculate(self):
         meta = torch.zeros(5, dtype=torch.int64, device=self.device)
         dist.recv(meta, src=0, group=self.async_pg)
