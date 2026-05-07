@@ -15,12 +15,17 @@ dependencies = [
     "torch>=2.4.0",
     "transformers>=4.51.0",
     "xxhash",
+    "safetensors",
+    "tqdm",
+    "numpy",
+    "sentencepiece",
 ]
 
 [project.optional-dependencies]
 cuda = ["triton>=3.0.0", "flash-attn"]
 npu = ["torch_npu"]
-all = ["triton>=3.0.0", "flash-attn", "torch_npu"]
+profile = ["ijson"]                      # used by experiments/pangu_lsd/analyze_trace.py
+all = ["triton>=3.0.0", "flash-attn", "torch_npu", "ijson"]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
