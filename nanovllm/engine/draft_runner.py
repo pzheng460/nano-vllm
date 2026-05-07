@@ -1,4 +1,4 @@
-"""MTP Draft Runner for SSD (Speculative Streaming Decoding).
+"""MTP Draft Runner for Latent Speculative Decoding.
 
 Runs MTP layers on a separate GPU. Uses NCCL for target↔draft communication.
 Implements: tree cache, glue decode, fork tokens, tree decode.
@@ -19,6 +19,17 @@ from nanovllm.utils.loader import _load_weight
 from nanovllm.utils.device import get_device_backend
 
 _PANGU_TYPES = {'PanguProMoE', 'PanguProMoEV2', 'PanguUltraMoE', 'PanguEmbedded', 'pangu'}
+
+
+def _push_max_buf_size(config):
+    """Worst-case push tree-cache buffer size — must match model_runner side."""
+    K = config.num_speculative_tokens
+    F = config.async_fan_out
+    nv = K + 1
+    n_e_max = nv * F
+    K_a_max = K if (config.latent_tree_decode and K > 1) else 1
+    per_seq_max = 3 + n_e_max * 3 + n_e_max * K_a_max
+    return 1 + config.max_num_seqs * per_seq_max
 
 
 def _is_pangu(hf_config):
@@ -253,11 +264,15 @@ class MTPDraftRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        self.tree_decode = config.ssd_tree_decode
+        self.tree_decode = config.latent_tree_decode
         self._reset_tree_cache()
         self.last_hidden = {}
         # Pre-allocate recv buffers
         self._cmd_buf = torch.zeros(4, dtype=torch.int64, device=self.device)
+        # Pre-allocated push send buffer (fixed-size protocol — both sides
+        # know the max size, so no separate size handshake is needed).
+        self._push_buf_max_size = _push_max_buf_size(config)
+        self._push_buf_max = torch.zeros(self._push_buf_max_size, dtype=torch.int64, device=self.device)
 
         print(f"[MTPDraftRunner] Initialized on GPU {config.draft_gpu}, K={self.K}, F={self.F}, tree_decode={self.tree_decode}", flush=True)
 
@@ -638,9 +653,9 @@ class MTPDraftRunner:
                 torch.tensor([sid_int, 0, 0], dtype=torch.int64, device=d),
             ]
         push_buf = torch.cat(parts)
-        dist.send(torch.tensor([push_buf.shape[0]], dtype=torch.int64, device=d),
-                  dst=0, group=self.async_pg)
-        dist.send(push_buf, dst=0, group=self.async_pg)
+        # Fixed-size protocol: copy into pre-allocated max-size buf.
+        self._push_buf_max[:push_buf.shape[0]].copy_(push_buf)
+        dist.send(self._push_buf_max, dst=0, group=self.async_pg)
 
     def handle_speculate(self):
         meta = torch.zeros(5, dtype=torch.int64, device=self.device)
@@ -802,49 +817,35 @@ class MTPDraftRunner:
                 self.tree_caches[sid] = (keys, spec_tokens[offset:offset+total])
                 offset += total
         if not (self.tree_decode and self.K > 1):
-            # 3b. Batched chain: single MTP forward for ALL seqs' candidates.
-            # Critical path — target stalls on push of draft_tokens until this
-            # finishes. Use static-shape CUDA graph when batch fits; else eager.
-            batch_slots = torch.cat(all_slot_list)
-            batch_ctxs = torch.cat(all_ctx_lens)
+            # 3b. PAPER-STYLE per-fan independent rollout: for each of F top
+            # candidates, run a separate MTP forward AND a separate lm_head
+            # call. This is what Mirror-SD calls "branch-complete rollouts" —
+            # critically, NO batching across fan, so the per-row output (and
+            # final logit/argmax) for top-1 is bit-identical regardless of F.
+            # Only f=0 (top-1) writes K/V to MTP cache (slots for f>0 set to
+            # -1 to skip).
+            cat_slots_full = torch.cat(all_slot_list)
+            cat_ctxs_full = torch.cat(all_ctx_lens)
             max_bt_real = max(bt.shape[1] for bt in all_bt_rows)
-            batch_bt = torch.cat([F.pad(bt, (0, max_bt_real - bt.shape[1])) for bt in all_bt_rows]).contiguous()
-            real_n = batch_embeds.shape[0]
-
-            sg = getattr(self, "_spec_g", None)
-            sgraph = getattr(self, "_spec_graph", None)
-            can_graph = (
-                sgraph is not None and sg is not None
-                and real_n <= sg["total"]
-                and max_bt_real <= sg["bt"].shape[1]
-            )
-
-            if can_graph:
-                cap_n = sg["total"]
-                cap_bt = sg["bt"].shape[1]
-                sg["embeds"][:real_n].copy_(batch_embeds)
-                sg["embeds"][real_n:].zero_()
-                sg["hidden"][:real_n].copy_(batch_hidden)
-                sg["hidden"][real_n:].zero_()
-                sg["pos"][:real_n].copy_(batch_pos)
-                sg["pos"][real_n:].zero_()
-                sg["slot"][:real_n].copy_(batch_slots)
-                sg["slot"][real_n:].fill_(-1)        # padding: skip KV write
-                sg["ctx_lens"][:real_n].copy_(batch_ctxs)
-                sg["ctx_lens"][real_n:].fill_(1)
-                sg["bt"][:real_n, :max_bt_real].copy_(batch_bt)
-                if max_bt_real < cap_bt:
-                    sg["bt"][:real_n, max_bt_real:].zero_()
-                sg["bt"][real_n:].zero_()
-                sgraph.replay()
-                normed_out = sg["out_normed"][:real_n]
-            else:
-                set_context(False, slot_mapping=batch_slots, context_lens=batch_ctxs, block_tables=batch_bt)
-                normed_out, _ = self.mtp_layer(batch_embeds, batch_hidden, batch_pos)
+            cat_bt_full = torch.cat(
+                [F.pad(bt, (0, max_bt_real - bt.shape[1])) for bt in all_bt_rows]
+            ).contiguous()
+            drafts_per_fan = []
+            for f in range(fan):
+                fan_cands = cands_all[:, f]                         # (nv_total,)
+                fan_embeds = self.embed_tokens(fan_cands)           # (nv_total, H)
+                slots_f = cat_slots_full[f::fan].contiguous()
+                ctxs_f = cat_ctxs_full[f::fan].contiguous()
+                bt_f = cat_bt_full[f::fan].contiguous()
+                set_context(False, slot_mapping=slots_f, context_lens=ctxs_f, block_tables=bt_f)
+                normed_out, _ = self.mtp_layer(fan_embeds, early_hidden_all, all_pos)
                 reset_context()
-
-            logits = self.compute_mtp_logits(normed_out)
-            draft_tokens = logits.argmax(dim=-1)
+                logits_f = self.compute_mtp_logits(normed_out)
+                drafts_per_fan.append(logits_f.argmax(dim=-1))
+            # Stack to (nv_total, F) and reshape to (nv_total*F,) with the
+            # interleaved order matching the original batched key layout.
+            drafts_stack = torch.stack(drafts_per_fan, dim=1)        # (nv_total, F)
+            draft_tokens = drafts_stack.reshape(-1)                  # (nv_total*F,)
 
             # Split back per seq
             offset = 0
@@ -870,8 +871,9 @@ class MTPDraftRunner:
             else:
                 parts.append(torch.tensor([sid, 0, 0], dtype=torch.int64, device=d))
         push_buf = torch.cat(parts)
-        dist.send(torch.tensor([push_buf.shape[0]], dtype=torch.int64, device=d), dst=0, group=self.async_pg)
-        dist.send(push_buf, dst=0, group=self.async_pg)
+        # Fixed-size protocol: copy into pre-allocated max-size buf, single send.
+        self._push_buf_max[:push_buf.shape[0]].copy_(push_buf)
+        dist.send(self._push_buf_max, dst=0, group=self.async_pg)
 
     def handle_cache_lookup(self):
         """Batched cache lookup: n_seqs from _cmd_buf[1], then receive lookup data."""
@@ -953,7 +955,9 @@ class MTPDraftRunner:
             prof.__enter__()
         while True:
             dist.recv(self._cmd_buf, src=0, group=self.async_pg)
-            cmd = self._cmd_buf[0].tolist()
+            # Single sync to settle all 4 cmd elements at once.
+            cmd_vals = self._cmd_buf.cpu().tolist()
+            cmd = cmd_vals[0]
             if cmd == 0:
                 self.handle_speculate()
             elif cmd == 1:
@@ -963,7 +967,7 @@ class MTPDraftRunner:
             elif cmd == 4:  # cache_update from target
                 self.handle_cache_update()
             elif cmd == 5:  # early_speculate: target sent [cmd, num_seqs] in _cmd_buf
-                num_seqs = self._cmd_buf[1].tolist()
+                num_seqs = cmd_vals[1]
                 self.handle_early_speculate(num_seqs)
             elif cmd == 6:  # cache_lookup: lightweight hit query
                 self.handle_cache_lookup()
@@ -979,7 +983,7 @@ class MTPDraftRunner:
 
 
 class EAGLEDraftModel(torch.nn.Module):
-    """EAGLE draft model for async SSD on separate GPU."""
+    """EAGLE draft model for async Latent SD on separate GPU."""
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -1017,7 +1021,7 @@ class EAGLEDraftModel(torch.nn.Module):
 
 
 class EAGLEDraftRunner:
-    """Async EAGLE draft runner for SSD on separate GPU."""
+    """Async EAGLE draft runner for Latent SD on separate GPU."""
 
     _hit = 0
     _miss = 0
@@ -1083,10 +1087,15 @@ class EAGLEDraftRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        self.tree_decode = config.ssd_tree_decode
+        self.tree_decode = config.latent_tree_decode
         self._reset_tree_cache()
         self.last_hidden = {}
         self._cmd_buf = torch.zeros(4, dtype=torch.int64, device=self.device)
+
+        # Pre-allocated push buffer (fixed-size protocol — both sides agree
+        # on max size, no separate size handshake).
+        self._push_buf_max_size = _push_max_buf_size(config)
+        self._push_buf_max = torch.zeros(self._push_buf_max_size, dtype=torch.int64, device=self.device)
 
         # Pre-allocate recv buffers to avoid per-call torch.zeros
         max_seqs = config.max_num_seqs
@@ -1524,7 +1533,7 @@ class EAGLEDraftRunner:
                 normed_all_pre = None
                 glue_hidden_all = early_hidden_all
             else:
-                # ssd_early_layers is now always < 0 (extract pre-norm at layer
+                # latent_early_layers is now always < 0 (extract pre-norm at layer
                 # N+K). Target always sends unnormed hidden, so draft norms here.
                 normed_all_pre = self.draft_model.model.norm(early_hidden_all)
                 glue_hidden_all = normed_all_pre
@@ -1752,9 +1761,9 @@ class EAGLEDraftRunner:
             else:
                 parts.append(torch.tensor([sid, 0, 0], dtype=torch.int64, device=self.device))
         push_buf = torch.cat(parts)
-        # Send size first, then data
-        dist.send(torch.tensor([push_buf.shape[0]], dtype=torch.int64, device=self.device), dst=0, group=self.async_pg)
-        dist.send(push_buf, dst=0, group=self.async_pg)
+        # Fixed-size protocol: copy into pre-allocated max-size buf, single send.
+        self._push_buf_max[:push_buf.shape[0]].copy_(push_buf)
+        dist.send(self._push_buf_max, dst=0, group=self.async_pg)
 
     def handle_cache_lookup(self):
         """Batched cache lookup: receive [n_seqs, sid0, al0, rt0, ...], return N*K tokens."""
@@ -1842,7 +1851,9 @@ class EAGLEDraftRunner:
             prof.__enter__()
         while True:
             dist.recv(self._cmd_buf, src=0, group=self.async_pg)
-            cmd = int(self._cmd_buf[0].tolist())
+            # Single sync to settle all 4 cmd elements at once.
+            cmd_vals = self._cmd_buf.cpu().tolist()
+            cmd = cmd_vals[0]
             if cmd == 0:
                 self.handle_speculate()
             elif cmd == 1:
@@ -1850,8 +1861,7 @@ class EAGLEDraftRunner:
             elif cmd == 3:
                 self.handle_cleanup()
             elif cmd == 5:
-                vals = self._cmd_buf[1:4].tolist()
-                num_seqs, packed_len, meta_len = int(vals[0]), int(vals[1]), int(vals[2])
+                num_seqs, packed_len, meta_len = cmd_vals[1], cmd_vals[2], cmd_vals[3]
                 self.handle_early_speculate(num_seqs, packed_len, meta_len)
             elif cmd == 6:
                 self.handle_cache_lookup()

@@ -5,7 +5,7 @@
 ## 项目结构
 
 - `nanovllm/engine/llm_engine.py` — 主引擎，协调 prefill/decode/投机解码循环
-- `nanovllm/engine/model_runner.py` — 目标模型运行器，处理同步 MTP 和 SSD 解码
+- `nanovllm/engine/model_runner.py` — 目标模型运行器，处理同步 MTP 和 Latent SD 解码
 - `nanovllm/engine/draft_runner.py` — 异步草稿运行器（独立 GPU），树缓存 + MTP
 - `nanovllm/engine/scheduler.py` — 请求调度和块管理
 - `nanovllm/models/mimo.py` — MiMo 模型，含 MTP 层
@@ -34,7 +34,7 @@
 - MTP KV cache 使用 shifted token ID：位置 i 使用 `embed(token_{i+1})`
 - `num_speculative_tokens` 自动设为 `num_nextn_predict_layers`，除非用户显式覆盖
 
-### 2. SSD-MTP（投机流式解码）
+### 2. Latent-MTP（投机流式解码）
 
 双 GPU 异步投机解码。目标模型在 GPU 0，MTP 草稿在 GPU 1。
 
@@ -66,7 +66,7 @@ GPU 0（目标）                      GPU 1（草稿）
   对每个位置：`norm(early_hidden) → lm_head → topF 候选 → embed → MTP → draft_token`。
   每个 seq 存储 `(K+1)*F` 个条目。
 - **查找**：链式 K 步查找：`(sid, 0, recovery_token) → d0`，`(sid, 1, d0) → d1`，`(sid, 2, d1) → d2`
-- **命中率**：`ssd_early_layers=-3`，`async_fan_out=3` 时约 99%
+- **命中率**：`latent_early_layers=-3`，`async_fan_out=3` 时约 99%
 
 **NCCL 通信协议（cmd ID）：**
 | cmd | 名称 | 方向 | 数据 |
@@ -81,15 +81,15 @@ GPU 0（目标）                      GPU 1（草稿）
 
 **关键优化：**
 - 批量 NCCL：所有 seq 的 early hidden 一次发送（非逐 seq）
-- SSD 模式跳过目标端 MTP KV 更新（99% cache 命中，更新无必要）
+- Latent SD 模式跳过目标端 MTP KV 更新（99% cache 命中，更新无必要）
 - 草稿 KV cache 上限为 `max_num_seqs * max_blocks_per_seq`（不填满 GPU）
-- `ssd_early_layers` 配置：值 K 必须 < 0；在第 `N+K` 层提取 early hidden。`K=-1` 为最后一层（等价 sync MTP），`K=-3` 为倒数第 3 层（默认）
+- `latent_early_layers` 配置：值 K 必须 < 0；在第 `N+K` 层提取 early hidden。`K=-1` 为最后一层（等价 sync MTP），`K=-3` 为倒数第 3 层（默认）
 
-### SSD-MTP 算法详解
+### Latent-MTP 算法详解
 
 #### 一、整体架构
 
-SSD-MTP 是一种**双 GPU 异步推测解码**方案：
+Latent-MTP 是一种**双 GPU 异步推测解码**方案：
 
 ```
 GPU 0 (Target)                         GPU 1 (Draft)
@@ -109,7 +109,7 @@ GPU 0 (Target)                         GPU 1 (Draft)
 |------|------|
 | `draft_async=True` | 启用异步双 GPU 模式 |
 | `num_speculative_tokens (K)` | 每步投机 token 数 |
-| `ssd_early_layers` | K 必须 < 0；从第 `N+K` 层抽取 pre-norm early hidden。K=-1 → 最后一层（等价 sync MTP）；K=-3 → 倒数第3层（默认） |
+| `latent_early_layers` | K 必须 < 0；从第 `N+K` 层抽取 pre-norm early hidden。K=-1 → 最后一层（等价 sync MTP）；K=-3 → 倒数第3层（默认） |
 | `async_fan_out (F)` | 树缓存扇出因子（默认 3），每个位置取 top-F 候选 |
 
 #### 二、算法流程（每个 Decode Step）
@@ -133,7 +133,7 @@ lookup(sid, pos=2, d₁) → d₂
 
 Target 模型对 `[last_token, d₀, d₁, ..., d_{K-1}]` 做一次 **prefill-like forward**：
 
-- 逐层计算，到达第 `N + ssd_early_layers` 层时（K 是负值）：
+- 逐层计算，到达第 `N + latent_early_layers` 层时（K 是负值）：
   - **抽取 early hidden state**
   - **非阻塞异步 NCCL 发送**（cmd=5）给 Draft，包含所有 seq 的 early hidden、block table、positions
   - Target **继续计算剩余层**，与 Draft 的树构建**并行执行**
@@ -215,9 +215,54 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync1
 # 同步 MTP K=3（单卡）
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync3
 
-# 异步 SSD K=3（双卡）
+# 异步 Latent SD K=3（双卡）
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python bench_ssd.py --mode async3 --early-layers 2 --fan-out 3
 ```
+
+### PanGu Latent-MTP bench（`experiments/pangu_lsd/`）
+
+合并版 bench 脚本，支持 sync MTP 和 async push-mode SSD。默认 cache miss 直接退化为
+baseline 1-token verify；用 `--fallback` 重新打开 cmd=0 同步路径
+（对应 config 的 `enable_fallback`）。
+
+```bash
+# Sync MTP K=1 基准（TP=4 单进程）
+rm -f /dev/shm/nanovllm
+CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python -u \
+    experiments/pangu_lsd/bench.py --mode sync
+
+# Async（4 张 target GPU + 1 张 draft GPU）
+rm -f /dev/shm/nanovllm
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_PORT=2510 .venv/bin/python -u \
+    experiments/pangu_lsd/bench.py --mode async --K 1 --F 1 --early -1
+
+# 同时 profile target + draft（1 prompt × 8 tok → profile_merged.json.gz）
+rm -f /dev/shm/nanovllm target_trace.json draft_trace.json profile_merged.json.gz
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_PORT=2520 .venv/bin/python -u \
+    experiments/pangu_lsd/bench.py --mode async --profile \
+        --num-prompts 1 --max-tokens 8 --K 2 --F 1 --early -3
+.venv/bin/python experiments/pangu_lsd/analyze_trace.py
+# 把 profile_merged.json.gz 拖到 https://ui.perfetto.dev/
+
+# GPQA Diamond 接收率验证（PanGu sync MTP K=1 ≈ 89%）
+.venv/bin/python -u experiments/pangu_lsd/bench.py --mode sync \
+    --prompts experiments/pangu_lsd/gpqa_diamond.jsonl --max-tokens 256
+
+# 全 sweep（sync + async early ∈ {-1, -2, -3}）
+./experiments/pangu_lsd/run_grid.sh
+```
+
+主要 CLI 参数（`bench.py`）：
+- `--mode {sync, async}` — 必填
+- `--K`、`--F`、`--early` — 投机配置（`--F`、`--early` 仅 async）
+- `--fallback` — 打开 cmd=0 fallback（默认关）
+- `--profile` — torch.profiler → `profile_merged.json.gz`
+- `--prompts FILE`、`--num-prompts N`、`--max-tokens N`、`--model PATH`
+
+`TP`、`MAX_NUM_SEQS`、draft GPU 索引是 `bench.py` 顶部的常量，迁移到其他硬件时直接改。
+`latent_tree_decode` 在 K>1 时自动开启。
+
+完整参数表 / 性能数字 / 迁移说明见 `experiments/pangu_lsd/README.md`。
 
 ### 回测 Harness（Spec-Bench 对齐）
 
@@ -296,7 +341,7 @@ NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd
 |------|-------|------------|------|------|
 | 同步 MTP K=1 | 381.9 | 86.5% | - | - |
 | 同步 MTP K=3 | 257.6 | 84.0% | 22.7% | 5.9% |
-| 异步 SSD K=3 | 406.5 | 72.0% | 8.2% | 0.2% |
+| 异步 Latent SD K=3 | 406.5 | 72.0% | 8.2% | 0.2% |
 
 ## 性能（Qwen2-7B + EAGLE, H100, bs=1, max_tokens=256）
 
@@ -304,8 +349,8 @@ NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd
 |------|-------|------|------|------|
 | 基线（无投机） | 52.4 | - | - | - |
 | 同步 EAGLE K=3（batched） | 78.4 | 63% | 37% | 10% |
-| 异步 EAGLE SSD K=3（tree） | 78.3 | 66% | 40% | 13% |
-| 异步 EAGLE SSD K=2（tree） | 75.3 | 65% | 32% | - |
+| 异步 EAGLE Latent SD K=3（tree） | 78.3 | 66% | 40% | 13% |
+| 异步 EAGLE Latent SD K=2（tree） | 75.3 | 65% | 32% | - |
 
 ### 性能（Qwen2-7B + EAGLE, H100, bs=50, max_tokens=256）
 
@@ -313,11 +358,11 @@ NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd
 |------|-------|------|------|------|
 | 同步 EAGLE K=2（batched） | 1541 | 48% | 17% | - |
 | 同步 EAGLE K=3（batched） | 1493 | 46% | 18% | 9% |
-| 异步 EAGLE SSD K=3（tree） | 1079 | 48% | 21% | 7% |
+| 异步 EAGLE Latent SD K=3（tree） | 1079 | 48% | 21% | 7% |
 
 注意事项：
 - **bs=1 时异步 K=3（80.0）超过同步 K=3（78.4）** — draft 完全被掩盖，比基线快 53%
 - bs=50 时同步更快（batched EAGLE draft 在大 batch 下高效）
-- K>1 时必须使用 `ssd_tree_decode=True`（chain 模式只做 1 步 draft）
-- EAGLE 对 `ssd_early_layers=-2` 最优（更早抽取的层接受率会大幅下降）
+- K>1 时必须使用 `latent_tree_decode=True`（chain 模式只做 1 步 draft）
+- EAGLE 对 `latent_early_layers=-2` 最优（更早抽取的层接受率会大幅下降）
 - 同步 EAGLE draft 已 batch 化（所有 seq 一起处理，非逐 seq 串行）

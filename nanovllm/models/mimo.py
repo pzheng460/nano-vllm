@@ -92,7 +92,7 @@ class MiMoModel(nn.Module):
     ) -> torch.Tensor:
         """Returns pre-norm hidden states (before final RMSNorm).
         If return_penultimate=True, also returns hidden states from the
-        second-to-last layer (for SSD early MTP prediction).
+        second-to-last layer (for Latent SD early MTP prediction).
         """
         hidden_states = self.embed_tokens(input_ids)
         residual = None

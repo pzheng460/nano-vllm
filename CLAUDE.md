@@ -12,7 +12,7 @@ When updating project documentation, always keep all three files in sync:
 ## Project Structure
 
 - `nanovllm/engine/llm_engine.py` — Main engine, orchestrates prefill/decode/spec-decode loop
-- `nanovllm/engine/model_runner.py` — Target model runner, handles sync MTP and SSD decode
+- `nanovllm/engine/model_runner.py` — Target model runner, handles sync MTP and Latent SD decode
 - `nanovllm/engine/draft_runner.py` — Async draft runner (separate GPU), tree cache + MTP
 - `nanovllm/engine/scheduler.py` — Request scheduling and block management
 - `nanovllm/models/mimo.py` — MiMo model with MTP layer
@@ -41,7 +41,7 @@ Single-GPU speculative decoding using the model's built-in MTP layers.
 - MTP KV cache uses shifted token IDs: position i gets `embed(token_{i+1})`
 - `num_speculative_tokens` auto-set to `num_nextn_predict_layers` unless user overrides
 
-### 2. SSD-MTP (Speculative Streaming Decoding)
+### 2. Latent-MTP (Latent Speculative Decoding)
 
 Two-GPU async speculative decoding. Target model on GPU 0, MTP draft on GPU 1.
 
@@ -73,7 +73,7 @@ Step T:
   For each position: `norm(early_hidden) → lm_head → topF candidates → embed → MTP → draft_token`.
   Stores `(K+1)*F` entries per seq.
 - **Lookup**: Chain K lookups: `(sid, 0, recovery_token) → d0`, `(sid, 1, d0) → d1`, `(sid, 2, d1) → d2`
-- **Hit rate**: ~99% with `ssd_early_layers=-3`, `async_fan_out=3`
+- **Hit rate**: ~99% with `latent_early_layers=-3`, `async_fan_out=3`
 
 **NCCL Communication Protocol (cmd IDs):**
 | cmd | Name | Direction | Data |
@@ -88,11 +88,11 @@ Step T:
 
 **Key optimizations:**
 - Batch NCCL: all seqs' early hidden sent in one message (not per-seq)
-- Skip target MTP KV update in SSD mode (99% cache hit makes it unnecessary)
+- Skip target MTP KV update in Latent SD mode (99% cache hit makes it unnecessary)
 - Draft KV cache capped to `max_num_seqs * max_blocks_per_seq` (not fill GPU)
-- `ssd_early_layers` config: K must be < 0; extract early hidden at layer `N+K` (default -3 = 倒数第3). `K=-1` is sync MTP equivalent (last layer's hidden states).
+- `latent_early_layers` config: K must be < 0; extract early hidden at layer `N+K` (default -3 = 倒数第3). `K=-1` is sync MTP equivalent (last layer's hidden states).
 
-### SSD-MTP Algorithm Details
+### Latent-MTP Algorithm Details
 
 #### Architecture
 
@@ -114,7 +114,7 @@ GPU 0 (Target)                         GPU 1 (Draft)
 |-----------|---------|
 | `draft_async=True` | Enable async two-GPU mode |
 | `num_speculative_tokens (K)` | Draft tokens per step |
-| `ssd_early_layers` | K (must be < 0). Extract pre-norm hidden at layer `N+K`. `K=-1` → last layer (sync MTP equivalent); `K=-3` → 倒数第3 (default) |
+| `latent_early_layers` | K (must be < 0). Extract pre-norm hidden at layer `N+K`. `K=-1` → last layer (sync MTP equivalent); `K=-3` → 倒数第3 (default) |
 | `async_fan_out (F)` | Tree cache branching factor (default 3) |
 
 #### Decode Flow (per step)
@@ -136,7 +136,7 @@ lookup(sid, pos=2, d₁) → d₂
 **Step 2: Verify**
 
 Target runs prefill-like forward on `[last_token, d₀, d₁, ..., d_{K-1}]`:
-- At layer `N + ssd_early_layers` (K is negative):
+- At layer `N + latent_early_layers` (K is negative):
   - Extract early hidden state
   - Non-blocking async NCCL send (cmd=5) to Draft with all seqs' early hidden, block tables, positions
   - Target continues remaining layers **in parallel** with Draft's tree construction
@@ -209,9 +209,54 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync1
 # Sync MTP K=3 (single GPU)
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python bench_ssd.py --mode sync3
 
-# Async SSD K=3 (two GPUs)
+# Async Latent SD K=3 (two GPUs)
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python bench_ssd.py --mode async3 --early-layers 2 --fan-out 3
 ```
+
+### PanGu Latent-MTP bench (`experiments/pangu_lsd/`)
+
+Unified bench script for sync MTP + async push-mode SSD. Cache miss steps fall
+through to baseline 1-token verify by default; `--fallback` re-enables the
+cmd=0 round-trip path (`enable_fallback` config flag).
+
+```bash
+# Sync MTP K=1 baseline (TP=4, single process)
+rm -f /dev/shm/nanovllm
+CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python -u \
+    experiments/pangu_lsd/bench.py --mode sync
+
+# Async (4 target GPUs + 1 draft GPU)
+rm -f /dev/shm/nanovllm
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_PORT=2510 .venv/bin/python -u \
+    experiments/pangu_lsd/bench.py --mode async --K 1 --F 1 --early -1
+
+# Profile both target + draft (1 prompt × 8 tok → profile_merged.json.gz)
+rm -f /dev/shm/nanovllm target_trace.json draft_trace.json profile_merged.json.gz
+CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_PORT=2520 .venv/bin/python -u \
+    experiments/pangu_lsd/bench.py --mode async --profile \
+        --num-prompts 1 --max-tokens 8 --K 2 --F 1 --early -3
+.venv/bin/python experiments/pangu_lsd/analyze_trace.py
+# drag profile_merged.json.gz into https://ui.perfetto.dev/
+
+# GPQA Diamond accept-rate sanity check (~89% on PanGu sync MTP K=1)
+.venv/bin/python -u experiments/pangu_lsd/bench.py --mode sync \
+    --prompts experiments/pangu_lsd/gpqa_diamond.jsonl --max-tokens 256
+
+# Full sweep (sync + async early ∈ {-1, -2, -3})
+./experiments/pangu_lsd/run_grid.sh
+```
+
+Key CLI args (`bench.py`):
+- `--mode {sync, async}` — required
+- `--K`, `--F`, `--early` — spec config (async-only: `--F`, `--early`)
+- `--fallback` — re-enable cmd=0 fallback on cache miss (off by default)
+- `--profile` — torch.profiler tracing → `profile_merged.json.gz`
+- `--prompts FILE`, `--num-prompts N`, `--max-tokens N`, `--model PATH`
+
+`TP`, `MAX_NUM_SEQS`, draft GPU index are constants at the top of `bench.py`
+(edit for hardware migration). `latent_tree_decode` is auto-on for K>1.
+
+See `experiments/pangu_lsd/README.md` for full reference table.
 
 ### Regression Test Harness (Spec-Bench compatible)
 
@@ -265,7 +310,7 @@ Generate Chrome trace JSON for viewing in [Perfetto UI](https://ui.perfetto.dev/
 # Profile sync MTP
 CUDA_VISIBLE_DEVICES=0 .venv/bin/python experiments/profile_ssd.py --mode sync1 --prompts 3
 
-# Profile async SSD (2 GPUs)
+# Profile async Latent SD (2 GPUs)
 NCCL_PORT=2345 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python experiments/profile_ssd.py --mode async1 --prompts 3
 ```
 
@@ -284,7 +329,7 @@ Output: `*.json.gz` trace files. Open in Perfetto for timeline view and flame ch
 |------|-------|-------------|------|------|
 | Sync MTP K=1 | 381.9 | 86.5% | - | - |
 | Sync MTP K=3 | 257.6 | 84.0% | 22.7% | 5.9% |
-| Async SSD K=3 | 406.5 | 72.0% | 8.2% | 0.2% |
+| Async Latent SD K=3 | 406.5 | 72.0% | 8.2% | 0.2% |
 
 ## Performance (Qwen2-7B + EAGLE, H100, bs=1, max_tokens=256)
 
@@ -292,8 +337,8 @@ Output: `*.json.gz` trace files. Open in Perfetto for timeline view and flame ch
 |------|-------|------|------|------|
 | Baseline (no spec) | 52.4 | - | - | - |
 | Sync EAGLE K=3 (batched) | 78.4 | 63% | 37% | 10% |
-| **Async EAGLE SSD K=3 (tree)** | **80.0** | 66% | 40% | 13% |
-| Async EAGLE SSD K=2 (tree) | 75.3 | 65% | 32% | - |
+| **Async EAGLE Latent SD K=3 (tree)** | **80.0** | 66% | 40% | 13% |
+| Async EAGLE Latent SD K=2 (tree) | 75.3 | 65% | 32% | - |
 
 ### Performance (Qwen2-7B + EAGLE, H100, bs=50, max_tokens=256)
 
@@ -301,12 +346,12 @@ Output: `*.json.gz` trace files. Open in Perfetto for timeline view and flame ch
 |------|-------|------|------|------|
 | Sync EAGLE K=2 (batched) | 1541 | 48% | 17% | - |
 | Sync EAGLE K=3 (batched) | 1493 | 46% | 18% | 9% |
-| Async EAGLE SSD K=3 (tree) | 1079 | 48% | 21% | 7% |
-| Async EAGLE SSD K=2 (tree) | 1051 | 54% | 24% | - |
+| Async EAGLE Latent SD K=3 (tree) | 1079 | 48% | 21% | 7% |
+| Async EAGLE Latent SD K=2 (tree) | 1051 | 54% | 24% | - |
 
 Notes:
 - **bs=1: Async K=3 (80.0) beats Sync K=3 (78.4)** — draft fully hidden, 53% faster than baseline
 - bs=50: Sync wins due to higher accept rate (batched EAGLE draft is efficient at large batch)
-- `ssd_tree_decode=True` is required for K>1 (chain mode only runs 1 draft step)
-- `ssd_early_layers=-2` is optimal for EAGLE (more layers earlier = worse accept rate)
+- `latent_tree_decode=True` is required for K>1 (chain mode only runs 1 draft step)
+- `latent_early_layers=-2` is optimal for EAGLE (more layers earlier = worse accept rate)
 - Sync EAGLE draft is batched (all seqs together per step, not per-seq serial)

@@ -17,6 +17,22 @@ from nanovllm.utils.loader import load_model
 from nanovllm.utils.device import get_device_backend
 
 
+def _push_max_buf_size(config):
+    """Worst-case push tree-cache buffer size in int64 elements.
+    Both target and draft compute this identically — eliminates the size
+    handshake and enables a fixed pre-allocated buffer.
+
+    Layout: [num_seqs, (sid, n_e, K_a, keys[n_e*3], tokens[n_e*K_a]) per seq]
+    """
+    K = config.num_speculative_tokens
+    F = config.async_fan_out
+    nv = K + 1
+    n_e_max = nv * F
+    K_a_max = K if (config.latent_tree_decode and K > 1) else 1
+    per_seq_max = 3 + n_e_max * 3 + n_e_max * K_a_max
+    return 1 + config.max_num_seqs * per_seq_max
+
+
 def _get_model_cls(hf_config):
     model_type = getattr(hf_config, 'model_type', 'qwen3')
     if model_type == 'mimo':
@@ -57,6 +73,24 @@ class ModelRunner:
         # Sub-groups IMMEDIATELY after init (collective, all ranks must participate)
         tp_ranks = list(range(self.tp_size))
         self.tp_group = dist.new_group(tp_ranks) if self.world_size > 1 else None
+        # Second TP group (same ranks, distinct NCCL communicator) for the
+        # early-MTP side stream so its allreduces can run concurrently with
+        # target's tail-layer allreduces. We mark it high-priority so the
+        # underlying NCCL stream is created with high CUDA stream priority
+        # (PG is_high_priority_stream=True). Combined with the env var
+        # TORCH_NCCL_HIGH_PRIORITY=1, this gives the MTP collective stream
+        # actual scheduling priority on-GPU and a separate ncclStream from
+        # tp_group's internal stream.
+        if self.world_size > 1 and getattr(config, 'mtp_early_layers', -1) < -1:
+            try:
+                from torch.distributed.distributed_c10d import ProcessGroupNCCL
+                _opts = ProcessGroupNCCL.Options()
+                _opts.is_high_priority_stream = True
+                self.tp_group_mtp = dist.new_group(tp_ranks, pg_options=_opts)
+            except Exception:
+                self.tp_group_mtp = dist.new_group(tp_ranks)
+        else:
+            self.tp_group_mtp = None
         self.async_pg = None
         if config.draft_async:
             self.async_pg = dist.new_group([0, config.draft_rank])
@@ -126,6 +160,18 @@ class ModelRunner:
             # to produce the draft used in the NEXT verify window.
             self._pending_draft = {}
         self.sampler = Sampler()
+        # If MTP early-layer parallel mode is on, rewire MTP submodules to use
+        # tp_group_mtp so their allreduces share a separate NCCL communicator
+        # from target's, allowing real overlap on the side stream.
+        if (
+            self.use_mtp
+            and self.tp_group_mtp is not None
+            and hasattr(self.model.model, 'mtp_layers')
+        ):
+            for mtp in self.model.model.mtp_layers:
+                for sub in mtp.modules():
+                    if hasattr(sub, 'tp_group') and sub.tp_group is self.tp_group:
+                        sub.tp_group = self.tp_group_mtp
         self.warmup_model()
         self.allocate_kv_cache()
         if config.draft_model is not None:
@@ -140,7 +186,7 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        # Pre-allocate NCCL buffers for SSD communication
+        # Pre-allocate NCCL buffers for Latent SD communication
         if self.draft_async and rank == 0:
             d = self.device.device_name
             max_seqs = config.max_num_seqs
@@ -155,6 +201,19 @@ class ModelRunner:
             hidden_mult = 3 if getattr(config, 'eagle3', False) else 1
             hidden_i64_size = max_nv * config.hf_config.hidden_size * hidden_mult * config.hf_config.torch_dtype.itemsize // 8
             self._payload_buf = torch.zeros(1 + max_seqs * 5 + max_bt + max_nv + hidden_i64_size, dtype=torch.int64, device=d)
+            # Pre-allocated push tree-cache recv buf (skip size handshake).
+            self._push_buf_max_size = _push_max_buf_size(config)
+            self._push_buf_max = torch.zeros(self._push_buf_max_size, dtype=torch.int64, device=d)
+            # Pre-allocated TP broadcast buf for draft tokens (per-step).
+            # Layout: [len_seq0, t0..t_{k-1}, len_seq1, t0..t_{k-1}, ...]
+            if self.tp_size > 1:
+                self._draft_bcast_buf = torch.zeros(max_seqs * (1 + K), dtype=torch.int64, device=d)
+        elif self.draft_async and self.tp_size > 1:
+            # Other TP ranks also need the broadcast buf
+            d = self.device.device_name
+            K = config.num_speculative_tokens
+            max_seqs = config.max_num_seqs
+            self._draft_bcast_buf = torch.zeros(max_seqs * (1 + K), dtype=torch.int64, device=d)
 
         if self.tp_size > 1:
             if rank == 0:
@@ -212,7 +271,7 @@ class ModelRunner:
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
         num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        # During warmup, skip SSD communication and EAGLE KV prefill
+        # During warmup, skip Latent SD communication and EAGLE KV prefill
         saved_async = self.draft_async
         self.draft_async = False
         self._warmup = True
@@ -451,10 +510,10 @@ class ModelRunner:
         if self.speculative:
             if is_prefill:
                 if self.draft_async:
-                    return self._run_ssd_prefill_with_hidden(seqs)
+                    return self._run_latent_prefill_with_hidden(seqs)
                 return self._run_prefill_with_hidden(seqs)
             elif self.draft_async:
-                return self._run_ssd_decode(seqs)
+                return self._run_latent_decode(seqs)
             elif self.use_mtp:
                 return self._run_mtp_decode(seqs)
             else:
@@ -785,6 +844,101 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             self._pending_draft[seq.seq_id] = [drafts[i]]
 
+    def _argmax_logits_tp(self, normed: torch.Tensor) -> list[int]:
+        """Apply lm_head to (n_seqs, H), gather across TP, argmax → per-seq token.
+        Returns list[int] of length n_seqs on every rank (broadcast result)."""
+        n_seqs = normed.shape[0]
+        d = self.device.device_name
+        mtp_layer = self.model.model.mtp_layers[0]
+        logits = F.linear(normed, mtp_layer.shared_head.head.weight)
+        if self.tp_size > 1:
+            all_l = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.rank == 0 else None
+            dist.gather(logits, all_l, 0, group=self.tp_group)
+            logits = torch.cat(all_l, -1) if self.rank == 0 else None
+        if self.rank == 0:
+            tokens = logits.argmax(dim=-1).tolist()
+        else:
+            tokens = [0] * n_seqs
+        if self.tp_size > 1:
+            t = torch.tensor(tokens, dtype=torch.int64, device=d)
+            dist.broadcast(t, 0, group=self.tp_group)
+            tokens = t.tolist()
+        return tokens
+
+    def _stash_pending_draft_chain(
+        self,
+        seqs: list[Sequence],
+        mtp_normed_postverify: torch.Tensor,
+        last_indices: torch.Tensor,
+        n_acc_list: list[int],
+        K: int,
+    ) -> None:
+        """Chain MTP K times to produce K drafts per seq, then stash."""
+        d = self.device.device_name
+        n_seqs = len(seqs)
+        mtp_layer = self.model.model.mtp_layers[0]
+        embed_tokens = self.model.model.embed_tokens
+
+        # Step 0 hidden = post-verify MTP output at each seq's last accepted position.
+        if isinstance(last_indices, torch.Tensor):
+            cur_hidden = mtp_normed_postverify[last_indices]
+        else:
+            cur_hidden = mtp_normed_postverify[
+                torch.tensor(last_indices, dtype=torch.int64, device=d)
+            ]
+
+        drafts_per_seq = [[] for _ in range(n_seqs)]
+        for k in range(K):
+            d_k = self._argmax_logits_tp(cur_hidden)
+            for i in range(n_seqs):
+                drafts_per_seq[i].append(d_k[i])
+            if k == K - 1:
+                break
+            # Chain step k+1: MTP at position L+n_acc+k for each seq with input=embed(d_k)
+            chain_positions_py = []
+            chain_slot_py = []
+            chain_cu_q = [0]
+            chain_cu_k = [0]
+            max_chain_k = 0
+            for i in range(n_seqs):
+                # next draft's absolute position is (len(seq) - 1 + n_acc + k + 1 - 1) = len(seq) + n_acc + k - 1
+                # but we want MTP at position p such that its output predicts next token.
+                # post-verify last MTP position = L + n_acc - 1 (where L = len(seq) - 1).
+                # chain step (k=1) predicts at position p = L + n_acc + 0 (= len(seq) + n_acc - 1).
+                pos = len(seqs[i]) - 1 + n_acc_list[i] + k
+                chain_positions_py.append(pos)
+                bi = pos // self.block_size
+                bo = pos % self.block_size
+                chain_slot_py.append(seqs[i].block_table[bi] * self.block_size + bo)
+                chain_cu_q_inc = 1
+                chain_cu_q_last = chain_cu_q[-1]
+                chain_cu_q.append(chain_cu_q_last + chain_cu_q_inc)
+                seqlen_k = pos  # context covers 0..pos-1
+                chain_cu_k.append(chain_cu_k[-1] + seqlen_k)
+                max_chain_k = max(max_chain_k, seqlen_k)
+            chain_pos_t = self.device.to_device(
+                torch.tensor(chain_positions_py, dtype=torch.int64, pin_memory=True))
+            chain_input_ids_py = [drafts_per_seq[i][-1] for i in range(n_seqs)]
+            chain_input_t = self.device.to_device(
+                torch.tensor(chain_input_ids_py, dtype=torch.int64, pin_memory=True))
+            chain_slot_t = self.device.to_device(
+                torch.tensor(chain_slot_py, dtype=torch.int32, pin_memory=True))
+            chain_cu_q_t = self.device.to_device(
+                torch.tensor(chain_cu_q, dtype=torch.int32, pin_memory=True))
+            chain_cu_k_t = self.device.to_device(
+                torch.tensor(chain_cu_k, dtype=torch.int32, pin_memory=True))
+            chain_block_tables = self.prepare_block_tables(seqs)
+            set_context(True, chain_cu_q_t, chain_cu_k_t, 1, max_chain_k,
+                        chain_slot_t, None, chain_block_tables)
+            chain_embeds = embed_tokens(chain_input_t)
+            chain_out = mtp_layer(chain_embeds, cur_hidden, chain_pos_t)
+            chain_normed = chain_out[0] if isinstance(chain_out, tuple) else chain_out
+            cur_hidden = chain_normed
+            reset_context()
+
+        for i, seq in enumerate(seqs):
+            self._pending_draft[seq.seq_id] = drafts_per_seq[i]
+
     @torch.inference_mode()
     def _run_mtp_decode(self, seqs: list[Sequence]) -> list[list[int]]:
         """MTP decode, vLLM-aligned post-verify draft flow.
@@ -803,6 +957,8 @@ class ModelRunner:
         sequence prefix. The prior nano flow drafted BEFORE verify using the stale
         prefill `last_hidden` → lost ~50pp accept rate vs vLLM on PanGu.
         """
+        if getattr(self.config, 'mtp_early_layers', -1) < -1:
+            return self._run_mtp_decode_early(seqs)
         k = self.num_speculative_tokens
         d = self.device.device_name
         n_seqs = len(seqs)
@@ -918,7 +1074,11 @@ class ModelRunner:
 
         last_idx_t = self.device.to_device(
             torch.tensor(mtp_last_idx_py, dtype=torch.int64, pin_memory=True))
-        self._stash_pending_draft(seqs, mtp_normed, last_idx_t)
+        if k > 1:
+            # Chain MTP K times to produce K drafts for next-step verify.
+            self._stash_pending_draft_chain(seqs, mtp_normed, last_idx_t, n_acc_list, k)
+        else:
+            self._stash_pending_draft(seqs, mtp_normed, last_idx_t)
 
         # Update last_hidden (unused by new flow, kept for external readers) ---
         if self.rank == 0:
@@ -932,6 +1092,193 @@ class ModelRunner:
 
         return all_accepted if self.rank == 0 else None
 
+    @torch.inference_mode()
+    def _run_mtp_decode_early(self, seqs: list[Sequence]) -> list[list[int]]:
+        """Early-hidden sync MTP variant (single-GPU parallelism).
+
+        Captures pre-norm hidden at layer N + mtp_early_layers (e.g., -4 -> N-4),
+        launches the post-verify MTP forward on a side CUDA stream so it overlaps
+        with the target's remaining |K|-1 layers + norm + lm_head, then skips the
+        usual post-verify MTP loop. Assumes K=1 and that d_0 is accepted (next
+        draft = MTP(early_hidden_at_pos_L, embed(d_0))). Accept rate may drop
+        when bonus is taken (next-step draft was conditioned on the wrong
+        position) but MTP latency is hidden behind the tail target layers.
+        """
+        early_K = self.config.mtp_early_layers
+        assert early_K < -1, f"_run_mtp_decode_early called with K={early_K} >= -1"
+        k = self.num_speculative_tokens
+        assert k == 1, f"early-MTP prototype only supports num_speculative_tokens=1, got {k}"
+
+        d = self.device.device_name
+        n_seqs = len(seqs)
+        mtp_layer = self.model.model.mtp_layers[0]
+        embed_tokens = self.model.model.embed_tokens
+        model_inner = self.model.model
+        n_layers = len(model_inner.layers)
+        early_layer_idx = n_layers + self.config.mtp_early_layers
+        assert 0 <= early_layer_idx < n_layers - 1, (
+            f"mtp_early_layers={self.config.mtp_early_layers} maps to layer "
+            f"{early_layer_idx}; need 0 <= idx < {n_layers - 1}"
+        )
+
+        # Side stream for MTP overlap (lazy init).
+        if not hasattr(self, '_mtp_side_stream') or self._mtp_side_stream is None:
+            self._mtp_side_stream = torch.cuda.Stream()
+        side_stream = self._mtp_side_stream
+        main_stream = torch.cuda.current_stream()
+
+        # === Draft tokens come from _pending_draft (seeded at prefill end) ===
+        all_draft_tokens = [list(self._pending_draft[seq.seq_id]) for seq in seqs]
+
+        # === Verify input (sets target verify context) ===
+        verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
+        verify_ctx = get_context()
+        v_args = (verify_ctx.is_prefill, verify_ctx.cu_seqlens_q, verify_ctx.cu_seqlens_k,
+                  verify_ctx.max_seqlen_q, verify_ctx.max_seqlen_k,
+                  verify_ctx.slot_mapping, verify_ctx.context_lens, verify_ctx.block_tables)
+
+        # === Pre-build MTP context (one position per seq: position L, input=d_0) ===
+        mtp_input_ids_py = []
+        mtp_positions_py = []
+        mtp_slot_py = []
+        mtp_hidden_idx_py = []
+        mtp_cu_q = [0]
+        mtp_cu_k = [0]
+        mtp_last_idx_py = []
+        max_mtp_q = 1
+        max_mtp_k = 0
+
+        verify_offset = 0
+        for i, seq in enumerate(seqs):
+            nv = len(all_draft_tokens[i]) + 1  # K+1
+            L = len(seq) - 1
+            d_0 = all_draft_tokens[i][0]
+            mtp_positions_py.append(L)
+            mtp_input_ids_py.append(d_0)
+            mtp_hidden_idx_py.append(verify_offset)  # position L = first verify slot of this seq
+            bi = L // self.block_size
+            bo = L % self.block_size
+            mtp_slot_py.append(seq.block_table[bi] * self.block_size + bo)
+            mtp_cu_q.append(mtp_cu_q[-1] + 1)
+            mtp_cu_k.append(mtp_cu_k[-1] + len(seq))  # MTP attention context length
+            mtp_last_idx_py.append(mtp_cu_q[-1] - 1)
+            verify_offset += nv
+
+        max_mtp_k = max(mtp_cu_k[i + 1] - mtp_cu_k[i] for i in range(n_seqs))
+
+        # Pack the MTP-side meta tensors. These are allocated on main_stream
+        # but consumed on side_stream → record so the caching allocator
+        # waits for side_stream before recycling them.
+        mtp_positions_t = self.device.to_device(
+            torch.tensor(mtp_positions_py, dtype=torch.int64, pin_memory=True))
+        mtp_input_ids_t = self.device.to_device(
+            torch.tensor(mtp_input_ids_py, dtype=torch.int64, pin_memory=True))
+        mtp_hidden_idx_t = self.device.to_device(
+            torch.tensor(mtp_hidden_idx_py, dtype=torch.int64, pin_memory=True))
+        mtp_slot_t = self.device.to_device(
+            torch.tensor(mtp_slot_py, dtype=torch.int32, pin_memory=True))
+        mtp_cu_q_t = self.device.to_device(
+            torch.tensor(mtp_cu_q, dtype=torch.int32, pin_memory=True))
+        mtp_cu_k_t = self.device.to_device(
+            torch.tensor(mtp_cu_k, dtype=torch.int32, pin_memory=True))
+        mtp_block_tables = self.prepare_block_tables(seqs)
+        last_idx_t = self.device.to_device(
+            torch.tensor(mtp_last_idx_py, dtype=torch.int64, pin_memory=True))
+        for _t in (mtp_positions_t, mtp_input_ids_t, mtp_hidden_idx_t,
+                   mtp_slot_t, mtp_cu_q_t, mtp_cu_k_t, mtp_block_tables):
+            _t.record_stream(side_stream)
+
+        # === Manual layer iteration with mid-loop MTP launch on side stream ===
+        # Cache events on self to avoid per-step Event allocation overhead.
+        if not hasattr(self, '_mtp_early_event') or self._mtp_early_event is None:
+            self._mtp_early_event = torch.cuda.Event()
+            self._mtp_done_event = torch.cuda.Event()
+        early_event = self._mtp_early_event
+        mtp_done_event = self._mtp_done_event
+        mtp_normed_holder = []
+
+        hidden_states = model_inner.embed_tokens(verify_ids)
+        residual = None
+
+        for i, layer in enumerate(model_inner.layers):
+            hidden_states, residual = layer(verify_pos, hidden_states, residual)
+            if i == early_layer_idx:
+                # `hidden_states + residual` already produces a fresh tensor;
+                # no clone needed. Tag it for side_stream so the allocator
+                # doesn't recycle it while side_stream is still reading.
+                early_hidden = hidden_states + residual
+                early_hidden.record_stream(side_stream)
+                early_event.record(main_stream)
+                with torch.cuda.stream(side_stream):
+                    side_stream.wait_event(early_event)
+                    set_context(True, mtp_cu_q_t, mtp_cu_k_t, max_mtp_q, max_mtp_k,
+                                mtp_slot_t, None, mtp_block_tables)
+                    mtp_hidden_input = early_hidden.index_select(0, mtp_hidden_idx_t)
+                    mtp_embeds = embed_tokens(mtp_input_ids_t)
+                    mtp_out = mtp_layer(mtp_embeds, mtp_hidden_input, mtp_positions_t)
+                    mtp_normed = mtp_out[0] if isinstance(mtp_out, tuple) else mtp_out
+                    # mtp_normed is allocated on side_stream but consumed on
+                    # main_stream by _stash_pending_draft → record_stream so
+                    # the side_stream allocator does not recycle it.
+                    mtp_normed.record_stream(main_stream)
+                    mtp_normed_holder.append(mtp_normed)
+                    mtp_done_event.record(side_stream)
+                # Restore target verify context for the remaining layers on main stream.
+                set_context(*v_args)
+
+        hidden_states, _ = model_inner.norm(hidden_states, residual)
+        target_logits = self.model.compute_logits_all(hidden_states)
+        reset_context()
+
+        # === Accept on rank 0 (mirrors sync MTP path) ===
+        if self.rank == 0:
+            all_accepted = []
+            offset = 0
+            for seq, draft_tokens in zip(seqs, all_draft_tokens):
+                num_verify = len(draft_tokens) + 1
+                seq_logits = target_logits[offset:offset + num_verify]
+                predicted = seq_logits.argmax(dim=-1).tolist()
+                accepted = []
+                nd = len(draft_tokens)
+                for j in range(nd):
+                    if predicted[j] == draft_tokens[j]:
+                        accepted.append(draft_tokens[j])
+                    else:
+                        accepted.append(predicted[j])
+                        break
+                else:
+                    accepted.append(predicted[nd])
+                all_accepted.append(accepted)
+                offset += num_verify
+        else:
+            pass
+        if self.rank != 0:
+            all_accepted = [[] for _ in seqs]
+
+        # === TP broadcast accepted tokens (same as sync path) ===
+        if self.tp_size > 1:
+            n_acc_t = torch.tensor(
+                [len(a) for a in all_accepted] if self.rank == 0 else [0] * n_seqs,
+                dtype=torch.int64, device=d)
+            dist.broadcast(n_acc_t, 0, group=self.tp_group)
+            n_acc_list = n_acc_t.tolist()
+            if self.rank != 0:
+                all_accepted = [[0] * n_acc_list[i] for i in range(n_seqs)]
+            for i in range(n_seqs):
+                if n_acc_list[i] > 0:
+                    acc_t = torch.tensor(all_accepted[i], dtype=torch.int64, device=d)
+                    dist.broadcast(acc_t, 0, group=self.tp_group)
+                    if self.rank != 0:
+                        all_accepted[i] = acc_t.tolist()
+        else:
+            n_acc_list = [len(a) for a in all_accepted]
+
+        # === Wait for side-stream MTP, stash next draft ===
+        main_stream.wait_event(mtp_done_event)
+        if mtp_normed_holder:
+            self._stash_pending_draft(seqs, mtp_normed_holder[0], last_idx_t)
+
+        return all_accepted if self.rank == 0 else None
 
     def _send_cmd(self, cmd: int, aux: int = 0):
         """Send command to draft via NCCL. [cmd, aux, 0, 0] in one message."""
@@ -942,8 +1289,8 @@ class ModelRunner:
         dist.send(self._cmd_buf, dst=self.draft_rank, group=self.async_pg)
 
     @torch.inference_mode()
-    def _run_ssd_prefill_with_hidden(self, seqs: list[Sequence]) -> list[int]:
-        """SSD prefill: run target model, send hidden to draft via NCCL."""
+    def _run_latent_prefill_with_hidden(self, seqs: list[Sequence]) -> list[int]:
+        """Latent SD prefill: run target model, send hidden to draft via NCCL."""
         input_ids, positions = self.prepare_prefill(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         context = get_context()
@@ -1009,26 +1356,24 @@ class ModelRunner:
                 # Receive prewarm tree-cache push from draft (MTP path only;
                 # eagle async sends nothing during prefill).
                 if self.use_mtp:
-                    sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
-                    dist.recv(sz_buf, src=self.draft_rank, group=self.async_pg)
-                    buf_size = int(sz_buf.item())
-                    push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
-                    dist.recv(push_buf, src=self.draft_rank, group=self.async_pg)
+                    # Recv directly into pre-allocated max-size buf (no size handshake).
+                    dist.recv(self._push_buf_max, src=self.draft_rank, group=self.async_pg)
                     if not hasattr(self, '_local_tree_cache'):
                         self._local_tree_cache = {}
+                    push_cpu = self._push_buf_max.cpu().tolist()
                     pidx = 0
-                    n_push = int(push_buf[pidx].item()); pidx += 1
+                    n_push = push_cpu[pidx]; pidx += 1
                     for _ in range(n_push):
-                        sid = int(push_buf[pidx].item())
-                        n_e = int(push_buf[pidx + 1].item())
-                        K_a = int(push_buf[pidx + 2].item())
+                        sid = push_cpu[pidx]
+                        n_e = push_cpu[pidx + 1]
+                        K_a = push_cpu[pidx + 2]
                         pidx += 3
                         if n_e > 0:
-                            keys = push_buf[pidx:pidx + n_e * 3].reshape(n_e, 3).clone()
+                            keys_flat = push_cpu[pidx:pidx + n_e * 3]
                             pidx += n_e * 3
-                            toks = push_buf[pidx:pidx + n_e * K_a].reshape(n_e, K_a).clone()
+                            toks_flat = push_cpu[pidx:pidx + n_e * K_a]
                             pidx += n_e * K_a
-                            self._local_tree_cache[sid] = (keys, toks)
+                            self._local_tree_cache[sid] = (keys_flat, toks_flat, n_e, K_a)
 
         reset_context()
 
@@ -1038,7 +1383,7 @@ class ModelRunner:
         return token_ids
 
     @torch.inference_mode()
-    def _run_ssd_decode(self, seqs: list[Sequence]) -> list[list[int]]:
+    def _run_latent_decode(self, seqs: list[Sequence]) -> list[list[int]]:
         """SSD decode: send spec request to draft via NCCL, verify with target."""
         k = self.num_speculative_tokens
         all_draft_tokens = []
@@ -1052,136 +1397,184 @@ class ModelRunner:
             mtp_layer = self.model.model.mtp_layers[0]
         if self.rank == 0 and self.async_pg is not None:
             if eagle_async:
-                # Use locally pushed tree cache (received in llm_engine.step() after previous step)
+                # EAGLE async: same pure-CPU lookup pattern as MTP. Cache stored
+                # as flat Python lists by llm_engine push drain (CPU side, after
+                # .cpu().tolist() of the whole push buf). No GPU op per lookup.
                 if not hasattr(self, '_local_tree_cache'):
                     self._local_tree_cache = {}
                     self._cache_hit = 0
                     self._cache_miss = 0
                 for seq in seqs:
-                    local_cache = self._local_tree_cache.get(seq.seq_id)
-                    if local_cache is not None:
-                        keys, tokens = local_cache
-                        acc_len = seq.last_accepted_len
-                        if tokens.shape[1] >= k:
-                            # Tree mode: direct lookup returns all K tokens
-                            req = torch.tensor([[seq.seq_id, acc_len, seq.last_token]],
-                                                dtype=torch.int64, device=d)
-                            match = torch.all(req == keys, dim=1)
-                            if match.any():
-                                idx = match.float().argmax().tolist()
-                                all_draft_tokens.append(tokens[idx, :k].tolist())
-                                self._cache_hit += 1
-                                continue
+                    cache = self._local_tree_cache.get(seq.seq_id)
+                    sid_t, acc_t, tok_t = seq.seq_id, seq.last_accepted_len, seq.last_token
+                    found = None
+                    if cache is not None:
+                        keys_flat, toks_flat, n_e, K_a = cache
+                        if K_a >= k:
+                            # Tree mode: scan for (sid, acc, last_token) match
+                            for j in range(n_e):
+                                base = j * 3
+                                if (keys_flat[base] == sid_t
+                                        and keys_flat[base + 1] == acc_t
+                                        and keys_flat[base + 2] == tok_t):
+                                    tbase = j * K_a
+                                    found = toks_flat[tbase:tbase + k]
+                                    break
                         else:
                             # Chain mode: K chained lookups
-                            draft_tokens = []
-                            cur_token = seq.last_token
-                            hit = False
+                            chain = []
+                            cur = tok_t
                             for step in range(k):
-                                req = torch.tensor([[seq.seq_id, acc_len + step, cur_token]],
-                                                    dtype=torch.int64, device=d)
-                                match = torch.all(req == keys, dim=1)
-                                if match.any():
-                                    idx = match.float().argmax().tolist()
-                                    cur_token = tokens[idx, 0].tolist()
-                                    draft_tokens.append(cur_token)
-                                    if step == 0:
-                                        hit = True
-                                else:
-                                    draft_tokens.extend([0] * (k - step))
+                                hit_step = False
+                                target_acc = acc_t + step
+                                for j in range(n_e):
+                                    base = j * 3
+                                    if (keys_flat[base] == sid_t
+                                            and keys_flat[base + 1] == target_acc
+                                            and keys_flat[base + 2] == cur):
+                                        cur = toks_flat[j * K_a]
+                                        chain.append(cur)
+                                        hit_step = True
+                                        break
+                                if not hit_step:
                                     break
-                            if hit:
-                                all_draft_tokens.append(draft_tokens)
-                                self._cache_hit += 1
-                                continue
-                    # Cache miss: JIT on draft (only happens on first step or rare miss)
-                    self._cache_miss += 1
-                    self._send_cmd(0)
-                    meta = torch.tensor([seq.seq_id, getattr(seq, 'last_accepted_len', 0),
-                                          seq.last_token, len(seq), len(seq.block_table)],
-                                         dtype=torch.int64, device=d)
-                    dist.send(meta, dst=self.draft_rank, group=self.async_pg)
-                    dist.send(self.last_hidden[seq.seq_id].squeeze(0).contiguous(),
-                               dst=self.draft_rank, group=self.async_pg)
-                    dist.send(torch.tensor(seq.block_table, dtype=torch.int32, device=d),
-                               dst=self.draft_rank, group=self.async_pg)
-                    jit_buf = torch.zeros(k, dtype=torch.int64, device=d)
-                    dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
-                    all_draft_tokens.append(jit_buf.tolist())
+                            if chain and len(chain) == k:
+                                found = chain
+                            elif chain:
+                                found = chain + [0] * (k - len(chain))
+                    if found is not None:
+                        all_draft_tokens.append(found)
+                        self._cache_hit += 1
+                    else:
+                        self._cache_miss += 1
+                        if not self.config.enable_fallback:
+                            # Cache miss → baseline 1-token verify (no spec).
+                            all_draft_tokens.append([])
+                        else:
+                            # Fallback spec: ~10ms NCCL roundtrip per miss seq.
+                            self._send_cmd(0)
+                            meta = torch.tensor(
+                                [seq.seq_id, getattr(seq, 'last_accepted_len', 0),
+                                 seq.last_token, len(seq), len(seq.block_table)],
+                                dtype=torch.int64, device=d)
+                            dist.send(meta, dst=self.draft_rank, group=self.async_pg)
+                            dist.send(self.last_hidden[seq.seq_id].squeeze(0).contiguous(),
+                                      dst=self.draft_rank, group=self.async_pg)
+                            dist.send(torch.tensor(seq.block_table, dtype=torch.int32, device=d),
+                                      dst=self.draft_rank, group=self.async_pg)
+                            jit_buf = torch.zeros(k, dtype=torch.int64, device=d)
+                            dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
+                            all_draft_tokens.append(jit_buf.tolist())
             else:
-                # MTP path: local tree cache lookup (same as EAGLE, push mode)
+                # MTP path: local tree cache lookup — pure CPU scan.
+                # Cache is stored as flat Python lists (populated from push_cpu
+                # at end of previous step). Each lookup compares a 3-tuple
+                # against ≤32 cached entries — pure Python is faster than
+                # dispatching a GPU kernel (~5-10μs fixed overhead per op).
                 if not hasattr(self, '_local_tree_cache'):
                     self._local_tree_cache = {}
                 if not hasattr(self, '_cache_hit'):
                     self._cache_hit = 0
                     self._cache_miss = 0
-                for seq in seqs:
-                    local_cache = self._local_tree_cache.get(seq.seq_id)
-                    if local_cache is not None:
-                        keys, tokens = local_cache
-                        acc_len = seq.last_accepted_len
-                        if tokens.shape[1] >= k:
-                            req = torch.tensor([[seq.seq_id, acc_len, seq.last_token]],
-                                                dtype=torch.int64, device=d)
-                            match = torch.all(req == keys, dim=1)
-                            if match.any():
-                                idx = match.float().argmax().tolist()
-                                all_draft_tokens.append(tokens[idx, :k].tolist())
-                                self._cache_hit += 1
-                                continue
-                        else:
-                            draft_tokens = []
-                            cur_token = seq.last_token
-                            hit = False
-                            for step in range(k):
-                                req = torch.tensor([[seq.seq_id, acc_len + step, cur_token]],
-                                                    dtype=torch.int64, device=d)
-                                match = torch.all(req == keys, dim=1)
-                                if match.any():
-                                    idx = match.float().argmax().tolist()
-                                    cur_token = tokens[idx, 0].tolist()
-                                    draft_tokens.append(cur_token)
-                                    if step == 0:
-                                        hit = True
-                                else:
-                                    draft_tokens.extend([0] * (k - step))
+                miss_idxs = []
+                for i, seq in enumerate(seqs):
+                    cache = self._local_tree_cache.get(seq.seq_id)
+                    sid_t, acc_t, tok_t = seq.seq_id, seq.last_accepted_len, seq.last_token
+                    found = None
+                    if cache is not None:
+                        keys_flat, toks_flat, n_e, K_a = cache
+                        if K_a >= k:
+                            # Tree mode: scan for exact (sid, acc, last_token) match
+                            for j in range(n_e):
+                                base = j * 3
+                                if (keys_flat[base] == sid_t
+                                        and keys_flat[base + 1] == acc_t
+                                        and keys_flat[base + 2] == tok_t):
+                                    tbase = j * K_a
+                                    found = toks_flat[tbase:tbase + k]
                                     break
-                            if hit:
-                                all_draft_tokens.append(draft_tokens)
-                                self._cache_hit += 1
-                                continue
-                    # Cache miss: delegate to draft via cmd=0 (same as EAGLE
-                    # path). Running MTP locally on rank 0 deadlocks when
-                    # tp_size > 1 because its TP collectives (allreduce in
-                    # o_proj / MoE) expect all TP ranks to participate — but
-                    # this block is inside `if self.rank == 0:`. The draft GPU
-                    # has its own single-device MTP replica, so handing the
-                    # JIT speculation off avoids the problem entirely.
-                    self._cache_miss += 1
-                    self._send_cmd(0)
-                    meta = torch.tensor(
-                        [seq.seq_id, getattr(seq, 'last_accepted_len', 0),
-                         seq.last_token, len(seq), len(seq.block_table)],
-                        dtype=torch.int64, device=d)
-                    dist.send(meta, dst=self.draft_rank, group=self.async_pg)
-                    dist.send(self.last_hidden[seq.seq_id].squeeze(0).contiguous(),
-                              dst=self.draft_rank, group=self.async_pg)
-                    dist.send(torch.tensor(seq.block_table, dtype=torch.int32, device=d),
-                              dst=self.draft_rank, group=self.async_pg)
-                    jit_buf = torch.zeros(k, dtype=torch.int64, device=d)
-                    dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
-                    all_draft_tokens.append(jit_buf.tolist())
+                        else:
+                            # Chain mode: K chained lookups
+                            chain = []
+                            cur = tok_t
+                            for step in range(k):
+                                hit_step = False
+                                target_acc = acc_t + step
+                                for j in range(n_e):
+                                    base = j * 3
+                                    if (keys_flat[base] == sid_t
+                                            and keys_flat[base + 1] == target_acc
+                                            and keys_flat[base + 2] == cur):
+                                        cur = toks_flat[j * K_a]
+                                        chain.append(cur)
+                                        hit_step = True
+                                        break
+                                if not hit_step:
+                                    break
+                            if chain and len(chain) == k:
+                                found = chain
+                            elif chain:
+                                # partial chain — pad with zeros so verify still
+                                # has K draft positions; accept will reject the
+                                # zeros after first mismatch
+                                found = chain + [0] * (k - len(chain))
+                    if found is not None:
+                        all_draft_tokens.append(found)
+                        self._cache_hit += 1
+                    else:
+                        all_draft_tokens.append(None)
+                        miss_idxs.append(i)
+                        self._cache_miss += 1
+                # === Handle misses ===
+                # Default (enable_fallback=False): no spec → baseline
+                # 1-token verify (verify_ids = [last_token] for this seq).
+                # Optional (enable_fallback=True): send cmd=0 to draft
+                # for sync fallback spec — costs ~10ms NCCL roundtrip but
+                # recovers K spec tokens per miss.
+                use_fallback = self.config.enable_fallback
+                for i in miss_idxs:
+                    if not use_fallback:
+                        all_draft_tokens[i] = []
+                    else:
+                        seq = seqs[i]
+                        self._send_cmd(0)
+                        meta = torch.tensor(
+                            [seq.seq_id, getattr(seq, 'last_accepted_len', 0),
+                             seq.last_token, len(seq), len(seq.block_table)],
+                            dtype=torch.int64, device=d)
+                        dist.send(meta, dst=self.draft_rank, group=self.async_pg)
+                        dist.send(self.last_hidden[seq.seq_id].squeeze(0).contiguous(),
+                                  dst=self.draft_rank, group=self.async_pg)
+                        dist.send(torch.tensor(seq.block_table, dtype=torch.int32, device=d),
+                                  dst=self.draft_rank, group=self.async_pg)
+                        jit_buf = torch.zeros(k, dtype=torch.int64, device=d)
+                        dist.recv(jit_buf, src=self.draft_rank, group=self.async_pg)
+                        all_draft_tokens[i] = jit_buf.tolist()
 
-        # Broadcast draft tokens to TP workers
+        # Broadcast draft tokens to TP workers — single batched op.
+        # Layout: per-seq [actual_len, t0, t1, ..., t_{k-1}] (zero-padded).
+        # rank 0 fills, others recv into pre-allocated _draft_bcast_buf, single
+        # .cpu().tolist() to settle all draft tokens at once.
         if self.tp_size > 1:
+            n = len(seqs)
+            slot_size = 1 + k
+            buf = self._draft_bcast_buf[:n * slot_size]
+            if self.rank == 0:
+                flat = []
+                for tokens in all_draft_tokens:
+                    actual_len = len(tokens)
+                    flat.append(actual_len)
+                    flat.extend(tokens)
+                    flat.extend([0] * (k - actual_len))
+                buf.copy_(torch.tensor(flat, dtype=torch.int64))
+            dist.broadcast(buf, 0, group=self.tp_group)
             if self.rank != 0:
-                all_draft_tokens = [[0] * k for _ in seqs]
-            for i, seq in enumerate(seqs):
-                for j in range(k):
-                    d_tensor = torch.tensor([all_draft_tokens[i][j]], dtype=torch.int64, device=d)
-                    dist.broadcast(d_tensor, 0, group=self.tp_group)
-                    if self.rank != 0:
-                        all_draft_tokens[i][j] = d_tensor.item()
+                flat_cpu = buf.cpu().tolist()
+                all_draft_tokens = []
+                for i in range(n):
+                    base = i * slot_size
+                    actual_len = flat_cpu[base]
+                    all_draft_tokens.append(flat_cpu[base + 1:base + 1 + actual_len])
 
         # === Verify phase (layer-by-layer for early hidden extraction) ===
         verify_ids, verify_pos = self._prepare_verify(seqs, all_draft_tokens)
@@ -1194,14 +1587,14 @@ class ModelRunner:
             early_layer = n_layers - 3
             send_after_norm = False
         else:
-            # ssd_early_layers semantic — K MUST be < 0:
+            # latent_early_layers semantic — K MUST be < 0:
             #   K=-1 → extract after the last layer (= 倒数第1, sync MTP equivalent)
             #   K=-3 → extract after the 3rd-from-last (= 倒数第3)
             # The hidden sent to draft is always pre-final-norm (unnormed
             # residual sum). Draft applies its own norm downstream.
-            ssd_K = self.config.ssd_early_layers
+            ssd_K = self.config.latent_early_layers
             assert ssd_K < 0, (
-                f"ssd_early_layers must be < 0 "
+                f"latent_early_layers must be < 0 "
                 f"(K=-1 → last layer, K=-N → 倒数第N); got {ssd_K}"
             )
             send_after_norm = False
@@ -1286,17 +1679,13 @@ class ModelRunner:
             h.wait()
         hidden = residual  # unnormed, for MTP last_hidden
 
-        # Pipelined recv: as soon as cmd=5 isends are done, kick off the
-        # irecv for the size of draft's push response. This lets the NCCL
-        # transfer overlap with target's logits / accept work below. Wait
-        # at the end of this step (before cleanup_send) to keep p2p ordering.
-        push_sz_irecv = None
+        # Pipelined recv into pre-allocated max-size buf (no size handshake).
+        # Both sides know the max size from config; draft pads accordingly.
+        push_irecv = None
         if (self.rank == 0 and self.async_pg is not None and self.use_mtp
                 and len(_async_send_handles) > 0):
-            if not hasattr(self, '_push_sz_buf'):
-                self._push_sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
-            push_sz_irecv = dist.irecv(
-                self._push_sz_buf, src=self.draft_rank, group=self.async_pg)
+            push_irecv = dist.irecv(
+                self._push_buf_max, src=self.draft_rank, group=self.async_pg)
 
         target_logits = self.model.compute_logits_all(hidden_states)
         reset_context()
@@ -1310,14 +1699,18 @@ class ModelRunner:
                 seq_logits = target_logits[offset:offset + num_verify]
                 predicted = seq_logits.argmax(dim=-1).tolist()
                 accepted = []
-                for j in range(k):
+                # Iterate up to len(draft_tokens). When draft is [] (cache miss
+                # → no-spec), this just picks predicted[0] as the only accepted
+                # token (= baseline 1-token decode).
+                k_local = len(draft_tokens)
+                for j in range(k_local):
                     if predicted[j] == draft_tokens[j]:
                         accepted.append(draft_tokens[j])
                     else:
                         accepted.append(predicted[j])
                         break
                 else:
-                    accepted.append(predicted[k])
+                    accepted.append(predicted[k_local])
 
                 seq.last_accepted_len = len(accepted) - 1
                 seq.recovery_token_id = accepted[-1]
@@ -1330,7 +1723,7 @@ class ModelRunner:
         else:
             all_accepted = [[] for _ in seqs]
 
-        # Skip MTP KV cache update in SSD mode — cache hit rate ~99% makes it unnecessary
+        # Skip MTP KV cache update in Latent SD mode — cache hit rate ~99% makes it unnecessary
         # (MTP KV only needed for cache miss local fallback, which is rare)
 
         # Drain push tree-cache (cmd=5 response). The size irecv was kicked off
@@ -1341,26 +1734,27 @@ class ModelRunner:
         # FIFO is preserved (target=[isend cmd5, irecv sz, recv push, send
         # cmd3, recv ack] vs draft=[recv cmd5, send sz, send push, recv cmd3,
         # send ack]).
-        if push_sz_irecv is not None:
-            push_sz_irecv.wait()
-            buf_size = int(self._push_sz_buf.item())
-            push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
-            dist.recv(push_buf, src=self.draft_rank, group=self.async_pg)
+        if push_irecv is not None:
+            push_irecv.wait()
             if not hasattr(self, '_local_tree_cache'):
                 self._local_tree_cache = {}
+            push_cpu = self._push_buf_max.cpu().tolist()
             pidx = 0
-            n_push = int(push_buf[pidx].item()); pidx += 1
+            n_push = push_cpu[pidx]; pidx += 1
             for _ in range(n_push):
-                sid = int(push_buf[pidx].item())
-                n_e = int(push_buf[pidx + 1].item())
-                K_a = int(push_buf[pidx + 2].item())
+                sid = push_cpu[pidx]
+                n_e = push_cpu[pidx + 1]
+                K_a = push_cpu[pidx + 2]
                 pidx += 3
                 if n_e > 0:
-                    keys = push_buf[pidx:pidx + n_e * 3].reshape(n_e, 3).clone()
+                    # Store cache as flat CPU lists. Lookup is a tight Python
+                    # scan over 1-32 entries — much cheaper than dispatching a
+                    # GPU kernel which carries ~5-10μs fixed overhead per op.
+                    keys_flat = push_cpu[pidx:pidx + n_e * 3]
                     pidx += n_e * 3
-                    toks = push_buf[pidx:pidx + n_e * K_a].reshape(n_e, K_a).clone()
+                    toks_flat = push_cpu[pidx:pidx + n_e * K_a]
                     pidx += n_e * K_a
-                    self._local_tree_cache[sid] = (keys, toks)
+                    self._local_tree_cache[sid] = (keys_flat, toks_flat, n_e, K_a)
         # _push_pending no longer needed — we drained inside this function.
 
         if self.rank == 0:

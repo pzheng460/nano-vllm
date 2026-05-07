@@ -20,13 +20,22 @@ class Config:
     device_type: Optional[str] = None  # "cuda", "npu", or None (auto)
     draft_model: Optional[str] = None          # EAGLE checkpoint path
     num_speculative_tokens: int = 5            # number of speculative tokens per step
-    # SSD (Speculative Streaming Decoding) options
-    draft_async: bool = False                  # enable SSD async draft on separate GPU
+    # Latent Speculative Decoding options
+    draft_async: bool = False                  # enable Latent SD async draft on separate GPU
     draft_gpu: int = -1                        # GPU for draft model (-1 = auto)
     async_fan_out: int = 3                     # fan-out for tree speculation
-    ssd_early_layers: int = -3                 # extract early hidden at layer N+K (K must be < 0).
+    latent_early_layers: int = -3                 # extract early hidden at layer N+K (K must be < 0).
                                                # -1 = last layer (sync-equiv), -3 = 倒数第3, etc.
-    ssd_tree_decode: bool = True               # tree decode: K draft steps per candidate (default on for correct multi-step speculation)
+    latent_tree_decode: bool = True               # tree decode: K draft steps per candidate (default on for correct multi-step speculation)
+    enable_fallback: bool = False              # On cache miss, send cmd=0 to draft for sync fallback spec.
+                                               # Off (default) → cache miss falls through to baseline 1-token verify (no spec).
+                                               # On  → ~10ms NCCL roundtrip per miss to recover K spec tokens (rarely worth it).
+    # Sync-MTP early-hidden parallel. -1 = current sync MTP (last layer, no
+    # overlap). -X (X>=2) → extract pre-norm hidden at layer N+K, run MTP on
+    # a side CUDA stream in parallel with the target's remaining |K|-1
+    # layers, and skip post-verify MTP (next-step draft = early MTP output;
+    # accept rate may drop, but MTP latency is hidden).
+    mtp_early_layers: int = -1
     num_gpus: int = -1                         # total world size (auto-computed)
     draft_rank: int = -1                       # rank of draft process (auto-computed)
     disable_mtp: bool = False                  # force disable MTP speculative decoding
@@ -54,7 +63,7 @@ class Config:
             self.draft_hf_config = AutoConfig.from_pretrained(self.draft_model, trust_remote_code=True)
         else:
             self.draft_hf_config = None
-        # SSD: compute world size and draft rank
+        # Latent SD: compute world size and draft rank
         self.num_gpus = self.tensor_parallel_size + (1 if self.draft_async else 0)
         self.eagle_async = self.draft_async and self.draft_model is not None and not self.use_mtp
         # Detect EAGLE-3: has draft_vocab_size or architecture LlamaForCausalLMEagle3
@@ -67,7 +76,7 @@ class Config:
             )
         if self.draft_async:
             assert self.use_mtp or self.draft_model is not None, \
-                "SSD async draft requires MTP model or EAGLE draft_model"
+                "Latent SD async draft requires MTP model or EAGLE draft_model"
             self.draft_rank = self.tensor_parallel_size
             if self.draft_gpu == -1:
                 self.draft_gpu = self.draft_rank
@@ -78,7 +87,7 @@ class Config:
             self.mq_len = sum(self.fan_out_list)
             # Total lookahead for block pre-allocation:
             # speculative tokens (K+1) + tree decode positions (K * MQ_LEN)
-            self.ssd_total_lookahead = K + 1 + K * self.mq_len
+            self.latent_total_lookahead = K + 1 + K * self.mq_len
 
 _current_config = None
 

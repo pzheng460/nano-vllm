@@ -135,7 +135,7 @@ class LLMEngine:
         if self.draft_async and self.model_runner.async_pg is not None:
             # Drain pending push from draft BEFORE cleanup (NCCL ordering)
             mr = self.model_runner
-            # MTP path drains its push tree-cache inside _run_ssd_decode itself
+            # MTP path drains its push tree-cache inside _run_latent_decode itself
             # (irecv kicked off right after cmd=5 isend, waited before return —
             # so the data transfer overlaps with target's accept work). Only
             # the eagle_async path still drains here.
@@ -145,19 +145,19 @@ class LLMEngine:
                 d = mr.device.device_name
                 if not hasattr(mr, '_local_tree_cache'):
                     mr._local_tree_cache = {}
-                sz_buf = torch.zeros(1, dtype=torch.int64, device=d)
-                dist.recv(sz_buf, src=mr.draft_rank, group=mr.async_pg)
-                buf_size = int(sz_buf[0].tolist())
-                push_buf = torch.zeros(buf_size, dtype=torch.int64, device=d)
-                dist.recv(push_buf, src=mr.draft_rank, group=mr.async_pg)
+                # Fixed-size protocol: recv directly into pre-allocated max-size
+                # buf (no separate size handshake). Cache stored as flat Python
+                # lists for pure-CPU lookup in _run_latent_decode.
+                dist.recv(mr._push_buf_max, src=mr.draft_rank, group=mr.async_pg)
+                push_cpu = mr._push_buf_max.cpu().tolist()
                 idx = 0
-                n_push = int(push_buf[idx].tolist()); idx += 1
+                n_push = push_cpu[idx]; idx += 1
                 for _ in range(n_push):
-                    sid = int(push_buf[idx].tolist()); n_e = int(push_buf[idx+1].tolist()); K_a = int(push_buf[idx+2].tolist()); idx += 3
+                    sid = push_cpu[idx]; n_e = push_cpu[idx+1]; K_a = push_cpu[idx+2]; idx += 3
                     if n_e > 0:
-                        keys = push_buf[idx:idx+n_e*3].reshape(n_e, 3).clone(); idx += n_e*3
-                        tokens = push_buf[idx:idx+n_e*K_a].reshape(n_e, K_a).clone(); idx += n_e*K_a
-                        mr._local_tree_cache[sid] = (keys, tokens)
+                        keys_flat = push_cpu[idx:idx + n_e * 3]; idx += n_e * 3
+                        toks_flat = push_cpu[idx:idx + n_e * K_a]; idx += n_e * K_a
+                        mr._local_tree_cache[sid] = (keys_flat, toks_flat, n_e, K_a)
                 mr._push_pending = False
             for seq in seqs:
                 if seq.is_finished:
