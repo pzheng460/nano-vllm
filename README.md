@@ -29,6 +29,47 @@ uv pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 
 (If you prefer `pip`, `pip install git+https://github.com/GeeeekExplorer/nano-vllm.git` also works.)
 
+#### Editable install with extras (recommended for development)
+
+For developing locally on this fork (e.g. running the `experiments/pangu_lsd/`
+benches and trace analysis):
+
+```bash
+# 1. Install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sh    # or: pip install uv
+
+# 2. Clone + checkout the latent-sd branch
+git clone https://github.com/pzheng460/nano-vllm.git
+cd nano-vllm
+git checkout latent-sd
+
+# 3. Create venv (uv picks a Python in [3.10, 3.13))
+uv venv
+
+# 4. Install with extras
+uv pip install -e '.[cuda]'            # core + triton + flash-attn
+uv pip install -e '.[cuda,profile]'    # also installs ijson for trace analysis
+uv pip install -e '.[all]'             # cuda + npu + profile
+```
+
+**Notes**
+
+- `flash-attn` builds from source on first install (~5–15 min on CUDA 12 +
+  GCC 11+). Pass `--no-build-isolation` to speed it up:
+  ```bash
+  uv pip install flash-attn --no-build-isolation
+  ```
+- To pin a specific PyTorch CUDA wheel (e.g. cu128) before pulling the
+  rest:
+  ```bash
+  uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+  uv pip install -e '.[cuda]'
+  ```
+- After install, sanity-check:
+  ```bash
+  .venv/bin/python -c "import nanovllm, flash_attn, safetensors, sentencepiece, ijson; print('ok')"
+  ```
+
 ### Ascend NPU Installation
 
 For Huawei Atlas 800I/800T A2/A3 users, we recommend starting with Docker.
