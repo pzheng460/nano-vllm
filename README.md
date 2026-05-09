@@ -35,40 +35,63 @@ For developing locally on this fork (e.g. running the `experiments/pangu_lsd/`
 benches and trace analysis):
 
 ```bash
-# 1. Install uv if needed
-curl -LsSf https://astral.sh/uv/install.sh | sh    # or: pip install uv
-
-# 2. Clone + checkout the latent-sd branch
 git clone https://github.com/pzheng460/nano-vllm.git
 cd nano-vllm
 git checkout latent-sd
-
-# 3. Create venv (uv picks a Python in [3.10, 3.13))
-uv venv
-
-# 4. Install with extras
-uv pip install -e '.[cuda]'            # core + triton + flash-attn
-uv pip install -e '.[cuda,profile]'    # also installs ijson for trace analysis
-uv pip install -e '.[all]'             # cuda + npu + profile
 ```
 
-**Notes**
+Then pick one of the two flows below.
+
+##### Option A: uv (fastest)
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh    # or: pip install uv
+uv venv                                            # creates .venv with Python in [3.10, 3.13)
+uv pip install -e '.[cuda]'                        # core + triton + flash-attn
+# uv pip install -e '.[cuda,profile,hf]'           # add ijson + datasets
+# uv pip install -e '.[all]'                       # cuda + npu + profile + hf
+```
+
+`uv venv` does not install `pip` by default. If you want plain `pip` inside
+the venv (e.g. for follow-up installs):
+
+```bash
+uv pip install pip
+source .venv/bin/activate
+pip install -e '.[cuda,hf]'
+```
+
+##### Option B: conda
+
+```bash
+conda create -n nanovllm python=3.12 -y
+conda activate nanovllm
+pip install -e '.[cuda]'
+# pip install -e '.[cuda,profile,hf]'
+```
+
+##### Notes
 
 - `flash-attn` builds from source on first install (~5–15 min on CUDA 12 +
   GCC 11+). Pass `--no-build-isolation` to speed it up:
   ```bash
   uv pip install flash-attn --no-build-isolation
+  # or:
+  pip install flash-attn --no-build-isolation
   ```
 - To pin a specific PyTorch CUDA wheel (e.g. cu128) before pulling the
   rest:
   ```bash
-  uv pip install torch --index-url https://download.pytorch.org/whl/cu128
-  uv pip install -e '.[cuda]'
+  pip install torch --index-url https://download.pytorch.org/whl/cu128
+  pip install -e '.[cuda]'
   ```
-- After install, sanity-check:
+- Sanity-check after install:
   ```bash
-  .venv/bin/python -c "import nanovllm, flash_attn, safetensors, sentencepiece, ijson; print('ok')"
+  python -c "import nanovllm, flash_attn, safetensors, sentencepiece; print('ok')"
   ```
+- `experiments/pangu_lsd/test.sh` auto-detects the interpreter — it prefers
+  `$PYTHON` env var, then `./.venv/bin/python` (uv/venv layout), then
+  `python` on `PATH` (conda activate). No edits needed.
 
 ### Ascend NPU Installation
 

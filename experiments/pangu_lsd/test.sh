@@ -46,9 +46,26 @@ K="${K:-1}"
 F="${F:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-0}"
 
-# ---------- pre-flight ----------
-PY=".venv/bin/python"
-[ -x "$PY" ] || { echo "ERROR: .venv not found. Run 'uv venv && uv pip install -e \".[cuda,profile]\"' first."; exit 1; }
+# ---------- python interpreter ----------
+# Prefer:
+#   1. $PYTHON env var (explicit override)
+#   2. ./.venv/bin/python  (uv venv / python -m venv layout)
+#   3. `python` from PATH  (conda activate / system)
+if [ -n "${PYTHON:-}" ]; then
+    PY="$PYTHON"
+elif [ -x ".venv/bin/python" ]; then
+    PY=".venv/bin/python"
+else
+    PY="$(command -v python || true)"
+fi
+[ -n "$PY" ] && "$PY" -c "import nanovllm" 2>/dev/null || {
+    echo "ERROR: no working Python with nanovllm found."
+    echo "  Install one of:"
+    echo "    uv venv && uv pip install -e '.[cuda,hf]'"
+    echo "    conda create -n nanovllm python=3.12 && conda activate nanovllm && pip install -e '.[cuda,hf]'"
+    echo "  Or set PYTHON=/path/to/python."
+    exit 1
+}
 [ -d "$MODEL" ] || { echo "ERROR: MODEL not a directory: $MODEL"; exit 1; }
 [ -f "$PROMPTS" ] || { echo "ERROR: PROMPTS file missing: $PROMPTS"; exit 1; }
 
@@ -56,6 +73,7 @@ rm -f /dev/shm/nanovllm
 
 NUM_LINES=$(wc -l < "$PROMPTS")
 echo "================================================================"
+echo "  Python      : $PY"
 echo "  Model       : $MODEL"
 echo "  GPUs        : $GPUS"
 echo "  Prompts     : $PROMPTS  ($NUM_LINES total$( [ "$NUM_PROMPTS" -gt 0 ] && echo ", first $NUM_PROMPTS used" ))"
