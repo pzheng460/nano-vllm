@@ -25,7 +25,8 @@ dependencies = [
 cuda = ["triton>=3.0.0", "flash-attn"]
 npu = ["torch_npu"]
 profile = ["ijson"]                      # used by experiments/pangu_lsd/analyze_trace.py
-all = ["triton>=3.0.0", "flash-attn", "torch_npu", "ijson"]
+hf = ["datasets"]                        # bench.py --prompts hf:NAME[:SPLIT[:FIELD]]
+all = ["triton>=3.0.0", "flash-attn", "torch_npu", "ijson", "datasets"]
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"

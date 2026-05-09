@@ -3,26 +3,38 @@
 Cache miss falls through to baseline 1-token verify by default. Set
 `--fallback` to re-enable the cmd=0 round-trip path.
 
+`--prompts` accepts:
+  • a local jsonl path with one of:
+      - {"prompt": "..."}             (our format)
+      - {"turns": ["...", ...], ...}  (Spec-Bench schema; turns[0] used)
+  • an HF dataset spec:  hf:<dataset>[:<split>[:<field>]]
+    e.g.  hf:hendrydong/gpqa_diamond            (auto-detects 'problem')
+          hf:hendrydong/gpqa_diamond:test
+          hf:hendrydong/gpqa_diamond:test:problem
+    Common text fields are auto-detected: prompt | problem | question |
+    instruction | text | turns[0]. Requires `pip install datasets`.
+
 Usage:
-    # Sync MTP K=1 baseline
+    # Sync MTP K=1 baseline on Spec-Bench
     rm -f /dev/shm/nanovllm
     CUDA_VISIBLE_DEVICES=0,1,2,3 .venv/bin/python -u \\
-        experiments/pangu_lsd/bench.py --mode sync
+        experiments/pangu_lsd/bench.py --mode sync \\
+            --prompts tests/data/specbench_480.jsonl
 
     # Async (4 target + 1 draft GPU). NCCL_PORT must be unique per run.
     rm -f /dev/shm/nanovllm
     CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_PORT=2510 .venv/bin/python -u \\
         experiments/pangu_lsd/bench.py --mode async --K 1 --F 1 --early -1
 
+    # HF dataset (e.g. GPQA Diamond)
+    .venv/bin/python -u experiments/pangu_lsd/bench.py --mode sync \\
+        --prompts hf:hendrydong/gpqa_diamond --max-tokens 256
+
     # Profile (small trace → profile_merged.json.gz)
     rm -f /dev/shm/nanovllm target_trace.json draft_trace.json profile_merged.json.gz
     CUDA_VISIBLE_DEVICES=0,1,2,3,4 NCCL_PORT=2520 .venv/bin/python -u \\
         experiments/pangu_lsd/bench.py --mode async --profile \\
             --num-prompts 1 --max-tokens 8 --K 2 --F 1 --early -3
-
-    # GPQA Diamond accept-rate sanity check (~89%)
-    .venv/bin/python -u experiments/pangu_lsd/bench.py --mode sync \\
-        --prompts experiments/pangu_lsd/gpqa_diamond.jsonl --max-tokens 256
 """
 import argparse
 import json
@@ -35,6 +47,54 @@ DEFAULT_PROMPTS = os.path.join(os.path.dirname(__file__), "prompts.jsonl")
 TP = 4              # target tensor parallel (also drives draft GPU index for async)
 MAX_MODEL_LEN = 2048
 MAX_NUM_SEQS = 1
+
+# Auto-detection order for HF datasets when no explicit field is given.
+_HF_TEXT_FIELDS = ("prompt", "problem", "question", "instruction", "text")
+
+
+def _row_to_text(row, field=None):
+    """Pull a prompt string out of a dict-like row from a jsonl line or HF row."""
+    if field:
+        v = row.get(field)
+        if isinstance(v, list) and v:
+            return v[0]
+        if isinstance(v, str):
+            return v
+        raise ValueError(f"field '{field}' not found or not a string in row keys={list(row)}")
+    # Auto-detect.
+    for k in _HF_TEXT_FIELDS:
+        v = row.get(k)
+        if isinstance(v, str) and v:
+            return v
+    turns = row.get("turns")
+    if isinstance(turns, list) and turns:
+        return turns[0]
+    raise ValueError(f"no recognized text field in row keys={list(row)}; "
+                     f"pass an explicit field via --prompts hf:NAME:SPLIT:FIELD")
+
+
+def load_prompts(spec):
+    """spec: either a local jsonl path, or 'hf:DATASET[:SPLIT[:FIELD]]'."""
+    if spec.startswith("hf:"):
+        parts = spec[3:].split(":")
+        ds_name = parts[0]
+        split = parts[1] if len(parts) > 1 and parts[1] else "test"
+        field = parts[2] if len(parts) > 2 and parts[2] else None
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            raise SystemExit(
+                "HF dataset spec used but `datasets` not installed. "
+                "Install with: pip install datasets"
+            )
+        ds = load_dataset(ds_name, split=split)
+        return [_row_to_text(row, field) for row in ds]
+    out = []
+    with open(spec) as f:
+        for line in f:
+            obj = json.loads(line)
+            out.append(_row_to_text(obj))
+    return out
 
 
 def main():
@@ -59,9 +119,10 @@ def main():
         p.error("--early must be < 0 (negative = layers from the end)")
 
     from nanovllm import LLM, SamplingParams
-    prompts = [json.loads(l)["prompt"] for l in open(args.prompts)]
+    prompts = load_prompts(args.prompts)
     if args.num_prompts > 0:
         prompts = prompts[:args.num_prompts]
+    print(f"loaded {len(prompts)} prompts from {args.prompts}", flush=True)
 
     common = dict(
         tensor_parallel_size=TP,
