@@ -973,8 +973,13 @@ class MTPDraftRunner:
                 self.handle_cache_lookup()
             elif cmd == 2:
                 total = MTPDraftRunner._hit + MTPDraftRunner._miss
-                rate = MTPDraftRunner._hit / total * 100 if total else 0
-                print(f"[MTPDraftRunner] Exiting. Cache hit: {MTPDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                if total > 0:
+                    rate = MTPDraftRunner._hit / total * 100
+                    print(f"[MTPDraftRunner] Exiting. JIT/legacy lookup cache hit: "
+                          f"{MTPDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                else:
+                    # Push mode (no fallback): all hits accounted for on target.
+                    print("[MTPDraftRunner] Exiting (push-mode, no JIT lookups).", flush=True)
                 if prof:
                     prof.__exit__(None, None, None)
                     prof.export_chrome_trace(profile_path)
@@ -1867,8 +1872,12 @@ class EAGLEDraftRunner:
                 self.handle_cache_lookup()
             elif cmd == 2:
                 total = EAGLEDraftRunner._hit + EAGLEDraftRunner._miss
-                rate = EAGLEDraftRunner._hit / total * 100 if total else 0
-                print(f"[EAGLEDraftRunner] Exiting. Cache hit: {EAGLEDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                if total > 0:
+                    rate = EAGLEDraftRunner._hit / total * 100
+                    print(f"[EAGLEDraftRunner] Exiting. JIT/legacy lookup cache hit: "
+                          f"{EAGLEDraftRunner._hit}/{total} ({rate:.1f}%)", flush=True)
+                else:
+                    print("[EAGLEDraftRunner] Exiting (push-mode, no JIT lookups).", flush=True)
                 if prof:
                     prof.__exit__(None, None, None)
                     prof.export_chrome_trace(profile_path)

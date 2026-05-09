@@ -82,6 +82,12 @@ echo "  K F early   : $K  $F  $EARLY"
 echo "  Fallback    : OFF"
 echo "================================================================"
 
+# Tee both runs into log files so we can extract tok/s afterwards.
+LOG_DIR="${LOG_DIR:-experiments/pangu_lsd/logs}"
+mkdir -p "$LOG_DIR"
+SYNC_LOG="$LOG_DIR/sync_K1.log"
+ASYNC_LOG="$LOG_DIR/async_K${K}_F${F}_early${EARLY}.log"
+
 # ---------- 1. Sync MTP K=1 baseline ----------
 echo
 echo "=== [1/2] sync MTP K=1 baseline ==="
@@ -90,7 +96,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" $PY -u experiments/pangu_lsd/bench.py \
     --model "$MODEL" \
     --prompts "$PROMPTS" \
     --num-prompts "$NUM_PROMPTS" \
-    --max-tokens "$MAX_TOKENS"
+    --max-tokens "$MAX_TOKENS" 2>&1 | tee "$SYNC_LOG"
 
 # ---------- 2. Async push-mode (no fallback) ----------
 rm -f /dev/shm/nanovllm
@@ -102,7 +108,31 @@ CUDA_VISIBLE_DEVICES="$GPUS" NCCL_PORT="$NCCL_PORT" $PY -u experiments/pangu_lsd
     --model "$MODEL" \
     --prompts "$PROMPTS" \
     --num-prompts "$NUM_PROMPTS" \
-    --max-tokens "$MAX_TOKENS"
+    --max-tokens "$MAX_TOKENS" 2>&1 | tee "$ASYNC_LOG"
+
+# ---------- Comparison ----------
+# Pull "<total> tok in <secs>s = <tok/s> tok/s" from each log.
+grep_perf() { grep -oE "[0-9]+ tok in [0-9.]+s = [0-9.]+ tok/s" "$1" | tail -1; }
+grep_accept() { grep -oE "draft tokens accepted \([0-9.]+%" "$1" | tail -1 | grep -oE "[0-9.]+%"; }
+grep_cache_hit() { grep -oE "Cache hit: [0-9]+/[0-9]+ \([0-9.]+%\)" "$1" | tail -1; }
+
+SYNC_PERF=$(grep_perf "$SYNC_LOG")
+ASYNC_PERF=$(grep_perf "$ASYNC_LOG")
+SYNC_ACC=$(grep_accept "$SYNC_LOG")
+ASYNC_ACC=$(grep_accept "$ASYNC_LOG")
+ASYNC_HIT=$(grep_cache_hit "$ASYNC_LOG")
+
+# Speedup (async tok/s ÷ sync tok/s)
+SYNC_TOKS=$(echo "$SYNC_PERF" | grep -oE "= [0-9.]+ tok/s" | grep -oE "[0-9.]+")
+ASYNC_TOKS=$(echo "$ASYNC_PERF" | grep -oE "= [0-9.]+ tok/s" | grep -oE "[0-9.]+")
+SPEEDUP=$(awk -v a="$ASYNC_TOKS" -v s="$SYNC_TOKS" 'BEGIN{ if (s+0>0) printf "%.3f", a/s; else print "n/a" }')
 
 echo
-echo "All tests done. Inspect output above for accept rate + tok/s."
+echo "================================================================"
+echo "  Comparison (logs in $LOG_DIR/)"
+echo "----------------------------------------------------------------"
+printf "  %-32s %s\n" "sync MTP K=1"            "$SYNC_PERF   accept=$SYNC_ACC"
+printf "  %-32s %s\n" "async K=$K F=$F early=$EARLY"  "$ASYNC_PERF   accept=$ASYNC_ACC   $ASYNC_HIT"
+echo "----------------------------------------------------------------"
+echo "  speedup (async / sync)        : ${SPEEDUP}x"
+echo "================================================================"
