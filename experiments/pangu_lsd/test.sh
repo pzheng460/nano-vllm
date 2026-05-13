@@ -19,6 +19,7 @@
 #   K              num_speculative_tokens (default: 1)
 #   F              async_fan_out (default: 1)
 #   NUM_PROMPTS    cap on prompts read (default: 0 = all)
+#   MAX_NUM_SEQS   concurrent sequences (default: 1)
 #
 # Usage:
 #   cd nano-vllm
@@ -45,6 +46,7 @@ EARLY="${EARLY:--4}"
 K="${K:-1}"
 F="${F:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-0}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
 
 # ---------- python interpreter ----------
 # Prefer:
@@ -78,6 +80,7 @@ echo "  Model       : $MODEL"
 echo "  GPUs        : $GPUS"
 echo "  Prompts     : $PROMPTS  ($NUM_LINES total$( [ "$NUM_PROMPTS" -gt 0 ] && echo ", first $NUM_PROMPTS used" ))"
 echo "  max_tokens  : $MAX_TOKENS"
+echo "  max_num_seqs: $MAX_NUM_SEQS"
 echo "  K F early   : $K  $F  $EARLY"
 echo "  Fallback    : OFF"
 echo "================================================================"
@@ -96,6 +99,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" $PY -u experiments/pangu_lsd/bench.py \
     --model "$MODEL" \
     --prompts "$PROMPTS" \
     --num-prompts "$NUM_PROMPTS" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --max-tokens "$MAX_TOKENS" 2>&1 | tee "$SYNC_LOG"
 
 # ---------- 2. Async push-mode (no fallback) ----------
@@ -108,6 +112,7 @@ CUDA_VISIBLE_DEVICES="$GPUS" NCCL_PORT="$NCCL_PORT" $PY -u experiments/pangu_lsd
     --model "$MODEL" \
     --prompts "$PROMPTS" \
     --num-prompts "$NUM_PROMPTS" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --max-tokens "$MAX_TOKENS" 2>&1 | tee "$ASYNC_LOG"
 
 # ---------- Comparison ----------

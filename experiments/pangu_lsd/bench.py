@@ -111,6 +111,8 @@ def main():
                    help="latent_early_layers (async only, must be <0; -1 = last layer)")
     p.add_argument("--fallback", action="store_true",
                    help="async only: re-enable cmd=0 fallback on cache miss")
+    p.add_argument("--max-num-seqs", type=int, default=MAX_NUM_SEQS,
+                   help=f"concurrent sequences (default: {MAX_NUM_SEQS})")
     p.add_argument("--profile", action="store_true",
                    help="torch.profiler trace → profile_merged.json.gz in cwd")
     args = p.parse_args()
@@ -129,7 +131,7 @@ def main():
         trust_remote_code=True,
         enforce_eager=True,
         max_model_len=MAX_MODEL_LEN,
-        max_num_seqs=MAX_NUM_SEQS,
+        max_num_seqs=args.max_num_seqs,
         num_speculative_tokens=args.K,
         profile=args.profile,
     )
